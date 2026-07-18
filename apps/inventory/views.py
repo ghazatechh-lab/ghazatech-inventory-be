@@ -1,6 +1,8 @@
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
 from rest_framework.decorators import action
 from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
 
 from .models import (
     Brand,
@@ -35,11 +37,57 @@ class CategoryViewSet(ModelViewSet):
 
 class ProductViewSet(ModelViewSet):
     queryset = Product.objects.filter(is_deleted=False).select_related(
-        "brand", "category", "supplier"
+        "brand",
+        "category",
+        "supplier",
     )
     serializer_class = ProductSerializer
-    search_fields = ["product_name", "sku", "barcode", "compatible_models"]
-    filterset_fields = ["brand", "category", "is_active"]
+    search_fields = [
+        "product_name",
+        "sku",
+        "barcode",
+        "compatible_models",
+    ]
+    filterset_fields = [
+        "brand",
+        "category",
+        "is_active",
+    ]
+
+    def create(self, request, *args, **kwargs):
+        print("\n========== PRODUCT CREATE REQUEST ==========")
+        print("Request user:", request.user)
+        print("Request content type:", request.content_type)
+        print("Request data:", request.data)
+
+        serializer = self.get_serializer(data=request.data)
+
+        if not serializer.is_valid():
+            print("Product validation errors:", serializer.errors)
+            print("============================================\n")
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Product validation failed",
+                    "errors": serializer.errors,
+                    "received_data": request.data,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        self.perform_create(serializer)
+
+        print("Product created:", serializer.data)
+        print("============================================\n")
+
+        headers = self.get_success_headers(serializer.data)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED,
+            headers=headers,
+        )
 
     def perform_destroy(self, obj):
         obj.is_deleted = True

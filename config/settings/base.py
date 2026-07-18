@@ -131,3 +131,33 @@ CELERY_BEAT_SCHEDULE = {
     }
 }
 DEFAULT_VAT_PERCENTAGE = Decimal(env("DEFAULT_VAT_PERCENTAGE", default="5"))
+
+# Console logging for API requests, serializer validation errors, and exceptions.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "{asctime} | {levelname} | {name} | {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "loggers": {
+        "ghazatech.api": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}

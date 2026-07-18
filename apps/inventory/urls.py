@@ -19,6 +19,7 @@ r.register("inventory/stock", StockViewSet, basename="stock")
 r.register("inventory/movements", StockMovementViewSet, basename="movement")
 r.register("inventory/adjustments", StockAdjustmentViewSet, basename="adjustment")
 
+
 urlpatterns = [
     path("inventory/low-stock/", low_stock_products, name="inventory-low-stock"),
 ]
