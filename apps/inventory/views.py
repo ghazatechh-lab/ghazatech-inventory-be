@@ -1,24 +1,24 @@
+from rest_framework.decorators import action, api_view
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
-from rest_framework.decorators import action
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from rest_framework import status
 
 from .models import (
     Brand,
     Category,
     Product,
     ProductStock,
-    StockMovement,
+    ProductVariant,
     StockAdjustment,
+    StockMovement,
 )
 from .serializers import (
     BrandSerializer,
     CategorySerializer,
     ProductSerializer,
     ProductStockSerializer,
-    StockMovementSerializer,
+    ProductVariantSerializer,
     StockAdjustmentSerializer,
+    StockMovementSerializer,
 )
 from apps.common.response import ok
 
@@ -27,72 +27,53 @@ class BrandViewSet(ModelViewSet):
     queryset = Brand.objects.all()
     serializer_class = BrandSerializer
     search_fields = ["name"]
+    filterset_fields = ["is_active"]
 
 
 class CategoryViewSet(ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     search_fields = ["name"]
+    filterset_fields = ["is_active"]
 
 
 class ProductViewSet(ModelViewSet):
-    queryset = Product.objects.filter(is_deleted=False).select_related(
-        "brand",
-        "category",
-        "supplier",
+    queryset = (
+        Product.objects.filter(is_deleted=False)
+        .select_related("brand", "category", "supplier")
+        .prefetch_related("variants")
     )
     serializer_class = ProductSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     search_fields = [
         "product_name",
         "sku",
         "barcode",
         "compatible_models",
+        "variants__variant_name",
+        "variants__sku",
+        "variants__barcode",
     ]
-    filterset_fields = [
-        "brand",
-        "category",
-        "is_active",
-    ]
-
-    def create(self, request, *args, **kwargs):
-        print("\n========== PRODUCT CREATE REQUEST ==========")
-        print("Request user:", request.user)
-        print("Request content type:", request.content_type)
-        print("Request data:", request.data)
-
-        serializer = self.get_serializer(data=request.data)
-
-        if not serializer.is_valid():
-            print("Product validation errors:", serializer.errors)
-            print("============================================\n")
-
-            return Response(
-                {
-                    "success": False,
-                    "message": "Product validation failed",
-                    "errors": serializer.errors,
-                    "received_data": request.data,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        self.perform_create(serializer)
-
-        print("Product created:", serializer.data)
-        print("============================================\n")
-
-        headers = self.get_success_headers(serializer.data)
-
-        return Response(
-            serializer.data,
-            status=status.HTTP_201_CREATED,
-            headers=headers,
-        )
+    filterset_fields = ["brand", "category", "is_active"]
 
     def perform_destroy(self, obj):
         obj.is_deleted = True
         obj.deleted_by = self.request.user
-        obj.save()
+        obj.save(update_fields=["is_deleted", "deleted_by", "updated_at"])
+
+
+class ProductVariantViewSet(ModelViewSet):
+    queryset = ProductVariant.objects.select_related(
+        "product", "product__brand", "product__category"
+    )
+    serializer_class = ProductVariantSerializer
+    filterset_fields = ["product", "is_active", "is_default"]
+    search_fields = ["variant_name", "sku", "barcode"]
+
+    def perform_create(self, serializer):
+        product_id = self.request.data.get("product")
+        product = Product.objects.get(pk=product_id, is_deleted=False)
+        serializer.save(product=product)
 
 
 class StockViewSet(ReadOnlyModelViewSet):
@@ -103,9 +84,9 @@ class StockViewSet(ReadOnlyModelViewSet):
     @action(detail=False, methods=["get"], url_path="low-stock")
     def low_stock(self, request):
         data = [
-            x
-            for x in self.filter_queryset(self.get_queryset())
-            if x.available_stock <= x.reorder_level
+            item
+            for item in self.filter_queryset(self.get_queryset())
+            if item.available_stock <= item.reorder_level
         ]
         return ok(ProductStockSerializer(data, many=True).data)
 
@@ -147,6 +128,7 @@ def low_stock_products(request):
         stock for stock in queryset if stock.available_stock <= stock.reorder_level
     ]
 
-    serializer = ProductStockSerializer(low_stock_items, many=True)
-
-    return ok(serializer.data, message="Low stock products fetched successfully")
+    return ok(
+        ProductStockSerializer(low_stock_items, many=True).data,
+        message="Low stock products fetched successfully",
+    )

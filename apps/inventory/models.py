@@ -35,12 +35,6 @@ class Product(TimeStampedModel, SoftDeleteModel):
     )
     description = models.TextField(blank=True)
     product_image = models.ImageField(upload_to="products/", null=True, blank=True)
-    purchase_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    retail_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    wholesale_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    minimum_selling_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0
-    )
     warranty_period_days = models.PositiveIntegerField(default=0)
     reorder_level = models.PositiveIntegerField(default=0)
     rack_location = models.CharField(max_length=100, blank=True)
@@ -123,3 +117,60 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         related_name="approved_adjustments",
     )
     status = models.CharField(max_length=20, choices=STATUS, default="DRAFT")
+
+
+class ProductVariant(TimeStampedModel):
+    """Sellable variation of a product, such as Black / 16 GB / 512 GB."""
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="variants",
+    )
+    variant_name = models.CharField(max_length=250)
+    sku = models.CharField(max_length=100, unique=True)
+    barcode = models.CharField(max_length=120, unique=True, null=True, blank=True)
+    attributes = models.JSONField(default=dict, blank=True)
+
+    # Product pricing is maintained only at variant level.
+    purchase_price = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
+    retail_price = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
+    wholesale_price = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
+    minimum_selling_price = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
+    is_default = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["product", "variant_name", "id"]
+        indexes = [
+            models.Index(fields=["product", "is_active"]),
+            models.Index(fields=["sku"]),
+            models.Index(fields=["barcode"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product.product_name} - {self.variant_name}"
+
+    @property
+    def effective_purchase_price(self):
+        return self.purchase_price
+
+    @property
+    def effective_retail_price(self):
+        return self.retail_price
+
+    @property
+    def effective_wholesale_price(self):
+        return self.wholesale_price
+
+    @property
+    def effective_minimum_selling_price(self):
+        return self.minimum_selling_price

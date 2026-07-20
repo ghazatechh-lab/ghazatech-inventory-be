@@ -11,8 +11,36 @@ class ProductAdmin(admin.ModelAdmin):
         "product_name",
         "brand",
         "category",
-        "retail_price",
+        "default_variant_price",
         "is_active",
     )
-    search_fields = ("sku", "barcode", "product_name")
-    list_filter = ("brand", "category", "is_active")
+
+    list_filter = (
+        "brand",
+        "category",
+        "is_active",
+    )
+
+    search_fields = (
+        "sku",
+        "barcode",
+        "product_name",
+        "variants__sku",
+        "variants__barcode",
+    )
+
+    def default_variant_price(self, obj):
+        variant = (
+            obj.variants.filter(
+                is_default=True,
+                is_active=True,
+            ).first()
+            or obj.variants.filter(is_active=True).first()
+        )
+
+        if not variant:
+            return "—"
+
+        return variant.retail_price
+
+    default_variant_price.short_description = "Retail Price"
