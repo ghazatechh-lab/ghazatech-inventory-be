@@ -28,6 +28,9 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
+    available_qty = serializers.IntegerField(
+        required=False, allow_null=True, min_value=0, default=0
+    )
     sku = serializers.CharField(max_length=100, validators=[])
     barcode = serializers.CharField(
         max_length=120, required=False, allow_blank=True, allow_null=True, validators=[]
@@ -54,6 +57,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "sku",
             "barcode",
             "attributes",
+            "available_qty",
             "purchase_price",
             "retail_price",
             "wholesale_price",
@@ -68,6 +72,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["product", "created_at", "updated_at"]
+
+    def validate_available_qty(self, value):
+        return 0 if value in (None, "") else value
 
     def validate_attributes(self, value):
         if not isinstance(value, dict):
@@ -92,6 +99,7 @@ class ProductSerializer(serializers.ModelSerializer):
     product_image_url = serializers.SerializerMethodField()
     variants = ProductVariantSerializer(many=True, required=False)
     variant_count = serializers.SerializerMethodField()
+    total_available_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -110,6 +118,23 @@ class ProductSerializer(serializers.ModelSerializer):
         if prefetched is not None:
             return len([variant for variant in prefetched if variant.is_active])
         return obj.variants.filter(is_active=True).count()
+
+    def get_total_available_qty(self, obj):
+        prefetched = getattr(obj, "_prefetched_objects_cache", {}).get("variants")
+        if prefetched is not None:
+            return sum(
+                int(variant.available_qty or 0)
+                for variant in prefetched
+                if variant.is_active
+            )
+
+        return sum(
+            int(quantity or 0)
+            for quantity in obj.variants.filter(is_active=True).values_list(
+                "available_qty",
+                flat=True,
+            )
+        )
 
     def to_internal_value(self, data):
         """Convert multipart QueryDict input into a normal dictionary.
@@ -216,6 +241,7 @@ class ProductSerializer(serializers.ModelSerializer):
         for variant_data in variants_data:
             variant_id = variant_data.pop("id", None)
             variant_data["barcode"] = variant_data.get("barcode") or None
+            variant_data["available_qty"] = variant_data.get("available_qty") or 0
 
             if variant_id and variant_id in existing:
                 variant = existing[variant_id]

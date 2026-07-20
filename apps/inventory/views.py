@@ -41,7 +41,7 @@ class ProductViewSet(ModelViewSet):
     queryset = (
         Product.objects.filter(is_deleted=False)
         .select_related("brand", "category", "supplier")
-        .prefetch_related("variants")
+        .prefetch_related("variants", "stocks")
     )
     serializer_class = ProductSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]

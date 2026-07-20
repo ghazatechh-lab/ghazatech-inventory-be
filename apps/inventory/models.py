@@ -131,6 +131,10 @@ class ProductVariant(TimeStampedModel):
     sku = models.CharField(max_length=100, unique=True)
     barcode = models.CharField(max_length=120, unique=True, null=True, blank=True)
     attributes = models.JSONField(default=dict, blank=True)
+    available_qty = models.PositiveIntegerField(
+        default=0,
+        help_text="Current available quantity for this product variant.",
+    )
 
     # Product pricing is maintained only at variant level.
     purchase_price = models.DecimalField(
