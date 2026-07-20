@@ -22,6 +22,18 @@ class Category(TimeStampedModel):
 
 
 class Product(TimeStampedModel, SoftDeleteModel):
+    CONDITION_CHOICES = [
+        ("NEW", "New"),
+        ("USED", "Used"),
+        ("REFURBISHED", "Refurbished"),
+    ]
+    UNIT_CHOICES = [
+        ("PCS", "Pcs"),
+        ("SET", "Set"),
+        ("BOX", "Box"),
+        ("PACK", "Pack"),
+        ("PAIR", "Pair"),
+    ]
     product_name = models.CharField(max_length=250)
     sku = models.CharField(max_length=80, unique=True)
     barcode = models.CharField(max_length=100, unique=True, null=True, blank=True)
@@ -30,8 +42,23 @@ class Product(TimeStampedModel, SoftDeleteModel):
         Category, on_delete=models.PROTECT, related_name="products"
     )
     compatible_models = models.TextField(blank=True)
+    condition = models.CharField(
+        max_length=20, choices=CONDITION_CHOICES, default="NEW"
+    )
+    unit = models.CharField(max_length=20, choices=UNIT_CHOICES, default="PCS")
+    vat_inclusive = models.BooleanField(default=True)
+    vat_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=5,
+        validators=[MinValueValidator(0)],
+    )
     supplier = models.ForeignKey(
-        "suppliers.Supplier", null=True, blank=True, on_delete=models.SET_NULL
+        "suppliers.Supplier",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="products",
     )
     description = models.TextField(blank=True)
     product_image = models.ImageField(upload_to="products/", null=True, blank=True)

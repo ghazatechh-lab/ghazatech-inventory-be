@@ -96,6 +96,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     brand_name = serializers.CharField(source="brand.name", read_only=True)
     category_name = serializers.CharField(source="category.name", read_only=True)
+    supplier_name = serializers.CharField(
+        source="supplier.supplier_name", read_only=True, allow_null=True
+    )
     product_image_url = serializers.SerializerMethodField()
     variants = ProductVariantSerializer(many=True, required=False)
     variant_count = serializers.SerializerMethodField()
