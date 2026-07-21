@@ -1,7 +1,13 @@
 from django.db import transaction
 from django.utils import timezone
-from .models import ProductStock, StockMovement
+
 from apps.notifications.services import notify_branch
+
+from .models import ProductStock, StockMovement
+
+
+def generate_stock_number(prefix="SM"):
+    return f"{prefix}-" f"{timezone.now():%Y%m%d%H%M%S%f}"
 
 
 @transaction.atomic
@@ -11,44 +17,80 @@ def adjust_stock(
     branch,
     quantity,
     movement_type,
+    variant=None,
     performed_by=None,
     reference_type="",
     reference_id="",
     remarks="",
     allow_negative=False,
 ):
+    """
+    Apply a signed stock quantity to one product/variant in one branch.
+
+    Positive quantity increases stock.
+    Negative quantity decreases stock.
+    """
+    if variant and variant.product_id != product.id:
+        raise ValueError("The selected variant does not belong to the product.")
+
+    lookup = {
+        "product": product,
+        "branch": branch,
+        "variant": variant,
+    }
+
     stock, _ = ProductStock.objects.select_for_update().get_or_create(
-        product=product,
-        branch=branch,
-        defaults={"reorder_level": product.reorder_level},
+        **lookup,
+        defaults={
+            "reorder_level": product.reorder_level,
+        },
     )
-    old = stock.current_stock
-    new = old + quantity
-    if new < 0 and not allow_negative:
+
+    previous_stock = stock.current_stock
+    new_stock = previous_stock + int(quantity)
+
+    if new_stock < 0 and not allow_negative:
         raise ValueError(
-            f"Insufficient stock for {product.sku}; available {stock.available_stock}"
+            f"Insufficient stock for {product.sku}. "
+            f"Current stock: {previous_stock}."
         )
-    stock.current_stock = new
-    stock.save(update_fields=["current_stock", "last_stock_update", "updated_at"])
+
+    stock.current_stock = new_stock
+    stock.reorder_level = product.reorder_level
+    stock.save(
+        update_fields=[
+            "current_stock",
+            "reorder_level",
+            "last_stock_update",
+            "updated_at",
+        ]
+    )
+
     movement = StockMovement.objects.create(
-        movement_number=f"SM-{timezone.now():%Y%m%d%H%M%S%f}",
+        movement_number=generate_stock_number(),
         product=product,
+        variant=variant,
         branch=branch,
         movement_type=movement_type,
-        quantity=quantity,
-        previous_stock=old,
-        new_stock=new,
+        quantity=int(quantity),
+        previous_stock=previous_stock,
+        new_stock=new_stock,
         reference_type=reference_type,
-        reference_id=str(reference_id),
+        reference_id=str(reference_id or ""),
         remarks=remarks,
         performed_by=performed_by,
     )
-    if stock.available_stock <= stock.reorder_level:
+
+    if stock.available_stock < 10:
         notify_branch(
             branch,
             "LOW_STOCK",
             "Low Stock Alert",
-            f"{product.product_name} is low in stock. Available: {stock.available_stock}",
+            (
+                f"{product.product_name} is low in stock. "
+                f"Available: {stock.available_stock}. Low-stock threshold: below 10."
+            ),
             "WARNING",
         )
+
     return movement

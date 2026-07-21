@@ -176,7 +176,16 @@ class ProductVariant(TimeStampedModel):
 
 class ProductStock(TimeStampedModel):
     product = models.ForeignKey(
-        Product, on_delete=models.CASCADE, related_name="stocks"
+        Product,
+        on_delete=models.CASCADE,
+        related_name="stocks",
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="branch_stocks",
     )
     branch = models.ForeignKey(
         "branches.Branch",
@@ -190,47 +199,144 @@ class ProductStock(TimeStampedModel):
     last_stock_update = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("product", "branch")
+        ordering = [
+            "product__product_name",
+            "branch__branch_code",
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "branch"],
+                condition=models.Q(variant__isnull=True),
+                name="unique_base_product_stock_per_branch",
+            ),
+            models.UniqueConstraint(
+                fields=["variant", "branch"],
+                condition=models.Q(variant__isnull=False),
+                name="unique_variant_stock_per_branch",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["product", "branch"]),
+            models.Index(fields=["variant", "branch"]),
+            models.Index(fields=["branch", "current_stock"]),
+        ]
 
     @property
     def available_stock(self):
-        return self.current_stock - self.reserved_stock
+        return self.current_stock - self.reserved_stock - self.damaged_stock
+
+    def __str__(self):
+        item = str(self.variant) if self.variant_id else self.product.product_name
+        return f"{item} @ {self.branch}"
 
 
 class StockMovement(TimeStampedModel):
     MOVES = [
         ("OPENING", "Opening Stock"),
-        ("PURCHASE", "Purchase Received"),
+        ("PURCHASE", "Purchase"),
         ("SALE", "Sale"),
         ("CUSTOMER_RETURN", "Customer Return"),
         ("SUPPLIER_RETURN", "Supplier Return"),
-        ("TRANSFER_OUT", "Stock Transfer Out"),
-        ("TRANSFER_IN", "Stock Transfer In"),
-        ("ADJUSTMENT", "Manual Adjustment"),
+        ("TRANSFER_OUT", "Transfer Out"),
+        ("TRANSFER_IN", "Transfer In"),
+        ("ADJUSTMENT", "Adjustment"),
         ("DAMAGED", "Damaged Stock"),
         ("INTERNAL", "Internal Use"),
     ]
-    movement_number = models.CharField(max_length=50, unique=True)
-    product = models.ForeignKey(Product, on_delete=models.PROTECT)
-    branch = models.ForeignKey("branches.Branch", on_delete=models.PROTECT)
-    movement_type = models.CharField(max_length=30, choices=MOVES)
-    quantity = models.IntegerField()
+
+    movement_number = models.CharField(
+        max_length=50,
+        unique=True,
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="stock_movements",
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="stock_movements",
+    )
+    branch = models.ForeignKey(
+        "branches.Branch",
+        on_delete=models.PROTECT,
+        related_name="stock_movements",
+    )
+    movement_type = models.CharField(
+        max_length=30,
+        choices=MOVES,
+    )
+    quantity = models.IntegerField(
+        help_text=(
+            "Signed quantity. Positive increases stock and " "negative decreases stock."
+        )
+    )
     previous_stock = models.IntegerField()
     new_stock = models.IntegerField()
-    reference_type = models.CharField(max_length=80, blank=True)
-    reference_id = models.CharField(max_length=80, blank=True)
+    reference_type = models.CharField(
+        max_length=80,
+        blank=True,
+    )
+    reference_id = models.CharField(
+        max_length=80,
+        blank=True,
+    )
     remarks = models.TextField(blank=True)
     performed_by = models.ForeignKey(
-        "accounts.User", null=True, on_delete=models.SET_NULL
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="stock_movements",
     )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["branch", "created_at"]),
+            models.Index(fields=["product", "created_at"]),
+            models.Index(fields=["variant", "created_at"]),
+            models.Index(fields=["movement_type", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.movement_number
 
 
 class StockAdjustment(TimeStampedModel, BranchAwareModel):
-    TYPES = [("ADD", "Add"), ("DEDUCT", "Deduct")]
-    STATUS = [("DRAFT", "Draft"), ("APPROVED", "Approved"), ("REJECTED", "Rejected")]
-    adjustment_number = models.CharField(max_length=50, unique=True)
-    product = models.ForeignKey(Product, on_delete=models.PROTECT)
-    adjustment_type = models.CharField(max_length=10, choices=TYPES)
+    TYPES = [
+        ("ADD", "Increase"),
+        ("DEDUCT", "Decrease"),
+    ]
+    STATUS = [
+        ("DRAFT", "Draft"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ]
+
+    adjustment_number = models.CharField(
+        max_length=50,
+        unique=True,
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="stock_adjustments",
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="stock_adjustments",
+    )
+    adjustment_type = models.CharField(
+        max_length=10,
+        choices=TYPES,
+    )
     quantity = models.PositiveIntegerField()
     reason = models.CharField(max_length=120)
     remarks = models.TextField(blank=True)
@@ -241,4 +347,25 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         on_delete=models.SET_NULL,
         related_name="approved_adjustments",
     )
-    status = models.CharField(max_length=20, choices=STATUS, default="DRAFT")
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS,
+        default="DRAFT",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["branch", "created_at"]),
+            models.Index(fields=["product", "created_at"]),
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    @property
+    def signed_quantity(self):
+        if self.adjustment_type == "DEDUCT":
+            return -self.quantity
+        return self.quantity
+
+    def __str__(self):
+        return self.adjustment_number
