@@ -1,13 +1,13 @@
 from rest_framework.decorators import action, api_view
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
 
+from apps.common.response import ok
 from .models import (
     Brand,
     Category,
     Product,
     ProductStock,
-    ProductVariant,
+    Rack,
     StockAdjustment,
     StockMovement,
 )
@@ -16,11 +16,10 @@ from .serializers import (
     CategorySerializer,
     ProductSerializer,
     ProductStockSerializer,
-    ProductVariantSerializer,
+    RackSerializer,
     StockAdjustmentSerializer,
     StockMovementSerializer,
 )
-from apps.common.response import ok
 
 
 class BrandViewSet(ModelViewSet):
@@ -37,43 +36,34 @@ class CategoryViewSet(ModelViewSet):
     filterset_fields = ["is_active"]
 
 
+class RackViewSet(ModelViewSet):
+    queryset = Rack.objects.select_related("branch").all()
+    serializer_class = RackSerializer
+    search_fields = ["rack_code", "rack_name", "branch__branch_name"]
+    filterset_fields = ["branch", "is_active"]
+
+
 class ProductViewSet(ModelViewSet):
     queryset = (
         Product.objects.filter(is_deleted=False)
-        .select_related("brand", "category", "supplier")
-        .prefetch_related("variants", "stocks")
+        .select_related("brand", "category", "supplier", "branch", "rack")
+        .prefetch_related("variants")
     )
     serializer_class = ProductSerializer
-    parser_classes = [MultiPartParser, FormParser, JSONParser]
-    search_fields = [
-        "product_name",
-        "sku",
-        "barcode",
-        "compatible_models",
-        "variants__variant_name",
-        "variants__sku",
-        "variants__barcode",
+    search_fields = ["product_name", "sku", "barcode", "compatible_models"]
+    filterset_fields = [
+        "brand",
+        "category",
+        "branch",
+        "rack",
+        "has_variants",
+        "is_active",
     ]
-    filterset_fields = ["brand", "category", "is_active"]
 
     def perform_destroy(self, obj):
         obj.is_deleted = True
         obj.deleted_by = self.request.user
-        obj.save(update_fields=["is_deleted", "deleted_by", "updated_at"])
-
-
-class ProductVariantViewSet(ModelViewSet):
-    queryset = ProductVariant.objects.select_related(
-        "product", "product__brand", "product__category"
-    )
-    serializer_class = ProductVariantSerializer
-    filterset_fields = ["product", "is_active", "is_default"]
-    search_fields = ["variant_name", "sku", "barcode"]
-
-    def perform_create(self, serializer):
-        product_id = self.request.data.get("product")
-        product = Product.objects.get(pk=product_id, is_deleted=False)
-        serializer.save(product=product)
+        obj.save()
 
 
 class StockViewSet(ReadOnlyModelViewSet):
@@ -84,9 +74,9 @@ class StockViewSet(ReadOnlyModelViewSet):
     @action(detail=False, methods=["get"], url_path="low-stock")
     def low_stock(self, request):
         data = [
-            item
-            for item in self.filter_queryset(self.get_queryset())
-            if item.available_stock <= item.reorder_level
+            x
+            for x in self.filter_queryset(self.get_queryset())
+            if x.available_stock <= x.reorder_level
         ]
         return ok(ProductStockSerializer(data, many=True).data)
 
@@ -114,21 +104,15 @@ class StockAdjustmentViewSet(ModelViewSet):
 @api_view(["GET"])
 def low_stock_products(request):
     queryset = ProductStock.objects.select_related(
-        "product",
-        "branch",
-        "product__brand",
-        "product__category",
+        "product", "branch", "product__brand", "product__category"
     )
-
     branch_id = request.query_params.get("branch")
     if branch_id:
         queryset = queryset.filter(branch_id=branch_id)
-
-    low_stock_items = [
+    items = [
         stock for stock in queryset if stock.available_stock <= stock.reorder_level
     ]
-
     return ok(
-        ProductStockSerializer(low_stock_items, many=True).data,
+        ProductStockSerializer(items, many=True).data,
         message="Low stock products fetched successfully",
     )

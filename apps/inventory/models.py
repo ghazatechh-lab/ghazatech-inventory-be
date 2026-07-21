@@ -1,11 +1,11 @@
-from django.db import models
 from django.core.validators import MinValueValidator
-from apps.common.models import TimeStampedModel, BranchAwareModel, SoftDeleteModel
+from django.db import models
+
+from apps.common.models import BranchAwareModel, SoftDeleteModel, TimeStampedModel
 
 
 class Brand(TimeStampedModel):
     name = models.CharField(max_length=100, unique=True)
-    description = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
 
     def __str__(self):
@@ -14,11 +14,37 @@ class Brand(TimeStampedModel):
 
 class Category(TimeStampedModel):
     name = models.CharField(max_length=120, unique=True)
-    description = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
 
     def __str__(self):
         return self.name
+
+
+class Rack(TimeStampedModel):
+    branch = models.ForeignKey(
+        "branches.Branch",
+        on_delete=models.CASCADE,
+        related_name="racks",
+    )
+    rack_code = models.CharField(max_length=50)
+    rack_name = models.CharField(max_length=120, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["branch", "rack_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "rack_code"],
+                name="unique_rack_code_per_branch",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["branch", "is_active"]),
+            models.Index(fields=["rack_code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.rack_code} - {self.branch}"
 
 
 class Product(TimeStampedModel, SoftDeleteModel):
@@ -34,13 +60,31 @@ class Product(TimeStampedModel, SoftDeleteModel):
         ("PACK", "Pack"),
         ("PAIR", "Pair"),
     ]
+
     product_name = models.CharField(max_length=250)
     sku = models.CharField(max_length=80, unique=True)
     barcode = models.CharField(max_length=100, unique=True, null=True, blank=True)
     brand = models.ForeignKey(Brand, on_delete=models.PROTECT, related_name="products")
     category = models.ForeignKey(
-        Category, on_delete=models.PROTECT, related_name="products"
+        Category,
+        on_delete=models.PROTECT,
+        related_name="products",
     )
+    branch = models.ForeignKey(
+        "branches.Branch",
+        on_delete=models.PROTECT,
+        related_name="products",
+        null=True,
+        blank=True,
+    )
+    rack = models.ForeignKey(
+        Rack,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="products",
+    )
+    has_variants = models.BooleanField(default=False)
     compatible_models = models.TextField(blank=True)
     condition = models.CharField(
         max_length=20, choices=CONDITION_CHOICES, default="NEW"
@@ -64,7 +108,6 @@ class Product(TimeStampedModel, SoftDeleteModel):
     product_image = models.ImageField(upload_to="products/", null=True, blank=True)
     warranty_period_days = models.PositiveIntegerField(default=0)
     reorder_level = models.PositiveIntegerField(default=0)
-    rack_location = models.CharField(max_length=100, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -72,10 +115,63 @@ class Product(TimeStampedModel, SoftDeleteModel):
             models.Index(fields=["sku"]),
             models.Index(fields=["barcode"]),
             models.Index(fields=["product_name"]),
+            models.Index(fields=["branch", "is_active"]),
         ]
 
     def __str__(self):
         return f"{self.sku} - {self.product_name}"
+
+
+class ProductVariant(TimeStampedModel):
+    product = models.ForeignKey(
+        Product, on_delete=models.CASCADE, related_name="variants"
+    )
+    attributes = models.JSONField(default=dict, blank=True)
+    available_qty = models.PositiveIntegerField(default=0)
+    purchase_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+    )
+    retail_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+    wholesale_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+    minimum_selling_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+    )
+    is_base = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["product", "id"]
+        indexes = [models.Index(fields=["product", "is_active"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product"],
+                condition=models.Q(is_base=True),
+                name="one_base_variant_per_product",
+            )
+        ]
+
+    def __str__(self):
+        if self.is_base:
+            return f"{self.product.product_name} - Base stock"
+        label = ", ".join(f"{key}: {value}" for key, value in self.attributes.items())
+        return f"{self.product.product_name} - {label or 'Variant'}"
 
 
 class ProductStock(TimeStampedModel):
@@ -83,7 +179,9 @@ class ProductStock(TimeStampedModel):
         Product, on_delete=models.CASCADE, related_name="stocks"
     )
     branch = models.ForeignKey(
-        "branches.Branch", on_delete=models.CASCADE, related_name="product_stocks"
+        "branches.Branch",
+        on_delete=models.CASCADE,
+        related_name="product_stocks",
     )
     current_stock = models.IntegerField(default=0)
     reserved_stock = models.IntegerField(default=0)
@@ -144,64 +242,3 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         related_name="approved_adjustments",
     )
     status = models.CharField(max_length=20, choices=STATUS, default="DRAFT")
-
-
-class ProductVariant(TimeStampedModel):
-    """Sellable variation of a product, such as Black / 16 GB / 512 GB."""
-
-    product = models.ForeignKey(
-        Product,
-        on_delete=models.CASCADE,
-        related_name="variants",
-    )
-    variant_name = models.CharField(max_length=250)
-    sku = models.CharField(max_length=100, unique=True)
-    barcode = models.CharField(max_length=120, unique=True, null=True, blank=True)
-    attributes = models.JSONField(default=dict, blank=True)
-    available_qty = models.PositiveIntegerField(
-        default=0,
-        help_text="Current available quantity for this product variant.",
-    )
-
-    # Product pricing is maintained only at variant level.
-    purchase_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
-    )
-    retail_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
-    )
-    wholesale_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
-    )
-    minimum_selling_price = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0, validators=[MinValueValidator(0)]
-    )
-    is_default = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ["product", "variant_name", "id"]
-        indexes = [
-            models.Index(fields=["product", "is_active"]),
-            models.Index(fields=["sku"]),
-            models.Index(fields=["barcode"]),
-        ]
-
-    def __str__(self):
-        return f"{self.product.product_name} - {self.variant_name}"
-
-    @property
-    def effective_purchase_price(self):
-        return self.purchase_price
-
-    @property
-    def effective_retail_price(self):
-        return self.retail_price
-
-    @property
-    def effective_wholesale_price(self):
-        return self.wholesale_price
-
-    @property
-    def effective_minimum_selling_price(self):
-        return self.minimum_selling_price
