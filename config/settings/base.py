@@ -103,7 +103,7 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
     ],
     "DEFAULT_PAGINATION_CLASS": "apps.common.pagination.StandardResultsSetPagination",
-    "PAGE_SIZE": 25,
+    "PAGE_SIZE": 12,
     "EXCEPTION_HANDLER": "apps.common.exceptions.custom_exception_handler",
 }
 SPECTACULAR_SETTINGS = {
