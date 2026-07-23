@@ -19,7 +19,7 @@ class StockTransferViewSet(ModelViewSet):
             "dispatched_by",
             "received_by",
         )
-        .prefetch_related("items")
+        .prefetch_related("items__product")
         .all()
     )
 
@@ -29,6 +29,17 @@ class StockTransferViewSet(ModelViewSet):
         "from_branch",
         "to_branch",
         "status",
+    ]
+
+    ordering_fields = [
+        "transfer_number",
+        "created_at",
+        "transfer_date",
+        "dispatch_date",
+        "received_date",
+        "status",
+        "from_branch__branch_name",
+        "to_branch__branch_name",
     ]
 
     search_fields = [

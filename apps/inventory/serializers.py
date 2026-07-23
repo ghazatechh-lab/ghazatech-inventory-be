@@ -567,6 +567,9 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = [
             "adjustment_number",
+            "adjustment_type",
+            "quantity",
+            "current_quantity",
             "status",
             "approved_by",
             "created_at",
@@ -592,6 +595,11 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         product = attrs.get("product")
         variant = attrs.get("variant")
+        actual_quantity = attrs.get("actual_quantity_counted")
+        if actual_quantity is None:
+            raise serializers.ValidationError(
+                {"actual_quantity_counted": "Actual quantity counted is required."}
+            )
 
         if variant and product and variant.product_id != product.id:
             raise serializers.ValidationError(

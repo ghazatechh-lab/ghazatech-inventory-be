@@ -338,6 +338,10 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         choices=TYPES,
     )
     quantity = models.PositiveIntegerField()
+    current_quantity = models.IntegerField(default=0)
+    actual_quantity_counted = models.IntegerField(
+        default=0, validators=[MinValueValidator(0)]
+    )
     reason = models.CharField(max_length=120)
     remarks = models.TextField(blank=True)
     approved_by = models.ForeignKey(

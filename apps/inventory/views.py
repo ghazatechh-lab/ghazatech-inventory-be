@@ -5,6 +5,7 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 from rest_framework.viewsets import (
     ModelViewSet,
     ReadOnlyModelViewSet,
@@ -32,9 +33,12 @@ from .serializers import (
     variant_label,
 )
 from .services import adjust_stock
+from .permissions import ReferenceDataPermission
 
 
 class BrandViewSet(ModelViewSet):
+    permission_classes = [ReferenceDataPermission]
+    ordering_fields = ["name", "is_active", "created_at"]
     queryset = Brand.objects.all()
     serializer_class = BrandSerializer
     search_fields = ["name"]
@@ -42,6 +46,8 @@ class BrandViewSet(ModelViewSet):
 
 
 class CategoryViewSet(ModelViewSet):
+    permission_classes = [ReferenceDataPermission]
+    ordering_fields = ["name", "is_active", "created_at"]
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     search_fields = ["name"]
@@ -49,6 +55,14 @@ class CategoryViewSet(ModelViewSet):
 
 
 class RackViewSet(ModelViewSet):
+    permission_classes = [ReferenceDataPermission]
+    ordering_fields = [
+        "rack_code",
+        "rack_name",
+        "branch__branch_code",
+        "is_active",
+        "created_at",
+    ]
     queryset = Rack.objects.select_related("branch").all()
     serializer_class = RackSerializer
     search_fields = [
@@ -82,6 +96,7 @@ class ProductViewSet(ModelViewSet):
         "barcode",
         "compatible_models",
     ]
+    ordering_fields = ["product_name", "sku", "condition", "created_at"]
     filterset_fields = [
         "brand",
         "category",
@@ -98,13 +113,17 @@ class ProductViewSet(ModelViewSet):
 
 
 class StockViewSet(ReadOnlyModelViewSet):
-    queryset = ProductStock.objects.select_related(
-        "product",
-        "product__brand",
-        "product__category",
-        "variant",
-        "branch",
-    ).filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    queryset = (
+        ProductStock.objects.select_related(
+            "product",
+            "product__brand",
+            "product__category",
+            "variant",
+            "branch",
+        )
+        .prefetch_related("product__variants")
+        .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    )
     serializer_class = ProductStockSerializer
     filterset_fields = [
         "branch",
@@ -117,25 +136,21 @@ class StockViewSet(ReadOnlyModelViewSet):
 
         branch_id = request.query_params.get("branch")
         product_id = request.query_params.get("product")
+        category_id = request.query_params.get("category")
         search = request.query_params.get(
-            "search",
-            "",
+            "search", request.query_params.get("q", "")
         ).strip()
-        status_filter = (
-            request.query_params.get(
-                "status",
-                "",
-            )
-            .strip()
-            .lower()
-        )
+        status_filter = request.query_params.get("status", "").strip().lower()
+        min_price = request.query_params.get("min_price")
+        max_price = request.query_params.get("max_price")
+        ordering = request.query_params.get("ordering", "product_name")
 
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
-
         if product_id:
             queryset = queryset.filter(product_id=product_id)
-
+        if category_id:
+            queryset = queryset.filter(product__category_id=category_id)
         if search:
             queryset = queryset.filter(
                 Q(product__product_name__icontains=search)
@@ -145,12 +160,20 @@ class StockViewSet(ReadOnlyModelViewSet):
             )
 
         groups = {}
-
         for stock in queryset:
-            key = (
-                stock.product_id,
-                stock.variant_id,
-            )
+            key = (stock.product_id, stock.variant_id)
+            if stock.variant_id:
+                retail_price = stock.variant.retail_price
+            else:
+                base_variant = next(
+                    (
+                        variant
+                        for variant in stock.product.variants.all()
+                        if variant.is_base
+                    ),
+                    None,
+                )
+                retail_price = base_variant.retail_price if base_variant else 0
 
             if key not in groups:
                 groups[key] = {
@@ -158,9 +181,11 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "product_name": stock.product.product_name,
                     "sku": stock.product.sku,
                     "brand_name": stock.product.brand.name,
+                    "category_id": stock.product.category_id,
                     "category_name": stock.product.category.name,
                     "variant_id": stock.variant_id,
                     "variant_label": variant_label(stock.variant),
+                    "retail_price": retail_price,
                     "reorder_level": stock.reorder_level,
                     "branch_stocks": [],
                     "total_current": 0,
@@ -171,7 +196,6 @@ class StockViewSet(ReadOnlyModelViewSet):
 
             available = stock.available_stock
             group = groups[key]
-
             group["branch_stocks"].append(
                 {
                     "branch_id": stock.branch_id,
@@ -183,47 +207,56 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "available_stock": available,
                 }
             )
-
             group["total_current"] += stock.current_stock
             group["total_reserved"] += stock.reserved_stock
             group["total_damaged"] += stock.damaged_stock
             group["total_available"] += available
-            group["reorder_level"] = max(
-                group["reorder_level"],
-                stock.reorder_level,
-            )
+            group["reorder_level"] = max(group["reorder_level"], stock.reorder_level)
 
         results = []
-
         for group in groups.values():
-            if group["total_available"] <= 0:
-                status = "out"
-            elif group["total_available"] < 10:
-                status = "low"
-            else:
-                status = "ok"
+            total = group["total_available"]
+            group["status"] = "out" if total <= 0 else "low" if total < 10 else "ok"
+            group["branch_stocks"].sort(key=lambda item: item["branch_code"] or "")
 
-            group["status"] = status
-            group["branch_stocks"].sort(key=lambda item: (item["branch_code"] or ""))
-
-            if status_filter and status_filter != status:
+            if status_filter and status_filter != group["status"]:
                 continue
-
+            price = float(group["retail_price"] or 0)
+            if min_price not in (None, "") and price < float(min_price):
+                continue
+            if max_price not in (None, "") and price > float(max_price):
+                continue
             results.append(group)
 
-        results.sort(
-            key=lambda item: (
+        ordering_map = {
+            "product_name": lambda item: (
                 item["product_name"].lower(),
                 item["variant_label"].lower(),
-            )
+            ),
+            "category_name": lambda item: item["category_name"].lower(),
+            "retail_price": lambda item: float(item["retail_price"] or 0),
+            "total_available": lambda item: item["total_available"],
+            "status": lambda item: {"out": 0, "low": 1, "ok": 2}.get(item["status"], 9),
+        }
+        descending = ordering.startswith("-")
+        ordering_key = ordering.lstrip("-")
+        results.sort(
+            key=ordering_map.get(ordering_key, ordering_map["product_name"]),
+            reverse=descending,
         )
 
+        count = len(results)
+        try:
+            page = max(int(request.query_params.get("page", 1)), 1)
+            page_size = min(max(int(request.query_params.get("page_size", 12)), 1), 500)
+        except (TypeError, ValueError):
+            page, page_size = 1, 12
+        start = (page - 1) * page_size
+        results = results[start : start + page_size]
+
         return ok(
-            {
-                "count": len(results),
-                "results": results,
-            },
-            message=("Stock overview fetched " "successfully."),
+            {"count": count, "results": results},
+            message="Stock overview fetched successfully.",
         )
 
     @action(
@@ -301,26 +334,37 @@ class StockAdjustmentViewSet(ModelViewSet):
         branch = serializer.validated_data.get("branch") or getattr(
             user, "branch", None
         )
-
         if not branch:
-            from rest_framework.exceptions import (
-                ValidationError,
-            )
-
             raise ValidationError(
-                {"branch": ("Branch is required for " "a stock adjustment.")}
+                {"branch": "Branch is required for a stock adjustment."}
             )
 
-        adjustment_type = serializer.validated_data["adjustment_type"]
-        quantity = serializer.validated_data["quantity"]
+        product = serializer.validated_data["product"]
+        variant = serializer.validated_data.get("variant")
+        stock, _ = ProductStock.objects.select_for_update().get_or_create(
+            product=product,
+            variant=variant,
+            branch=branch,
+            defaults={"current_stock": 0},
+        )
+        current_quantity = stock.current_stock
+        actual_quantity = serializer.validated_data["actual_quantity_counted"]
+        difference = actual_quantity - current_quantity
+        if difference == 0:
+            raise ValidationError(
+                {
+                    "actual_quantity_counted": "Actual quantity is already equal to current quantity."
+                }
+            )
 
-        signed_quantity = -quantity if adjustment_type == "DEDUCT" else quantity
-
-        adjustment_number = "SA-" f"{timezone.now():%Y%m%d%H%M%S%f}"
-
+        adjustment_number = f"SA-{timezone.now():%Y%m%d%H%M%S%f}"
         adjustment = serializer.save(
             adjustment_number=adjustment_number,
             branch=branch,
+            current_quantity=current_quantity,
+            actual_quantity_counted=actual_quantity,
+            adjustment_type="ADD" if difference > 0 else "DEDUCT",
+            quantity=abs(difference),
             status="APPROVED",
             approved_by=user,
             created_by=user,
@@ -328,15 +372,15 @@ class StockAdjustmentViewSet(ModelViewSet):
         )
 
         adjust_stock(
-            product=adjustment.product,
-            variant=adjustment.variant,
+            product=product,
+            variant=variant,
             branch=branch,
-            quantity=signed_quantity,
+            quantity=difference,
             movement_type="ADJUSTMENT",
             performed_by=user,
             reference_type="STOCK_ADJUSTMENT",
             reference_id=adjustment.id,
-            remarks=(f"{adjustment.reason}. " f"{adjustment.remarks}").strip(),
+            remarks=(f"{adjustment.reason}. {adjustment.remarks}").strip(),
         )
 
 
