@@ -1,33 +1,21 @@
-from django.urls import path
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import (
-    EmployeeViewSet,
-    AttendanceViewSet,
-    LeaveViewSet,
-    PayrollViewSet,
-    DepartmentViewSet,
-    DesignationViewSet,
-    LeaveTypeViewSet,
-    document_expiry,
-)
+from .views import *
 
-r = DefaultRouter()
-r.register("employees", EmployeeViewSet)
-r.register("attendance", AttendanceViewSet)
-r.register("leaves", LeaveViewSet)
-r.register("payroll", PayrollViewSet)
-r.register("departments", DepartmentViewSet)
-r.register("designations", DesignationViewSet)
-r.register("leave-types", LeaveTypeViewSet)
+router = DefaultRouter()
+router.register("departments", DepartmentViewSet, basename="department")
+router.register("designations", DesignationViewSet, basename="designation")
+router.register("employees", EmployeeViewSet, basename="employee")
+router.register("documents", EmployeeDocumentViewSet, basename="employee-document")
+router.register("attendance", AttendanceViewSet, basename="attendance")
+router.register("leave-types", LeaveTypeViewSet, basename="leave-type")
+router.register("leave-balances", LeaveBalanceViewSet, basename="leave-balance")
+router.register("leaves", LeaveRequestViewSet, basename="leave-request")
+router.register("salary-revisions", SalaryRevisionViewSet, basename="salary-revision")
+router.register("payroll-runs", PayrollRunViewSet, basename="payroll-run")
+router.register("payroll", PayrollEntryViewSet, basename="payroll-entry")
+router.register("document-expiry", DocumentExpiryViewSet, basename="document-expiry")
+router.register("reports", HRMSReportViewSet, basename="hrms-report")
 
-urlpatterns = [
-    path("document-expiry/", document_expiry, name="hrms-document-expiry"),
-    path(
-        "document-expiry/upcoming/",
-        document_expiry,
-        name="hrms-document-expiry-upcoming",
-    ),
-]
-
-urlpatterns += r.urls
+urlpatterns = [path("", include(router.urls))]
