@@ -348,8 +348,27 @@ class StockAdjustmentViewSet(ModelViewSet):
             defaults={"current_stock": 0},
         )
         current_quantity = stock.current_stock
-        actual_quantity = serializer.validated_data["actual_quantity_counted"]
-        difference = actual_quantity - current_quantity
+        actual_quantity = serializer.validated_data.get("actual_quantity_counted")
+
+        if actual_quantity is not None:
+            difference = actual_quantity - current_quantity
+        else:
+            adjustment_type = serializer.validated_data.get("adjustment_type")
+            requested_quantity = serializer.validated_data.get("quantity")
+            difference = (
+                requested_quantity if adjustment_type == "ADD" else -requested_quantity
+            )
+            actual_quantity = current_quantity + difference
+
+        if actual_quantity < 0:
+            raise ValidationError(
+                {
+                    "quantity": (
+                        f"Cannot deduct {abs(difference)} items. "
+                        f"Only {current_quantity} items are currently in stock."
+                    )
+                }
+            )
         if difference == 0:
             raise ValidationError(
                 {

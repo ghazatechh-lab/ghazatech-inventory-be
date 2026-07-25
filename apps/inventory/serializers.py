@@ -706,6 +706,18 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
 
 class StockAdjustmentSerializer(serializers.ModelSerializer):
+    adjustment_type = serializers.ChoiceField(
+        choices=StockAdjustment.TYPES,
+        required=False,
+    )
+    quantity = serializers.IntegerField(
+        min_value=1,
+        required=False,
+    )
+    actual_quantity_counted = serializers.IntegerField(
+        min_value=0,
+        required=False,
+    )
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -737,8 +749,6 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = [
             "adjustment_number",
-            "adjustment_type",
-            "quantity",
             "current_quantity",
             "status",
             "approved_by",
@@ -766,9 +776,25 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         product = attrs.get("product")
         variant = attrs.get("variant")
         actual_quantity = attrs.get("actual_quantity_counted")
-        if actual_quantity is None:
+        adjustment_type = attrs.get("adjustment_type")
+        quantity = attrs.get("quantity")
+
+        # Support both stock-adjustment request formats:
+        # 1. Physical-count mode: actual_quantity_counted
+        # 2. Existing frontend mode: adjustment_type + quantity
+        if actual_quantity is None and (not adjustment_type or quantity is None):
             raise serializers.ValidationError(
-                {"actual_quantity_counted": "Actual quantity counted is required."}
+                {
+                    "actual_quantity_counted": (
+                        "Enter the actual quantity counted, or provide an "
+                        "adjustment type and quantity."
+                    )
+                }
+            )
+
+        if quantity is not None and quantity < 1:
+            raise serializers.ValidationError(
+                {"quantity": "Quantity must be at least 1."}
             )
 
         if variant and product and variant.product_id != product.id:
