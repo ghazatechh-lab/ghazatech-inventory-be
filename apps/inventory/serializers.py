@@ -199,32 +199,44 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+
     product_image_url = serializers.SerializerMethodField()
+
     variants = ProductVariantSerializer(
         many=True,
         required=False,
     )
+
     total_available_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
         fields = "__all__"
+
         read_only_fields = [
             "created_at",
             "updated_at",
             "is_deleted",
         ]
 
+        extra_kwargs = {
+            "barcode": {
+                "required": False,
+                "allow_blank": True,
+                "allow_null": True,
+            },
+        }
+
     def get_product_image_url(self, obj):
         if not obj.product_image:
             return None
 
         request = self.context.get("request")
-        return (
-            request.build_absolute_uri(obj.product_image.url)
-            if request
-            else obj.product_image.url
-        )
+
+        if request:
+            return request.build_absolute_uri(obj.product_image.url)
+
+        return obj.product_image.url
 
     def get_total_available_qty(self, obj):
         return sum(
@@ -235,11 +247,30 @@ class ProductSerializer(serializers.ModelSerializer):
         )
 
     def to_internal_value(self, data):
+        """
+        Convert QueryDict or normal dictionary into mutable data.
+
+        Also converts empty barcode values into None so PostgreSQL
+        does not receive duplicate empty strings for a unique field.
+        """
         mutable = (
             {key: data.get(key) for key in data.keys()}
             if hasattr(data, "getlist")
             else dict(data)
         )
+
+        barcode = mutable.get(
+            "barcode",
+            serializers.empty,
+        )
+
+        if barcode is not serializers.empty:
+            if barcode is None:
+                mutable["barcode"] = None
+            else:
+                normalized_barcode = str(barcode).strip()
+
+                mutable["barcode"] = normalized_barcode if normalized_barcode else None
 
         variants = mutable.get(
             "variants",
@@ -247,14 +278,22 @@ class ProductSerializer(serializers.ModelSerializer):
         )
 
         if variants is not serializers.empty:
-            if variants in (None, ""):
+            if variants in (
+                None,
+                "",
+            ):
                 mutable["variants"] = []
-            elif isinstance(variants, str):
+
+            elif isinstance(
+                variants,
+                str,
+            ):
                 try:
                     mutable["variants"] = json.loads(variants)
+
                 except json.JSONDecodeError as exc:
                     raise serializers.ValidationError(
-                        {"variants": "Invalid variant data."}
+                        {"variants": ("Invalid variant data.")}
                     ) from exc
 
         return super().to_internal_value(mutable)
@@ -262,11 +301,20 @@ class ProductSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         branch = attrs.get(
             "branch",
-            getattr(self.instance, "branch", None),
+            getattr(
+                self.instance,
+                "branch",
+                None,
+            ),
         )
+
         rack = attrs.get(
             "rack",
-            getattr(self.instance, "rack", None),
+            getattr(
+                self.instance,
+                "rack",
+                None,
+            ),
         )
 
         if rack and branch and rack.branch_id != branch.id:
@@ -276,8 +324,39 @@ class ProductSerializer(serializers.ModelSerializer):
 
         return attrs
 
-    def validate_variants(self, variants):
+    def validate_barcode(self, value):
+        """
+        Empty barcode values are stored as NULL.
+
+        PostgreSQL allows multiple NULL values in a unique column,
+        but it does not allow multiple empty strings.
+        """
+        if value is None:
+            return None
+
+        normalized_value = str(value).strip()
+
+        if not normalized_value:
+            return None
+
+        queryset = Product.objects.filter(barcode=normalized_value)
+
+        if self.instance:
+            queryset = queryset.exclude(pk=self.instance.pk)
+
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "A product with this barcode already exists."
+            )
+
+        return normalized_value
+
+    def validate_variants(
+        self,
+        variants,
+    ):
         has_variants = self.initial_data.get("has_variants")
+
         has_variants = str(has_variants).lower() in {
             "true",
             "1",
@@ -301,12 +380,42 @@ class ProductSerializer(serializers.ModelSerializer):
         return variants
 
     @staticmethod
-    def _sync_variants(product, variants_data):
+    def _normalize_barcode(
+        validated_data,
+    ):
+        """
+        Defensive normalization for create and update.
+
+        This protects the database even when serializer field
+        validation is bypassed by custom logic.
+        """
+        if "barcode" not in validated_data:
+            return validated_data
+
+        barcode = validated_data.get("barcode")
+
+        if barcode is None:
+            validated_data["barcode"] = None
+            return validated_data
+
+        barcode = str(barcode).strip()
+
+        validated_data["barcode"] = barcode if barcode else None
+
+        return validated_data
+
+    @staticmethod
+    def _sync_variants(
+        product,
+        variants_data,
+    ):
         existing = {variant.id: variant for variant in product.variants.all()}
+
         retained_ids = []
 
         if not product.has_variants:
             base_data = variants_data[0] if variants_data else {}
+
             base = product.variants.filter(is_base=True).first()
 
             if not base:
@@ -316,33 +425,64 @@ class ProductSerializer(serializers.ModelSerializer):
                 )
 
             base.attributes = {}
+
             base.available_qty = base_data.get("available_qty") or 0
+
             base.purchase_price = base_data.get("purchase_price") or None
+
             base.retail_price = base_data.get("retail_price") or 0
+
             base.wholesale_price = base_data.get("wholesale_price") or 0
+
             base.minimum_selling_price = base_data.get("minimum_selling_price") or 0
+
             base.is_active = True
+
             base.save()
 
             product.variants.exclude(id=base.id).delete()
+
             return
 
         product.variants.filter(is_base=True).delete()
 
-        for variant_data in variants_data:
+        for source_variant_data in variants_data:
+            variant_data = dict(source_variant_data)
+
             variant_id = variant_data.pop(
                 "id",
                 None,
             )
+
             variant_data["is_base"] = False
+
             variant_data["available_qty"] = variant_data.get("available_qty") or 0
+
             variant_data["purchase_price"] = variant_data.get("purchase_price") or None
+
+            variant_data["retail_price"] = variant_data.get("retail_price") or 0
+
+            variant_data["wholesale_price"] = variant_data.get("wholesale_price") or 0
+
+            variant_data["minimum_selling_price"] = (
+                variant_data.get("minimum_selling_price") or 0
+            )
 
             if variant_id and variant_id in existing:
                 variant = existing[variant_id]
-                for field, value in variant_data.items():
-                    setattr(variant, field, value)
+
+                for (
+                    field,
+                    field_value,
+                ) in variant_data.items():
+                    setattr(
+                        variant,
+                        field,
+                        field_value,
+                    )
+
                 variant.save()
+
             else:
                 variant = ProductVariant.objects.create(
                     product=product,
@@ -353,22 +493,31 @@ class ProductSerializer(serializers.ModelSerializer):
 
         product.variants.exclude(id__in=retained_ids).delete()
 
-    def _sync_branch_stock(self, product, *, reference_type):
-        """Synchronize product-form quantity with real branch stock.
+    def _sync_branch_stock(
+        self,
+        product,
+        *,
+        reference_type,
+    ):
+        """
+        Synchronize the quantity entered in the product form
+        with the actual ProductStock record.
 
-        Every actual quantity difference is written through adjust_stock(),
-        which records previous stock, new stock, user and timestamp.
+        Every quantity difference is written through adjust_stock()
+        so the stock movement audit history is preserved.
         """
         if not product.branch_id:
             return
 
         request = self.context.get("request")
-        user = request.user if request and request.user.is_authenticated else None
+
+        user = request.user if (request and request.user.is_authenticated) else None
 
         active_variants = product.variants.filter(is_active=True)
 
         for variant in active_variants:
             stock_variant = variant if product.has_variants else None
+
             desired_quantity = int(variant.available_qty or 0)
 
             stock, _ = ProductStock.objects.get_or_create(
@@ -377,22 +526,25 @@ class ProductSerializer(serializers.ModelSerializer):
                 variant=stock_variant,
                 defaults={
                     "current_stock": 0,
-                    "reorder_level": product.reorder_level,
+                    "reorder_level": (product.reorder_level),
                 },
             )
 
-            current_quantity = stock.current_stock
+            current_quantity = int(stock.current_stock or 0)
+
             difference = desired_quantity - current_quantity
 
             if difference == 0:
                 if stock.reorder_level != product.reorder_level:
                     stock.reorder_level = product.reorder_level
+
                     stock.save(
                         update_fields=[
                             "reorder_level",
                             "updated_at",
                         ]
                     )
+
                 continue
 
             adjust_stock(
@@ -409,34 +561,51 @@ class ProductSerializer(serializers.ModelSerializer):
                 remarks=(
                     "Opening stock entered from product form."
                     if reference_type == "PRODUCT_CREATE"
-                    else "Stock quantity updated from product edit form."
+                    else ("Stock quantity updated from " "product edit form.")
                 ),
             )
 
     @transaction.atomic
-    def create(self, validated_data):
+    def create(
+        self,
+        validated_data,
+    ):
+        validated_data = self._normalize_barcode(validated_data)
+
         variants_data = validated_data.pop(
             "variants",
             [],
         )
+
         product = super().create(validated_data)
+
         self._sync_variants(
             product,
             variants_data,
         )
+
         self._sync_branch_stock(
             product,
-            reference_type="PRODUCT_CREATE",
+            reference_type=("PRODUCT_CREATE"),
         )
+
         return product
 
     @transaction.atomic
-    def update(self, instance, validated_data):
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        validated_data = self._normalize_barcode(validated_data)
+
         variants_supplied = "variants" in validated_data
+
         variants_data = validated_data.pop(
             "variants",
             [],
         )
+
         product = super().update(
             instance,
             validated_data,
@@ -450,8 +619,9 @@ class ProductSerializer(serializers.ModelSerializer):
 
         self._sync_branch_stock(
             product,
-            reference_type="PRODUCT_EDIT",
+            reference_type=("PRODUCT_EDIT"),
         )
+
         return product
 
 
