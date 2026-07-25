@@ -5,29 +5,58 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ghaza_inventory_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    volumes: [postgres_data:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # In production, do not expose DB publicly
+    # ports:
+    #   - "5432:5432"
+
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    # In production, do not expose Redis publicly
+    # ports:
+    #   - "6379:6379"
+
   backend:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
-    env_file: .env
-    volumes: [.:/app]
-    ports: ["8000:8000"]
-    depends_on: [db, redis]
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./media:/app/media
+      - ./staticfiles:/app/staticfiles
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+
   celery_worker:
     build: .
     command: celery -A config worker -l info
-    env_file: .env
-    volumes: [.:/app]
-    depends_on: [backend, redis]
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./media:/app/media
+      - ./staticfiles:/app/staticfiles
+    depends_on:
+      - backend
+      - redis
+
   celery_beat:
     build: .
     command: celery -A config beat -l info
-    env_file: .env
-    volumes: [.:/app]
-    depends_on: [backend, redis]
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./media:/app/media
+      - ./staticfiles:/app/staticfiles
+    depends_on:
+      - backend
+      - redis
+
 volumes:
   postgres_data:
