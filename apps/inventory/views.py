@@ -122,6 +122,7 @@ class StockViewSet(ReadOnlyModelViewSet):
             "branch",
         )
         .prefetch_related("product__variants")
+        .filter(product__is_deleted=False)
         .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
     )
     serializer_class = ProductStockSerializer
@@ -350,25 +351,28 @@ class StockAdjustmentViewSet(ModelViewSet):
         current_quantity = stock.current_stock
         actual_quantity = serializer.validated_data.get("actual_quantity_counted")
 
-        if actual_quantity is not None:
-            difference = actual_quantity - current_quantity
-        else:
+        # Support both adjustment workflows:
+        # 1. Physical count: actual_quantity_counted
+        # 2. Existing frontend: adjustment_type + quantity
+        if actual_quantity is None:
             adjustment_type = serializer.validated_data.get("adjustment_type")
-            requested_quantity = serializer.validated_data.get("quantity")
-            difference = (
-                requested_quantity if adjustment_type == "ADD" else -requested_quantity
-            )
+            quantity = serializer.validated_data.get("quantity")
+            if adjustment_type not in {"ADD", "DEDUCT"} or not quantity:
+                raise ValidationError(
+                    {
+                        "quantity": (
+                            "Provide a valid quantity and adjustment type, "
+                            "or enter the actual quantity counted."
+                        )
+                    }
+                )
+            difference = quantity if adjustment_type == "ADD" else -quantity
             actual_quantity = current_quantity + difference
+        else:
+            difference = actual_quantity - current_quantity
 
         if actual_quantity < 0:
-            raise ValidationError(
-                {
-                    "quantity": (
-                        f"Cannot deduct {abs(difference)} items. "
-                        f"Only {current_quantity} items are currently in stock."
-                    )
-                }
-            )
+            raise ValidationError({"quantity": "Stock cannot be reduced below zero."})
         if difference == 0:
             raise ValidationError(
                 {
@@ -405,13 +409,17 @@ class StockAdjustmentViewSet(ModelViewSet):
 
 @api_view(["GET"])
 def low_stock_products(request):
-    queryset = ProductStock.objects.select_related(
-        "product",
-        "variant",
-        "branch",
-        "product__brand",
-        "product__category",
-    ).filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    queryset = (
+        ProductStock.objects.select_related(
+            "product",
+            "variant",
+            "branch",
+            "product__brand",
+            "product__category",
+        )
+        .filter(product__is_deleted=False)
+        .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    )
 
     branch_id = request.query_params.get("branch")
 

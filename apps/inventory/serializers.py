@@ -706,18 +706,6 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
 
 class StockAdjustmentSerializer(serializers.ModelSerializer):
-    adjustment_type = serializers.ChoiceField(
-        choices=StockAdjustment.TYPES,
-        required=False,
-    )
-    quantity = serializers.IntegerField(
-        min_value=1,
-        required=False,
-    )
-    actual_quantity_counted = serializers.IntegerField(
-        min_value=0,
-        required=False,
-    )
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -757,6 +745,11 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
             "created_by",
             "updated_by",
         ]
+        extra_kwargs = {
+            "actual_quantity_counted": {"required": False},
+            "adjustment_type": {"required": False},
+            "quantity": {"required": False},
+        }
 
     def get_variant_label(self, obj):
         return variant_label(obj.variant)
@@ -779,22 +772,24 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         adjustment_type = attrs.get("adjustment_type")
         quantity = attrs.get("quantity")
 
-        # Support both stock-adjustment request formats:
-        # 1. Physical-count mode: actual_quantity_counted
-        # 2. Existing frontend mode: adjustment_type + quantity
-        if actual_quantity is None and (not adjustment_type or quantity is None):
+        if actual_quantity is None and not (adjustment_type and quantity):
             raise serializers.ValidationError(
                 {
-                    "actual_quantity_counted": (
-                        "Enter the actual quantity counted, or provide an "
-                        "adjustment type and quantity."
+                    "quantity": (
+                        "Quantity is required when actual quantity counted "
+                        "is not provided."
                     )
                 }
             )
 
-        if quantity is not None and quantity < 1:
+        if adjustment_type and adjustment_type not in {"ADD", "DEDUCT"}:
             raise serializers.ValidationError(
-                {"quantity": "Quantity must be at least 1."}
+                {"adjustment_type": "Select Increase or Decrease."}
+            )
+
+        if quantity is not None and quantity <= 0:
+            raise serializers.ValidationError(
+                {"quantity": "Quantity must be greater than zero."}
             )
 
         if variant and product and variant.product_id != product.id:
