@@ -37,6 +37,28 @@ class CustomerSerializer(serializers.ModelSerializer):
             "deleted_by",
         ]
 
+    def to_internal_value(self, data):
+        """Normalize legacy/lowercase customer choice values."""
+        mutable = data.copy() if hasattr(data, "copy") else dict(data)
+
+        customer_type = mutable.get("customer_type")
+        category = mutable.get("category")
+
+        if isinstance(customer_type, str):
+            normalized_type = customer_type.strip().upper()
+
+            # Older frontend versions submitted category values as customer_type.
+            if normalized_type in {"RETAIL", "WHOLESALE", "CORPORATE", "LEAD"}:
+                mutable["category"] = normalized_type
+                mutable["customer_type"] = "BUSINESS"
+            else:
+                mutable["customer_type"] = normalized_type
+
+        if isinstance(category, str):
+            mutable["category"] = category.strip().upper()
+
+        return super().to_internal_value(mutable)
+
     def get_status(self, obj):
         if not obj.is_active:
             return "INACTIVE"

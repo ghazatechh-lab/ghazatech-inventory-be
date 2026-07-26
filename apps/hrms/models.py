@@ -521,6 +521,14 @@ class LeaveRequest(TimeStampedModel):
 
 
 class SalaryRevision(TimeStampedModel):
+    PAYROLL_STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("PROCESSING", "Processing"),
+        ("PAID", "Paid"),
+        ("FAILED", "Failed"),
+        ("CANCELLED", "Cancelled"),
+    ]
+
     REASON_CHOICES = [
         ("JOINING", "Joining"),
         ("ANNUAL_INCREMENT", "Annual Increment"),
@@ -545,6 +553,10 @@ class SalaryRevision(TimeStampedModel):
         null=True,
         blank=True,
     )
+    effective_to = models.DateField(
+        null=True,
+        blank=True,
+    )
     basic_salary = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -559,6 +571,18 @@ class SalaryRevision(TimeStampedModel):
         blank=True,
         default=0,
     )
+    deductions = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True, default=0
+    )
+    payroll_status = models.CharField(
+        max_length=20,
+        choices=PAYROLL_STATUS_CHOICES,
+        null=True,
+        blank=True,
+        default="PAID",
+    )
+    payment_date = models.DateField(null=True, blank=True)
+    payment_reference = models.CharField(max_length=120, null=True, blank=True)
     approved_by_name = models.CharField(max_length=150, null=True, blank=True)
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

@@ -113,8 +113,37 @@ class EmployeeViewSet(BaseViewSet):
     @action(detail=True, methods=["get"], url_path="salary-history")
     def salary_history(self, request, pk=None):
         employee = self.get_object()
+        revisions = employee.salary_revisions.all()
+
+        # Repair legacy data where the employee was created with zero salary and
+        # the actual salary was added later without a salary revision. This is
+        # only applied when there is no later revision, so genuine history is
+        # never overwritten.
+        joining = (
+            revisions.filter(reason="JOINING").order_by("effective_from", "id").first()
+        )
+        has_later_revision = revisions.exclude(reason="JOINING").exists()
+        employee_total = Decimal(employee.basic_salary or 0) + Decimal(
+            employee.allowances or 0
+        )
+
+        if (
+            joining
+            and not has_later_revision
+            and Decimal(joining.basic_salary or 0) + Decimal(joining.allowances or 0)
+            == 0
+            and employee_total > 0
+        ):
+            joining.basic_salary = employee.basic_salary or 0
+            joining.allowances = employee.allowances or 0
+            joining.save(update_fields=["basic_salary", "allowances", "updated_at"])
+
         return Response(
-            SalaryRevisionSerializer(employee.salary_revisions.all(), many=True).data
+            SalaryRevisionSerializer(
+                employee.salary_revisions.all(),
+                many=True,
+                context={"request": request},
+            ).data
         )
 
     @action(detail=True, methods=["post"], url_path="salary-revisions")
@@ -588,7 +617,9 @@ class PayrollRunViewSet(BaseViewSet):
 
 
 class PayrollEntryViewSet(BaseViewSet):
-    queryset = PayrollEntry.objects.select_related("employee", "branch", "payroll_run")
+    queryset = PayrollEntry.objects.select_related(
+        "employee", "branch", "payroll_run"
+    ).order_by("-created_at", "-id")
     serializer_class = PayrollEntrySerializer
     search_fields = [
         "employee__employee_code",

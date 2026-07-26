@@ -85,6 +85,7 @@ class QuotationSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
         read_only_fields = [
+            "quote_number",
             "sent_at",
             "accepted_at",
             "rejected_at",
@@ -381,7 +382,7 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
         if not stock:
             return 0
 
-        return stock.current_stock - stock.reserved_stock
+        return stock.current_stock - stock.reserved_stock - stock.damaged_stock
 
 
 class SalesOrderSerializer(serializers.ModelSerializer):
@@ -478,7 +479,7 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         if not stock:
             return Decimal("0")
 
-        return stock.current_stock - stock.reserved_stock
+        return stock.current_stock - stock.reserved_stock - stock.damaged_stock
 
     def validate(self, attrs):
         branch = attrs.get(
@@ -780,6 +781,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
         read_only_fields = [
+            "invoice_number",
             "issued_at",
             "paid_at",
             "voided_at",
@@ -1166,6 +1168,7 @@ class POSSaleSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
         read_only_fields = [
+            "receipt_number",
             "completed_at",
             "voided_at",
             "created_at",
@@ -1219,7 +1222,7 @@ class POSSaleSerializer(serializers.ModelSerializer):
         if not stock:
             return Decimal("0")
 
-        return stock.current_stock - stock.reserved_stock
+        return stock.current_stock - stock.reserved_stock - stock.damaged_stock
 
     def validate(self, attrs):
         branch = attrs.get(

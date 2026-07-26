@@ -17,6 +17,19 @@ from .models import (
 )
 
 
+def get_requested_branch_id(serializer):
+    request = (
+        serializer.context.get("request") if hasattr(serializer, "context") else None
+    )
+    if not request:
+        return None
+    value = request.query_params.get("branch")
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def variant_label(variant):
     if not variant:
         return "Base product"
@@ -136,23 +149,25 @@ class ProductVariantSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         product = instance.product
+        branch_id = get_requested_branch_id(self) or product.branch_id
 
-        if product.branch_id:
+        if branch_id:
             stock_variant = instance if product.has_variants else None
 
             stock = ProductStock.objects.filter(
                 product=product,
                 variant=stock_variant,
-                branch_id=product.branch_id,
+                branch_id=branch_id,
             ).first()
 
             if stock:
                 data["available_qty"] = stock.available_stock
             else:
-                # Existing installations may not yet have a branch-stock
-                # row for this attribute combination. Keep the stored
-                # variant quantity until the repair migration creates it.
-                data["available_qty"] = int(instance.available_qty or 0)
+                # When a branch is explicitly selected, only stock rows in
+                # that branch are valid. Do not fall back to the variant's
+                # legacy/global quantity because it can belong to another
+                # branch and makes the product list quantity inaccurate.
+                data["available_qty"] = 0
 
         return data
 
@@ -179,21 +194,9 @@ class ProductSerializer(serializers.ModelSerializer):
         source="category.name",
         read_only=True,
     )
-    branch_name = serializers.CharField(
-        source="branch.branch_name",
-        read_only=True,
-        allow_null=True,
-    )
-    branch_code = serializers.CharField(
-        source="branch.branch_code",
-        read_only=True,
-        allow_null=True,
-    )
-    rack_code = serializers.CharField(
-        source="rack.rack_code",
-        read_only=True,
-        allow_null=True,
-    )
+    branch_name = serializers.SerializerMethodField()
+    branch_code = serializers.SerializerMethodField()
+    rack_code = serializers.SerializerMethodField()
     supplier_name = serializers.CharField(
         source="supplier.supplier_name",
         read_only=True,
@@ -227,6 +230,28 @@ class ProductSerializer(serializers.ModelSerializer):
             },
         }
 
+    def _selected_branch(self, obj):
+        branch_id = get_requested_branch_id(self)
+        if not branch_id:
+            return obj.branch
+
+        stock = obj.stocks.filter(branch_id=branch_id).select_related("branch").first()
+        return stock.branch if stock else obj.branch
+
+    def get_branch_name(self, obj):
+        branch = self._selected_branch(obj)
+        return branch.branch_name if branch else None
+
+    def get_branch_code(self, obj):
+        branch = self._selected_branch(obj)
+        return branch.branch_code if branch else None
+
+    def get_rack_code(self, obj):
+        branch_id = get_requested_branch_id(self)
+        if branch_id and obj.rack_id and obj.rack.branch_id != branch_id:
+            return None
+        return obj.rack.rack_code if obj.rack_id else None
+
     def get_product_image_url(self, obj):
         if not obj.product_image:
             return None
@@ -239,12 +264,12 @@ class ProductSerializer(serializers.ModelSerializer):
         return obj.product_image.url
 
     def get_total_available_qty(self, obj):
-        return sum(
-            obj.stocks.all().values_list(
-                "current_stock",
-                flat=True,
-            )
-        )
+        stocks = obj.stocks.all()
+        branch_id = get_requested_branch_id(self)
+        if branch_id:
+            stocks = stocks.filter(branch_id=branch_id)
+
+        return sum(max(0, stock.available_stock) for stock in stocks)
 
     def to_internal_value(self, data):
         """
@@ -737,6 +762,8 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = [
             "adjustment_number",
+            "adjustment_type",
+            "quantity",
             "current_quantity",
             "status",
             "approved_by",
@@ -745,11 +772,6 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
             "created_by",
             "updated_by",
         ]
-        extra_kwargs = {
-            "actual_quantity_counted": {"required": False},
-            "adjustment_type": {"required": False},
-            "quantity": {"required": False},
-        }
 
     def get_variant_label(self, obj):
         return variant_label(obj.variant)
@@ -769,27 +791,9 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         product = attrs.get("product")
         variant = attrs.get("variant")
         actual_quantity = attrs.get("actual_quantity_counted")
-        adjustment_type = attrs.get("adjustment_type")
-        quantity = attrs.get("quantity")
-
-        if actual_quantity is None and not (adjustment_type and quantity):
+        if actual_quantity is None:
             raise serializers.ValidationError(
-                {
-                    "quantity": (
-                        "Quantity is required when actual quantity counted "
-                        "is not provided."
-                    )
-                }
-            )
-
-        if adjustment_type and adjustment_type not in {"ADD", "DEDUCT"}:
-            raise serializers.ValidationError(
-                {"adjustment_type": "Select Increase or Decrease."}
-            )
-
-        if quantity is not None and quantity <= 0:
-            raise serializers.ValidationError(
-                {"quantity": "Quantity must be greater than zero."}
+                {"actual_quantity_counted": "Actual quantity counted is required."}
             )
 
         if variant and product and variant.product_id != product.id:

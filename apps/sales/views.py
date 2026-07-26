@@ -15,11 +15,102 @@ from apps.common.logging import LoggedModelViewSet as ModelViewSet
 
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
+from apps.hrms.models import Employee
 from apps.finance.models import BankAccount, CashRegister
 from apps.customers.models import Customer
 from apps.branches.models import Branch
 from apps.accounts.models import User
 from .serializers import *
+
+
+def _sales_product_options(branch_id):
+    if not branch_id:
+        return []
+    stocks = (
+        ProductStock.objects.select_related("product", "variant", "branch")
+        .filter(branch_id=branch_id, product__is_active=True)
+        .order_by("product__product_name", "variant_id")
+    )
+    rows = []
+    for stock in stocks:
+        product = stock.product
+        if getattr(product, "is_deleted", False):
+            continue
+        available = stock.current_stock - stock.reserved_stock - stock.damaged_stock
+        if available <= 0:
+            continue
+        variant = stock.variant
+        price_variant = variant
+        if price_variant is None:
+            price_variant = product.variants.filter(
+                is_base=True, is_active=True
+            ).first()
+        if price_variant is None:
+            price_variant = (
+                product.variants.filter(is_active=True).order_by("id").first()
+            )
+
+        price = getattr(price_variant, "retail_price", None)
+        if price in (None, 0):
+            price = getattr(product, "selling_price", 0) or 0
+
+        rows.append(
+            {
+                "stock_id": stock.id,
+                "id": product.id,
+                "product_id": product.id,
+                "variant_id": stock.variant_id,
+                "product_name": product.product_name,
+                "sku": getattr(product, "sku", ""),
+                "barcode": getattr(product, "barcode", ""),
+                "description": getattr(product, "description", ""),
+                "selling_price": price,
+                "retail_price": price,
+                "unit_price": price,
+                "price": price,
+                "available_stock": available,
+                "variant_name": str(variant) if variant else "",
+            }
+        )
+    return rows
+
+
+def _salespeople_options():
+    employees = list(
+        Employee.objects.filter(employment_status="ACTIVE").order_by(
+            "first_name", "last_name"
+        )
+    )
+    users_by_email = {
+        str(u.email or "").lower(): u
+        for u in User.objects.filter(is_active=True)
+        if u.email
+    }
+    result = []
+    used = set()
+    for employee in employees:
+        user = users_by_email.get(str(employee.email or "").lower())
+        if not user:
+            continue
+        used.add(user.id)
+        name = f"{employee.first_name} {employee.last_name or ''}".strip()
+        result.append(
+            {
+                "id": user.id,
+                "display_name": name,
+                "employee_code": employee.employee_code or "",
+            }
+        )
+    for user in User.objects.filter(is_active=True).order_by("first_name", "username"):
+        if user.id not in used:
+            result.append(
+                {
+                    "id": user.id,
+                    "display_name": user.get_full_name() or user.username,
+                    "employee_code": "",
+                }
+            )
+    return result
 
 
 class Base(ModelViewSet):
@@ -73,6 +164,32 @@ class QuotationViewSet(Base):
         "-quote_date",
         "-id",
     ]
+
+    @action(detail=False, methods=["get"], url_path="form-options")
+    def form_options(self, request):
+        branch_id = request.query_params.get("branch")
+        return Response(
+            {
+                "branches": [
+                    {
+                        "id": b.id,
+                        "branch_name": b.branch_name,
+                        "branch_code": getattr(b, "branch_code", ""),
+                    }
+                    for b in Branch.objects.filter(is_active=True).order_by(
+                        "branch_name"
+                    )
+                ],
+                "customers": [
+                    {"id": c.id, "customer_name": c.customer_name}
+                    for c in Customer.objects.filter(is_active=True).order_by(
+                        "customer_name"
+                    )
+                ],
+                "salespeople": _salespeople_options(),
+                "products": _sales_product_options(branch_id),
+            }
+        )
 
     @action(
         detail=False,
@@ -507,7 +624,11 @@ class SalesOrderViewSet(Base):
                         "product_id": stock.product_id,
                         "variant_id": stock.variant_id,
                         "branch_id": stock.branch_id,
-                        "available_stock": (stock.current_stock - stock.reserved_stock),
+                        "available_stock": (
+                            stock.current_stock
+                            - stock.reserved_stock
+                            - stock.damaged_stock
+                        ),
                     }
                     for stock in stocks
                 ],
@@ -827,9 +948,7 @@ class SalesInvoiceViewSet(Base):
             is_active=True,
         ).order_by("customer_name")
 
-        salespeople = User.objects.filter(
-            is_active=True,
-        ).order_by("first_name", "username")
+        salespeople = _salespeople_options()
 
         product_filters = {
             "is_active": True,
@@ -909,45 +1028,8 @@ class SalesInvoiceViewSet(Base):
                     }
                     for customer in customers
                 ],
-                "salespeople": [
-                    {
-                        "id": user.id,
-                        "display_name": (user.get_full_name() or user.username),
-                    }
-                    for user in salespeople
-                ],
-                "products": [
-                    {
-                        "id": product.id,
-                        "product_name": product.product_name,
-                        "sku": getattr(
-                            product,
-                            "sku",
-                            "",
-                        ),
-                        "description": getattr(
-                            product,
-                            "description",
-                            "",
-                        ),
-                        "selling_price": getattr(
-                            product,
-                            "selling_price",
-                            0,
-                        ),
-                        "is_active": getattr(
-                            product,
-                            "is_active",
-                            True,
-                        ),
-                        "is_deleted": getattr(
-                            product,
-                            "is_deleted",
-                            False,
-                        ),
-                    }
-                    for product in products
-                ],
+                "salespeople": salespeople,
+                "products": _sales_product_options(branch_id),
                 "sales_orders": [
                     {
                         "id": order.id,
@@ -1269,49 +1351,17 @@ class POSSaleViewSet(Base):
                     }
                     for user in cashiers
                 ],
-                "products": [
-                    {
-                        "id": product.id,
-                        "product_name": product.product_name,
-                        "sku": getattr(
-                            product,
-                            "sku",
-                            "",
-                        ),
-                        "barcode": getattr(
-                            product,
-                            "barcode",
-                            "",
-                        ),
-                        "description": getattr(
-                            product,
-                            "description",
-                            "",
-                        ),
-                        "selling_price": getattr(
-                            product,
-                            "selling_price",
-                            0,
-                        ),
-                        "is_active": getattr(
-                            product,
-                            "is_active",
-                            True,
-                        ),
-                        "is_deleted": getattr(
-                            product,
-                            "is_deleted",
-                            False,
-                        ),
-                    }
-                    for product in products
-                ],
+                "products": _sales_product_options(branch_id),
                 "stock": [
                     {
                         "product_id": stock.product_id,
                         "variant_id": stock.variant_id,
                         "branch_id": stock.branch_id,
-                        "available_stock": (stock.current_stock - stock.reserved_stock),
+                        "available_stock": (
+                            stock.current_stock
+                            - stock.reserved_stock
+                            - stock.damaged_stock
+                        ),
                     }
                     for stock in stocks
                 ],

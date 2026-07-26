@@ -91,6 +91,72 @@ class EmployeeSerializer(serializers.ModelSerializer):
         )
         return employee
 
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        old_basic = Decimal(instance.basic_salary or 0)
+        old_allowances = Decimal(instance.allowances or 0)
+        employee = super().update(instance, validated_data)
+
+        new_basic = Decimal(employee.basic_salary or 0)
+        new_allowances = Decimal(employee.allowances or 0)
+        salary_changed = (old_basic, old_allowances) != (new_basic, new_allowances)
+
+        if not salary_changed:
+            return employee
+
+        request = self.context.get("request")
+        approver_name = ""
+        approver = None
+        if request and getattr(request, "user", None) and request.user.is_authenticated:
+            approver = request.user
+            approver_name = request.user.get_full_name() or request.user.username
+
+        joining = (
+            employee.salary_revisions.filter(reason="JOINING")
+            .order_by("effective_from", "id")
+            .first()
+        )
+        has_later_revision = employee.salary_revisions.exclude(
+            reason="JOINING"
+        ).exists()
+
+        # Legacy employees were sometimes created before salary was entered.
+        # In that case, populate the zero-value joining record instead of
+        # showing an incorrect AED 0.00 starting salary.
+        if (
+            joining
+            and not has_later_revision
+            and Decimal(joining.basic_salary or 0) + Decimal(joining.allowances or 0)
+            == 0
+            and new_basic + new_allowances > 0
+        ):
+            joining.basic_salary = new_basic
+            joining.allowances = new_allowances
+            joining.approved_by = joining.approved_by or approver
+            joining.approved_by_name = joining.approved_by_name or approver_name
+            joining.save(
+                update_fields=[
+                    "basic_salary",
+                    "allowances",
+                    "approved_by",
+                    "approved_by_name",
+                    "updated_at",
+                ]
+            )
+            return employee
+
+        SalaryRevision.objects.create(
+            employee=employee,
+            reason="CORRECTION",
+            effective_from=timezone.localdate(),
+            basic_salary=new_basic,
+            allowances=new_allowances,
+            approved_by=approver,
+            approved_by_name=approver_name,
+            notes="Salary updated from employee profile.",
+        )
+        return employee
+
 
 class AttendanceSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source="employee.full_name", read_only=True)
@@ -190,14 +256,36 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
 class SalaryRevisionSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source="employee.full_name", read_only=True)
     reason_display = serializers.CharField(source="get_reason_display", read_only=True)
+    payroll_status_display = serializers.CharField(
+        source="get_payroll_status_display", read_only=True
+    )
     total_salary = serializers.DecimalField(
         max_digits=14, decimal_places=2, read_only=True
     )
+    net_salary = serializers.SerializerMethodField()
 
     class Meta:
         model = SalaryRevision
         fields = "__all__"
         read_only_fields = ["approved_by"]
+
+    def get_net_salary(self, obj):
+        return (obj.total_salary or Decimal("0")) - (obj.deductions or Decimal("0"))
+
+    def validate(self, attrs):
+        effective_from = attrs.get("effective_from")
+        effective_to = attrs.get("effective_to")
+        if effective_from and effective_to and effective_to < effective_from:
+            raise serializers.ValidationError(
+                {"effective_to": "To date must be on or after the From date."}
+            )
+        if (attrs.get("deductions") or 0) > (attrs.get("basic_salary") or 0) + (
+            attrs.get("allowances") or 0
+        ):
+            raise serializers.ValidationError(
+                {"deductions": "Deductions cannot exceed gross salary."}
+            )
+        return attrs
 
     @transaction.atomic
     def create(self, validated_data):
@@ -209,11 +297,13 @@ class SalaryRevisionSerializer(serializers.ModelSerializer):
                 request.user.get_full_name() or request.user.username,
             )
         revision = SalaryRevision.objects.create(**validated_data)
-        revision.employee.basic_salary = revision.basic_salary
-        revision.employee.allowances = revision.allowances
-        revision.employee.save(
-            update_fields=["basic_salary", "allowances", "updated_at"]
-        )
+        # Historical records with a To date must not overwrite current salary.
+        if not revision.effective_to:
+            revision.employee.basic_salary = revision.basic_salary
+            revision.employee.allowances = revision.allowances
+            revision.employee.save(
+                update_fields=["basic_salary", "allowances", "updated_at"]
+            )
         return revision
 
 

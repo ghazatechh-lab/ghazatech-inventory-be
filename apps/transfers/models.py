@@ -49,6 +49,13 @@ class StockTransferItem(models.Model):
         StockTransfer, on_delete=models.CASCADE, related_name="items"
     )
     product = models.ForeignKey("inventory.Product", on_delete=models.PROTECT)
+    variant = models.ForeignKey(
+        "inventory.ProductVariant",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transfer_items",
+    )
     requested_quantity = models.PositiveIntegerField()
     dispatched_quantity = models.PositiveIntegerField(default=0)
     received_quantity = models.PositiveIntegerField(default=0)
