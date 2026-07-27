@@ -93,7 +93,7 @@ class SupplierSerializer(
         obj,
     ):
         return (
-            obj.supplierbill_set.aggregate(
+            obj.supplier_bills.aggregate(
                 value=Sum(
                     "total_amount",
                 ),
@@ -106,7 +106,7 @@ class SupplierSerializer(
         obj,
     ):
         return (
-            obj.supplierpayment_set.aggregate(
+            obj.supplier_payments.aggregate(
                 value=Sum("amount"),
             )["value"]
             or 0
@@ -117,7 +117,7 @@ class SupplierSerializer(
         obj,
     ):
         bills = (
-            obj.supplierbill_set.aggregate(
+            obj.supplier_bills.aggregate(
                 value=Sum(
                     "balance_due",
                 ),
