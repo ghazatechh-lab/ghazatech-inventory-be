@@ -572,13 +572,149 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
     employee_code = serializers.CharField(
         source="employee.employee_code", read_only=True
     )
+    employee_joining_date = serializers.DateField(
+        source="employee.joining_date",
+        read_only=True,
+        allow_null=True,
+    )
     branch_name = serializers.CharField(
-        source="branch.branch_name", read_only=True, allow_null=True
+        source="branch.branch_name",
+        read_only=True,
+        allow_null=True,
+    )
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
     )
 
     class Meta:
         model = PayrollEntry
         fields = "__all__"
+        read_only_fields = [
+            "payroll_run",
+            "gross_salary",
+            "net_salary",
+        ]
+
+    def validate_period(self, value):
+        import re
+
+        period = str(value or "").strip()
+
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+            raise serializers.ValidationError("Period must use YYYY-MM format.")
+
+        return period
+
+    def validate(self, attrs):
+        employee = attrs.get(
+            "employee",
+            getattr(self.instance, "employee", None),
+        )
+        period = attrs.get(
+            "period",
+            getattr(self.instance, "period", None),
+        )
+
+        basic_salary = Decimal(
+            attrs.get(
+                "basic_salary",
+                getattr(self.instance, "basic_salary", 0) or 0,
+            )
+            or 0
+        )
+        allowances = Decimal(
+            attrs.get(
+                "allowances",
+                getattr(self.instance, "allowances", 0) or 0,
+            )
+            or 0
+        )
+        deductions = Decimal(
+            attrs.get(
+                "deductions",
+                getattr(self.instance, "deductions", 0) or 0,
+            )
+            or 0
+        )
+
+        errors = {}
+
+        if basic_salary < 0:
+            errors["basic_salary"] = "Basic salary cannot be negative."
+
+        if allowances < 0:
+            errors["allowances"] = "Allowances cannot be negative."
+
+        if deductions < 0:
+            errors["deductions"] = "Deductions cannot be negative."
+
+        gross_salary = basic_salary + allowances
+
+        if deductions > gross_salary:
+            errors["deductions"] = "Deductions cannot exceed gross salary."
+
+        if employee and period:
+            from datetime import date
+
+            try:
+                year, month = [int(part) for part in str(period).split("-")]
+                period_date = date(year, month, 1)
+            except (TypeError, ValueError):
+                errors["period"] = "Period must use YYYY-MM format."
+                period_date = None
+
+            if period_date:
+                current_month = timezone.localdate().replace(day=1)
+
+                if period_date > current_month:
+                    errors["period"] = "Future payroll periods are not allowed."
+
+                if employee.joining_date:
+                    joining_month = employee.joining_date.replace(day=1)
+
+                    if period_date < joining_month:
+                        errors["period"] = (
+                            "Payroll period cannot be before the "
+                            "employee joining month."
+                        )
+
+                duplicate = PayrollEntry.objects.filter(
+                    employee=employee,
+                    period=period,
+                )
+
+                if self.instance:
+                    duplicate = duplicate.exclude(pk=self.instance.pk)
+
+                if duplicate.exists():
+                    errors["period"] = (
+                        "A payroll record already exists for this "
+                        "employee and period."
+                    )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        if employee:
+            attrs["branch"] = employee.branch
+
+        attrs["gross_salary"] = gross_salary
+        attrs["net_salary"] = gross_salary - deductions
+
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        validated_data.pop("payroll_run", None)
+
+        return PayrollEntry.objects.create(**validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        validated_data.pop("payroll_run", None)
+
+        return super().update(instance, validated_data)
 
 
 class PayrollRunSerializer(serializers.ModelSerializer):

@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.http import HttpResponse
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -628,6 +628,161 @@ class PayrollEntryViewSet(BaseViewSet):
         "period",
     ]
     filterset_fields = ["period", "branch", "status", "employee"]
+
+    @staticmethod
+    def _month_sequence(from_period, to_period):
+        from datetime import date
+
+        try:
+            from_year, from_month = [int(part) for part in str(from_period).split("-")]
+            to_year, to_month = [int(part) for part in str(to_period).split("-")]
+
+            current = date(from_year, from_month, 1)
+            end = date(to_year, to_month, 1)
+        except (TypeError, ValueError):
+            raise serializers.ValidationError(
+                {"period": "From Month and To Month must use YYYY-MM format."}
+            )
+
+        if end < current:
+            raise serializers.ValidationError(
+                {"to_period": "To Month cannot be before From Month."}
+            )
+
+        periods = []
+
+        while current <= end:
+            periods.append(current.strftime("%Y-%m"))
+
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+        return periods
+
+    @transaction.atomic
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="bulk-previous",
+    )
+    def bulk_previous(self, request):
+        employee_id = request.data.get("employee")
+        from_period = request.data.get("from_period")
+        to_period = request.data.get("to_period")
+        basic_salary = request.data.get("basic_salary", 0)
+        allowances = request.data.get("allowances", 0)
+        deductions = request.data.get("deductions", 0)
+        payroll_status = request.data.get("status", "PAID")
+
+        if not employee_id:
+            return Response(
+                {"employee": "Employee is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not from_period:
+            return Response(
+                {"from_period": "From Month is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not to_period:
+            return Response(
+                {"to_period": "To Month is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        employee = Employee.objects.filter(pk=employee_id).first()
+
+        if not employee:
+            return Response(
+                {"employee": "Employee was not found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        periods = self._month_sequence(from_period, to_period)
+        current_period = timezone.localdate().strftime("%Y-%m")
+        joining_period = (
+            employee.joining_date.strftime("%Y-%m") if employee.joining_date else None
+        )
+
+        if not joining_period:
+            return Response(
+                {
+                    "employee": (
+                        "Employee joining date is required before adding "
+                        "previous payroll."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if from_period < joining_period:
+            return Response(
+                {
+                    "from_period": (
+                        f"Employee joined in {joining_period}. "
+                        "Previous payroll cannot start before the joining month."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if to_period > current_period:
+            return Response(
+                {"to_period": ("Previous payroll cannot include a future month.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        duplicates = list(
+            PayrollEntry.objects.filter(
+                employee=employee,
+                period__in=periods,
+            ).values_list("period", flat=True)
+        )
+
+        if duplicates:
+            return Response(
+                {
+                    "period": (
+                        "Payroll already exists for: " + ", ".join(sorted(duplicates))
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        created_entries = []
+
+        for period in periods:
+            serializer = self.get_serializer(
+                data={
+                    "employee": employee.id,
+                    "period": period,
+                    "basic_salary": basic_salary,
+                    "allowances": allowances,
+                    "deductions": deductions,
+                    "status": payroll_status,
+                }
+            )
+            serializer.is_valid(raise_exception=True)
+            created_entries.append(serializer.save())
+
+        return Response(
+            {
+                "message": (
+                    f"{len(created_entries)} previous payroll record(s) created."
+                ),
+                "count": len(created_entries),
+                "periods": periods,
+                "results": self.get_serializer(
+                    created_entries,
+                    many=True,
+                ).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class DocumentExpiryViewSet(BaseViewSet):
