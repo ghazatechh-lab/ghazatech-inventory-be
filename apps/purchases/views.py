@@ -79,6 +79,90 @@ class PurchaseOrderViewSet(Base):
         "branch__branch_name",
     ]
 
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="update-status",
+    )
+    def update_status(self, request, pk=None):
+        """Apply controlled Purchase Order status transitions.
+
+        The frontend uses this endpoint for submission, approval, cancellation,
+        and receipt-state updates. Approval metadata is managed here rather
+        than being accepted from the client.
+        """
+        purchase_order = self.get_object()
+        requested_status = str(request.data.get("status", "")).strip().upper()
+
+        transitions = {
+            "DRAFT": {"PENDING_APPROVAL", "CANCELLED"},
+            "PENDING_APPROVAL": {"DRAFT", "APPROVED", "CANCELLED"},
+            "APPROVED": {"PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"},
+            "PARTIALLY_RECEIVED": {"RECEIVED", "CANCELLED"},
+            "RECEIVED": set(),
+            "CANCELLED": set(),
+        }
+
+        if not requested_status:
+            raise serializers.ValidationError(
+                {"status": "Please select a new purchase order status."}
+            )
+
+        valid_statuses = {value for value, _label in PurchaseOrder.STATUS_CHOICES}
+        if requested_status not in valid_statuses:
+            raise serializers.ValidationError(
+                {"status": "The selected purchase order status is invalid."}
+            )
+
+        if requested_status == purchase_order.status:
+            return Response(
+                {
+                    "message": "Purchase order is already in this status.",
+                    "data": self.get_serializer(purchase_order).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        allowed = transitions.get(purchase_order.status, set())
+        if requested_status not in allowed:
+            current_label = purchase_order.get_status_display()
+            raise serializers.ValidationError(
+                {
+                    "status": (
+                        f"Purchase order cannot change from {current_label} "
+                        f"to {dict(PurchaseOrder.STATUS_CHOICES).get(requested_status, requested_status)}."
+                    )
+                }
+            )
+
+        update_fields = ["status", "updated_at"]
+        purchase_order.status = requested_status
+
+        if requested_status == "PENDING_APPROVAL":
+            purchase_order.submitted_at = timezone.now()
+            update_fields.append("submitted_at")
+
+        if requested_status == "APPROVED":
+            purchase_order.approved_by = request.user
+            purchase_order.approved_at = timezone.now()
+            update_fields.extend(["approved_by", "approved_at"])
+
+        purchase_order.updated_by = request.user
+        update_fields.append("updated_by")
+        purchase_order.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        return Response(
+            {
+                "message": (
+                    "Purchase order approved successfully."
+                    if requested_status == "APPROVED"
+                    else "Purchase order status updated successfully."
+                ),
+                "data": self.get_serializer(purchase_order).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
     def get_queryset(self):
         queryset = super().get_queryset()
 

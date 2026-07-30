@@ -3352,8 +3352,8 @@ class DeliveryNoteViewSet(Base):
             }
         )
 
-    @action(detail=True, methods=["post"])
-    def dispatch(self, request, pk=None):
+    @action(detail=True, methods=["post"], url_path="dispatch")
+    def mark_dispatched(self, request, pk=None):
         note = self.get_object()
         note.status = "IN_TRANSIT"
         note.dispatched_at = timezone.now()
