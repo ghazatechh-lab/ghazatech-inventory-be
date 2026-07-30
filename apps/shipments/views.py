@@ -33,6 +33,10 @@ from .serializers import (
     ShipmentTrackingLogSerializer,
 )
 
+from django.db.models import (
+    Q,
+)
+
 User = get_user_model()
 
 
@@ -95,17 +99,17 @@ class ShipmentViewSet(
         "invoice",
         "customer",
         "received_by",
+        "delivery_person",
     ).prefetch_related(
         "items__product__brand",
         "items__variant",
         "items__rack",
-        "tracking_logs",
+        "tracking_logs__updated_by",
     )
 
     serializer_class = ShipmentSerializer
 
     filterset_fields = [
-        "shipment_type",
         "branch",
         "supplier",
         "purchase_order",
@@ -145,12 +149,33 @@ class ShipmentViewSet(
 
         branch_id = self.request.query_params.get("branch")
 
-        if branch_id:
+        if branch_id not in (
+            None,
+            "",
+            "all",
+        ):
             queryset = queryset.filter(
                 branch_id=branch_id,
             )
 
-        return queryset
+        shipment_type = self.request.query_params.get("shipment_type")
+
+        if shipment_type == "PURCHASE":
+            queryset = queryset.filter(
+                Q(
+                    shipment_type="PURCHASE",
+                )
+                | Q(
+                    purchase_order__isnull=False,
+                    supplier__isnull=False,
+                )
+            )
+        elif shipment_type:
+            queryset = queryset.filter(
+                shipment_type=shipment_type,
+            )
+
+        return queryset.distinct()
 
     @action(
         detail=False,
@@ -164,7 +189,6 @@ class ShipmentViewSet(
         branch_id = request.query_params.get("branch")
 
         suppliers = Supplier.objects.filter(
-            is_deleted=False,
             is_active=True,
         ).order_by(
             "supplier_name",
@@ -206,7 +230,6 @@ class ShipmentViewSet(
                 "variants",
             )
             .filter(
-                is_deleted=False,
                 is_active=True,
             )
             .order_by(
@@ -226,7 +249,11 @@ class ShipmentViewSet(
             )
         )
 
-        if branch_id:
+        if branch_id not in (
+            None,
+            "",
+            "all",
+        ):
             orders = orders.filter(
                 branch_id=branch_id,
             )

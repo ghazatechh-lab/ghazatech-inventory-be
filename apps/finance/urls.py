@@ -1,10 +1,188 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
-from .views import *
 
-r = DefaultRouter()
-r.register("expenses", ExpenseViewSet)
-r.register("expense-categories", ExpenseCategoryViewSet)
-r.register("cash-register", CashRegisterViewSet)
-r.register("bank-accounts", BankAccountViewSet)
-r.register("ledger", LedgerViewSet)
-urlpatterns = r.urls
+from .views import (
+    AccountingDashboardViewSet,
+    AccountingPeriodViewSet,
+    BankAccountViewSet,
+    BudgetViewSet,
+    CashRegisterViewSet,
+    ChartOfAccountViewSet,
+    ExpenseCategoryViewSet,
+    ExpenseViewSet,
+    FixedAssetViewSet,
+    JournalEntryViewSet,
+    LedgerViewSet,
+    ReceivableInvoiceViewSet,
+    ReceivableReceiptViewSet,
+    TaxRateViewSet,
+    BankTransactionViewSet,
+    BankFundTransferViewSet,
+    AssetDepreciationRunViewSet,
+    AssetDisposalViewSet,
+    PayableBillViewSet,
+    PayablePaymentViewSet,
+    vat_summary,
+    trial_balance,
+    income_statement,
+    balance_sheet,
+    cash_flow,
+    changes_in_equity,
+    branch_consolidation,
+    period_close,
+    period_task_toggle,
+    period_action,
+)
+
+router = DefaultRouter()
+
+router.register("expenses", ExpenseViewSet, basename="expense")
+router.register(
+    "expense-categories",
+    ExpenseCategoryViewSet,
+    basename="expense-category",
+)
+router.register(
+    "cash-register",
+    CashRegisterViewSet,
+    basename="cash-register",
+)
+router.register(
+    "bank-accounts",
+    BankAccountViewSet,
+    basename="bank-account",
+)
+router.register(
+    "accounts",
+    ChartOfAccountViewSet,
+    basename="chart-of-account",
+)
+router.register(
+    "journals",
+    JournalEntryViewSet,
+    basename="journal-entry",
+)
+router.register(
+    "ledger",
+    LedgerViewSet,
+    basename="ledger",
+)
+router.register(
+    "receivable-invoices",
+    ReceivableInvoiceViewSet,
+    basename="receivable-invoice",
+)
+router.register(
+    "receivable-receipts",
+    ReceivableReceiptViewSet,
+    basename="receivable-receipt",
+)
+router.register(
+    "fixed-assets",
+    FixedAssetViewSet,
+    basename="fixed-asset",
+)
+router.register(
+    "tax-rates",
+    TaxRateViewSet,
+    basename="tax-rate",
+)
+router.register(
+    "budgets",
+    BudgetViewSet,
+    basename="budget",
+)
+router.register(
+    "periods",
+    AccountingPeriodViewSet,
+    basename="accounting-period",
+)
+router.register(
+    "dashboard",
+    AccountingDashboardViewSet,
+    basename="accounting-dashboard",
+)
+
+router.register(
+    "bank-transactions",
+    BankTransactionViewSet,
+    basename="bank-transaction",
+)
+router.register(
+    "fund-transfers",
+    BankFundTransferViewSet,
+    basename="fund-transfer",
+)
+router.register(
+    "asset-depreciation-runs",
+    AssetDepreciationRunViewSet,
+    basename="asset-depreciation-run",
+)
+router.register(
+    "asset-disposals",
+    AssetDisposalViewSet,
+    basename="asset-disposal",
+)
+router.register(
+    "payable-bills",
+    PayableBillViewSet,
+    basename="payable-bill",
+)
+router.register(
+    "payable-payments",
+    PayablePaymentViewSet,
+    basename="payable-payment",
+)
+
+urlpatterns = router.urls + [
+    path(
+        "reporting/vat-summary/",
+        vat_summary,
+        name="finance-vat-summary",
+    ),
+    path(
+        "reporting/reports/trial-balance/",
+        trial_balance,
+        name="finance-trial-balance",
+    ),
+    path(
+        "reporting/reports/income-statement/",
+        income_statement,
+        name="finance-income-statement",
+    ),
+    path(
+        "reporting/reports/balance-sheet/",
+        balance_sheet,
+        name="finance-balance-sheet",
+    ),
+    path(
+        "reporting/reports/cash-flow/",
+        cash_flow,
+        name="finance-cash-flow",
+    ),
+    path(
+        "reporting/reports/changes-in-equity/",
+        changes_in_equity,
+        name="finance-changes-equity",
+    ),
+    path(
+        "reporting/branch-consolidation-summary/",
+        branch_consolidation,
+        name="finance-branch-consolidation",
+    ),
+    path(
+        "reporting/period-close/",
+        period_close,
+        name="finance-period-close",
+    ),
+    path(
+        "reporting/period-close/<int:period_id>/tasks/<int:task_id>/",
+        period_task_toggle,
+        name="finance-period-task",
+    ),
+    path(
+        "reporting/period-close/<int:period_id>/<str:action>/",
+        period_action,
+        name="finance-period-action",
+    ),
+]

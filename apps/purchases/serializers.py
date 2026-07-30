@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -29,79 +30,162 @@ from .models import (
 )
 
 
-class POItemSerializer(
-    serializers.ModelSerializer,
-):
+class POItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
     )
-
     sku = serializers.CharField(
         source="product.sku",
         read_only=True,
     )
-
+    product_image = serializers.SerializerMethodField()
     variant_name = serializers.SerializerMethodField()
+    remaining_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseOrderItem
-        exclude = [
-            "purchase_order",
-        ]
+        exclude = ["purchase_order"]
         read_only_fields = [
             "vat_amount",
             "line_total",
+            "received_quantity",
         ]
 
-    def get_variant_name(
-        self,
-        obj,
-    ):
+    def get_product_image(self, obj):
+        image = getattr(obj.product, "image", None) or getattr(
+            obj.product, "product_image", None
+        )
+
+        if not image:
+            return None
+
+        try:
+            url = image.url
+        except (AttributeError, ValueError):
+            return None
+
+        request = self.context.get("request")
+
+        return request.build_absolute_uri(url) if request else url
+
+    def get_variant_name(self, obj):
         if not obj.variant:
             return ""
 
-        return getattr(
-            obj.variant,
-            "display_name",
-            None,
-        ) or str(obj.variant)
+        return (
+            getattr(obj.variant, "display_name", None)
+            or getattr(obj.variant, "variant_name", None)
+            or str(obj.variant)
+        )
+
+    def get_remaining_quantity(self, obj):
+        ordered = Decimal(str(obj.quantity or 0))
+        received = Decimal(str(obj.received_quantity or 0))
+
+        return max(
+            Decimal("0"),
+            ordered - received,
+        )
+
+    def validate(self, attrs):
+        quantity = Decimal(
+            str(
+                attrs.get(
+                    "quantity",
+                    getattr(self.instance, "quantity", 0),
+                )
+                or 0
+            )
+        )
+        unit_price = Decimal(
+            str(
+                attrs.get(
+                    "unit_price",
+                    getattr(self.instance, "unit_price", 0),
+                )
+                or 0
+            )
+        )
+        discount_amount = Decimal(
+            str(
+                attrs.get(
+                    "discount_amount",
+                    getattr(self.instance, "discount_amount", 0),
+                )
+                or 0
+            )
+        )
+        vat_percentage = Decimal(
+            str(
+                attrs.get(
+                    "vat_percentage",
+                    getattr(self.instance, "vat_percentage", 5),
+                )
+                or 0
+            )
+        )
+
+        errors = {}
+
+        if quantity <= 0:
+            errors["quantity"] = "Quantity must be greater than zero."
+
+        if unit_price < 0:
+            errors["unit_price"] = "Unit price cannot be negative."
+
+        if discount_amount < 0:
+            errors["discount_amount"] = "Discount cannot be negative."
+
+        gross = quantity * unit_price
+
+        if discount_amount > gross:
+            errors["discount_amount"] = "Discount cannot exceed the line amount."
+
+        if vat_percentage < 0:
+            errors["vat_percentage"] = "VAT percentage cannot be negative."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs
 
 
-class POSerializer(
-    serializers.ModelSerializer,
-):
-    items = POItemSerializer(
-        many=True,
+class POSerializer(serializers.ModelSerializer):
+    items = POItemSerializer(many=True)
+
+    po_number = serializers.CharField(
+        read_only=True,
     )
-
     supplier_name = serializers.CharField(
         source="supplier.supplier_name",
         read_only=True,
     )
-
     branch_name = serializers.CharField(
         source="branch.branch_name",
         read_only=True,
     )
-
     branch_code = serializers.CharField(
         source="branch.branch_code",
         read_only=True,
     )
-
+    approved_by_name = serializers.SerializerMethodField()
     item_count = serializers.IntegerField(
         source="items.count",
         read_only=True,
     )
-
     delivery_status = serializers.SerializerMethodField()
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+    allowed_statuses = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseOrder
         fields = "__all__"
-
         read_only_fields = [
+            "po_number",
             "subtotal",
             "vat_amount",
             "total_amount",
@@ -112,10 +196,27 @@ class POSerializer(
             "approved_at",
         ]
 
-    def get_delivery_status(
-        self,
-        obj,
-    ):
+    def get_approved_by_name(self, obj):
+        user = obj.approved_by
+
+        if not user:
+            return ""
+
+        if hasattr(user, "get_full_name"):
+            full_name = (user.get_full_name() or "").strip()
+
+            if full_name:
+                return full_name
+
+        return (
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or getattr(user, "email", None)
+            or getattr(user, "username", None)
+            or str(user)
+        )
+
+    def get_delivery_status(self, obj):
         if obj.status == "RECEIVED":
             return "RECEIVED"
 
@@ -124,7 +225,7 @@ class POSerializer(
 
         if (
             obj.expected_delivery_date
-            and obj.expected_delivery_date < date.today()
+            and obj.expected_delivery_date < timezone.localdate()
             and obj.status
             not in {
                 "RECEIVED",
@@ -138,16 +239,39 @@ class POSerializer(
 
         return "PENDING"
 
-    def _generate_po_number(
-        self,
-    ):
-        prefix = timezone.now().strftime(
-            "PO-%Y%m%d",
-        )
+    def get_allowed_statuses(self, obj):
+        transitions = {
+            "DRAFT": [
+                "PENDING_APPROVAL",
+                "CANCELLED",
+            ],
+            "PENDING_APPROVAL": [
+                "DRAFT",
+                "APPROVED",
+                "CANCELLED",
+            ],
+            "APPROVED": [
+                "PARTIALLY_RECEIVED",
+                "RECEIVED",
+                "CANCELLED",
+            ],
+            "PARTIALLY_RECEIVED": [
+                "RECEIVED",
+                "CANCELLED",
+            ],
+            "RECEIVED": [],
+            "CANCELLED": [],
+        }
+
+        return transitions.get(obj.status, [])
+
+    def _generate_po_number(self):
+        prefix = timezone.localdate().strftime("PO-%Y%m%d")
 
         latest = (
-            PurchaseOrder.objects.filter(
-                po_number__startswith=prefix,
+            PurchaseOrder.objects.select_for_update()
+            .filter(
+                po_number__startswith=f"{prefix}-",
             )
             .order_by("-id")
             .first()
@@ -155,154 +279,89 @@ class POSerializer(
 
         sequence = 1
 
-        if latest:
+        if latest and latest.po_number:
             try:
-                sequence = int(latest.po_number.split("-")[-1]) + 1
-            except (
-                TypeError,
-                ValueError,
-            ):
+                sequence = int(latest.po_number.rsplit("-", 1)[-1]) + 1
+            except (TypeError, ValueError):
                 sequence = (
                     PurchaseOrder.objects.filter(
-                        po_number__startswith=prefix,
+                        po_number__startswith=f"{prefix}-",
                     ).count()
                     + 1
                 )
 
-        return f"{prefix}-{sequence:04d}"
+        candidate = f"{prefix}-{sequence:04d}"
 
-    def _calculate_item(
-        self,
-        item,
-    ):
-        quantity = Decimal(
-            str(
-                item.get(
-                    "quantity",
-                    0,
-                )
-            )
-        )
+        while PurchaseOrder.objects.filter(po_number=candidate).exists():
+            sequence += 1
+            candidate = f"{prefix}-{sequence:04d}"
 
-        unit_price = Decimal(
-            str(
-                item.get(
-                    "unit_price",
-                    0,
-                )
-            )
-        )
+        return candidate
 
-        discount = Decimal(
-            str(
-                item.get(
-                    "discount_amount",
-                    0,
-                )
-            )
-        )
-
-        vat_percentage = Decimal(
-            str(
-                item.get(
-                    "vat_percentage",
-                    5,
-                )
-            )
-        )
+    def _calculate_item(self, item):
+        quantity = Decimal(str(item.get("quantity", 0) or 0))
+        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
+        discount = Decimal(str(item.get("discount_amount", 0) or 0))
+        vat_percentage = Decimal(str(item.get("vat_percentage", 5) or 0))
 
         gross = quantity * unit_price
-
         taxable = max(
             Decimal("0"),
             gross - discount,
         )
-
         vat_amount = taxable * vat_percentage / Decimal("100")
-
         line_total = taxable + vat_amount
 
         return {
+            "gross": gross,
+            "taxable": taxable,
             "vat_amount": vat_amount,
             "line_total": line_total,
-            "gross": gross,
         }
 
-    def _totals(
-        self,
-        items,
-        data,
-    ):
+    def _totals(self, items, data):
         subtotal = Decimal("0")
-        vat = Decimal("0")
+        vat_amount = Decimal("0")
+        line_discounts = Decimal("0")
 
         for item in items:
-            values = self._calculate_item(
-                item,
-            )
+            values = self._calculate_item(item)
 
             subtotal += values["gross"]
-            vat += values["vat_amount"]
-
-        shipping = Decimal(
-            str(
-                data.get(
-                    "shipping_amount",
-                    0,
-                )
-            )
-        )
-
-        other_charges = Decimal(
-            str(
-                data.get(
-                    "other_charges",
-                    0,
-                )
-            )
-        )
-
-        order_discount = Decimal(
-            str(
-                data.get(
-                    "discount_amount",
-                    0,
-                )
-            )
-        )
-
-        line_discounts = sum(
-            (
-                Decimal(
-                    str(
-                        item.get(
-                            "discount_amount",
-                            0,
-                        )
+            vat_amount += values["vat_amount"]
+            line_discounts += Decimal(
+                str(
+                    item.get(
+                        "discount_amount",
+                        0,
                     )
+                    or 0
                 )
-                for item in items
-            ),
-            Decimal("0"),
-        )
+            )
 
-        total = (
-            subtotal - line_discounts - order_discount + vat + shipping + other_charges
+        shipping_amount = Decimal(str(data.get("shipping_amount", 0) or 0))
+        other_charges = Decimal(str(data.get("other_charges", 0) or 0))
+        order_discount = Decimal(str(data.get("discount_amount", 0) or 0))
+
+        total_amount = (
+            subtotal
+            - line_discounts
+            - order_discount
+            + vat_amount
+            + shipping_amount
+            + other_charges
         )
 
         return (
             subtotal,
-            vat,
+            vat_amount,
             max(
                 Decimal("0"),
-                total,
+                total_amount,
             ),
         )
 
-    def validate(
-        self,
-        attrs,
-    ):
+    def validate(self, attrs):
         order_date = attrs.get(
             "order_date",
             getattr(
@@ -311,8 +370,7 @@ class POSerializer(
                 None,
             ),
         )
-
-        expected = attrs.get(
+        expected_delivery_date = attrs.get(
             "expected_delivery_date",
             getattr(
                 self.instance,
@@ -320,14 +378,6 @@ class POSerializer(
                 None,
             ),
         )
-
-        if expected and order_date and expected < order_date:
-            raise serializers.ValidationError(
-                {
-                    "expected_delivery_date": "Expected delivery cannot be before the order date."
-                }
-            )
-
         status_value = attrs.get(
             "status",
             getattr(
@@ -336,11 +386,48 @@ class POSerializer(
                 "DRAFT",
             ),
         )
+        branch = attrs.get(
+            "branch",
+            getattr(
+                self.instance,
+                "branch",
+                None,
+            ),
+        )
+        supplier = attrs.get(
+            "supplier",
+            getattr(
+                self.instance,
+                "supplier",
+                None,
+            ),
+        )
+
+        errors = {}
+
+        if not branch:
+            errors["branch"] = "Branch is required."
+
+        if not supplier:
+            errors["supplier"] = "Supplier is required."
+
+        if not order_date:
+            errors["order_date"] = "Order date is required."
+
+        if (
+            expected_delivery_date
+            and order_date
+            and expected_delivery_date < order_date
+        ):
+            errors["expected_delivery_date"] = (
+                "Expected delivery cannot be before the order date."
+            )
 
         if status_value not in dict(PurchaseOrder.STATUS_CHOICES):
-            raise serializers.ValidationError(
-                {"status": "Invalid purchase order status."}
-            )
+            errors["status"] = "Invalid purchase order status."
+
+        if errors:
+            raise serializers.ValidationError(errors)
 
         return attrs
 
@@ -368,11 +455,9 @@ class POSerializer(
         if target_status == "APPROVED":
             validated_data["approved_at"] = timezone.now()
 
-            request = self.context.get(
-                "request",
-            )
+            request = self.context.get("request")
 
-            if request and request.user.is_authenticated:
+            if request and request.user and request.user.is_authenticated:
                 validated_data["approved_by"] = request.user
 
     def _save_items(
@@ -382,12 +467,12 @@ class POSerializer(
     ):
         purchase_order.items.all().delete()
 
-        for item in items:
+        for raw_item in items:
+            item = dict(raw_item)
             item.pop("id", None)
+            item.pop("received_quantity", None)
 
-            values = self._calculate_item(
-                item,
-            )
+            values = self._calculate_item(item)
 
             PurchaseOrderItem.objects.create(
                 purchase_order=purchase_order,
@@ -397,10 +482,7 @@ class POSerializer(
             )
 
     @transaction.atomic
-    def create(
-        self,
-        validated_data,
-    ):
+    def create(self, validated_data):
         items = validated_data.pop(
             "items",
             [],
@@ -408,22 +490,16 @@ class POSerializer(
 
         if not items:
             raise serializers.ValidationError(
-                {"items": "At least one purchase order item is required."}
+                {"items": ("At least one purchase order item is required.")}
             )
 
-        po_number = (
-            validated_data.get(
-                "po_number",
-            )
-            or self._generate_po_number()
-        )
-
-        validated_data["po_number"] = po_number
+        validated_data.pop("po_number", None)
+        validated_data["po_number"] = self._generate_po_number()
 
         (
             subtotal,
-            vat,
-            total,
+            vat_amount,
+            total_amount,
         ) = self._totals(
             items,
             validated_data,
@@ -431,13 +507,11 @@ class POSerializer(
 
         validated_data.update(
             subtotal=subtotal,
-            vat_amount=vat,
-            total_amount=total,
+            vat_amount=vat_amount,
+            total_amount=total_amount,
         )
 
-        self._set_workflow_dates(
-            validated_data,
-        )
+        self._set_workflow_dates(validated_data)
 
         purchase_order = PurchaseOrder.objects.create(
             **validated_data,
@@ -461,16 +535,18 @@ class POSerializer(
             None,
         )
 
+        validated_data.pop("po_number", None)
+
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": "At least one purchase order item is required."}
+                    {"items": ("At least one purchase order item is required.")}
                 )
 
             (
                 subtotal,
-                vat,
-                total,
+                vat_amount,
+                total_amount,
             ) = self._totals(
                 items,
                 validated_data,
@@ -478,8 +554,8 @@ class POSerializer(
 
             validated_data.update(
                 subtotal=subtotal,
-                vat_amount=vat,
-                total_amount=total,
+                vat_amount=vat_amount,
+                total_amount=total_amount,
             )
 
         self._set_workflow_dates(
@@ -488,11 +564,7 @@ class POSerializer(
         )
 
         for field, value in validated_data.items():
-            setattr(
-                instance,
-                field,
-                value,
-            )
+            setattr(instance, field, value)
 
         instance.save()
 
@@ -572,6 +644,11 @@ class GRNItemSerializer(serializers.ModelSerializer):
 
 
 class GRNSerializer(serializers.ModelSerializer):
+    # Generated automatically by the backend. The frontend must not be
+    # required to submit a GRN number.
+    grn_number = serializers.CharField(
+        read_only=True,
+    )
     items = GRNItemSerializer(many=True)
     attachments = GRNAttachmentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(
@@ -596,6 +673,7 @@ class GRNSerializer(serializers.ModelSerializer):
         model = GoodsReceivedNote
         fields = "__all__"
         read_only_fields = [
+            "grn_number",
             "is_confirmed",
             "confirmed_at",
             "created_by",
@@ -698,15 +776,31 @@ class GRNSerializer(serializers.ModelSerializer):
                 )
 
     def _save_items(self, grn, items):
+        """
+        Save GRN items that have already passed nested serializer validation.
+
+        DRF converts product, variant, and other related primary keys into
+        model instances during GRNSerializer validation. Re-validating those
+        model instances through GRNItemSerializer(data=item) makes
+        PrimaryKeyRelatedField interpret the model objects as submitted IDs,
+        resulting in errors such as:
+
+        - Select a valid product.
+        - Select a valid variant.
+
+        Save the validated dictionaries directly instead.
+        """
         grn.items.all().delete()
 
-        for item in items:
+        for raw_item in items:
+            item = dict(raw_item)
+
             item.pop("id", None)
-            item_serializer = GRNItemSerializer(data=item)
-            item_serializer.is_valid(raise_exception=True)
+            item.pop("grn", None)
+
             GoodsReceivedItem.objects.create(
                 grn=grn,
-                **item_serializer.validated_data,
+                **item,
             )
 
     @transaction.atomic
@@ -771,6 +865,29 @@ class SupplierBillSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class SupplierPaymentAttachmentSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierPaymentAttachment
+        fields = [
+            "id",
+            "file",
+            "file_url",
+            "original_name",
+            "file_size",
+            "content_type",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+        request = self.context.get("request")
+        return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+
+
 class PaymentAllocationSerializer(serializers.ModelSerializer):
     bill_number = serializers.CharField(source="bill.bill_number", read_only=True)
 
@@ -780,7 +897,9 @@ class PaymentAllocationSerializer(serializers.ModelSerializer):
 
 
 class SupplierPaymentSerializer(serializers.ModelSerializer):
+    payment_number = serializers.CharField(read_only=True)
     allocations = PaymentAllocationSerializer(many=True, required=False)
+    attachments = SupplierPaymentAttachmentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(
         source="supplier.supplier_name", read_only=True
     )
@@ -924,6 +1043,7 @@ class SupplierReturnItemSerializer(
 class SupplierReturnSerializer(
     serializers.ModelSerializer,
 ):
+    return_number = serializers.CharField(read_only=True)
     items = SupplierReturnItemSerializer(
         many=True,
     )
@@ -1327,6 +1447,7 @@ class VendorCreditApplicationSerializer(
 class VendorCreditSerializer(
     serializers.ModelSerializer,
 ):
+    credit_number = serializers.CharField(read_only=True)
     items = VendorCreditItemSerializer(
         many=True,
     )
@@ -1787,6 +1908,7 @@ class PurchaseExpenseAttachmentSerializer(serializers.ModelSerializer):
 
 
 class PurchaseExpenseSerializer(serializers.ModelSerializer):
+    expense_number = serializers.CharField(read_only=True)
     attachments = PurchaseExpenseAttachmentSerializer(many=True, read_only=True)
     branch_name = serializers.CharField(
         source="branch.branch_name", read_only=True, allow_null=True

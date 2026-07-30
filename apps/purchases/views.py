@@ -308,13 +308,13 @@ class GRNViewSet(Base):
             .order_by("-order_date", "-id")
         )
 
-        if branch_id:
+        if branch_id not in (None, "", "all"):
             orders = orders.filter(branch_id=branch_id)
 
         branches = Branch.objects.filter(is_active=True).order_by("branch_code")
         racks = Rack.objects.filter(is_active=True).select_related("branch")
 
-        if branch_id:
+        if branch_id not in (None, "", "all"):
             racks = racks.filter(branch_id=branch_id)
 
         receivers = User.objects.filter(is_active=True).order_by(
