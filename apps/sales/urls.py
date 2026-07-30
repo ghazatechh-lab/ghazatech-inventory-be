@@ -9,6 +9,7 @@ router.register("pos", POSSaleViewSet, basename="pos-sale")
 router.register("credit-notes", SalesCreditNoteViewSet, basename="credit-note")
 router.register("payments", SalesPaymentViewSet, basename="sales-payment")
 router.register("returns", SalesReturnViewSet, basename="sales-return")
+router.register("delivery-notes", DeliveryNoteViewSet, basename="delivery-note")
 router.register("price-lists", PriceListViewSet, basename="price-list")
 router.register("reports", SalesReportViewSet, basename="sales-report")
 urlpatterns = router.urls

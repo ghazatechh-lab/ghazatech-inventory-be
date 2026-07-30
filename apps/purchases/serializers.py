@@ -11,6 +11,7 @@ from .models import (
     GoodsReceivedNote,
     GRNAttachment,
     PurchaseExpense,
+    PurchaseExpenseCategory,
     PurchaseExpenseAttachment,
     PurchaseOrder,
     PurchaseOrderItem,
@@ -1907,15 +1908,23 @@ class PurchaseExpenseAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
+class PurchaseExpenseCategorySerializer(serializers.ModelSerializer):
+    value = serializers.CharField(source="code", read_only=True)
+    label = serializers.CharField(source="name", read_only=True)
+
+    class Meta:
+        model = PurchaseExpenseCategory
+        fields = ["id", "name", "code", "value", "label", "is_active"]
+
+
 class PurchaseExpenseSerializer(serializers.ModelSerializer):
+    category = serializers.CharField()
     expense_number = serializers.CharField(read_only=True)
     attachments = PurchaseExpenseAttachmentSerializer(many=True, read_only=True)
     branch_name = serializers.CharField(
         source="branch.branch_name", read_only=True, allow_null=True
     )
-    category_display = serializers.CharField(
-        source="get_category_display", read_only=True
-    )
+    category_display = serializers.SerializerMethodField()
     payment_method_display = serializers.CharField(
         source="get_payment_method_display", read_only=True
     )
@@ -1931,6 +1940,10 @@ class PurchaseExpenseSerializer(serializers.ModelSerializer):
             "created_by",
             "updated_by",
         ]
+
+    def get_category_display(self, obj):
+        category = PurchaseExpenseCategory.objects.filter(code=obj.category).first()
+        return category.name if category else obj.get_category_display()
 
     def validate(self, attrs):
         amount = attrs.get("amount", getattr(self.instance, "amount", 0))

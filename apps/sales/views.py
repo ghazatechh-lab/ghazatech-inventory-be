@@ -61,6 +61,7 @@ def _sales_product_options(branch_id):
                 "product_id": product.id,
                 "variant_id": stock.variant_id,
                 "product_name": product.product_name,
+                "name": product.product_name,
                 "sku": getattr(product, "sku", ""),
                 "barcode": getattr(product, "barcode", ""),
                 "description": getattr(product, "description", ""),
@@ -350,6 +351,13 @@ class QuotationViewSet(Base):
             branch=quotation.branch,
             salesperson=quotation.salesperson,
             order_date=timezone.localdate(),
+            delivery_date=timezone.localdate(),
+            shipping_address=(
+                getattr(quotation.customer, "address", None)
+                or getattr(quotation.customer, "billing_address", None)
+                or "To be confirmed"
+            ),
+            emirate=getattr(quotation.customer, "emirate", None),
             currency=quotation.currency,
             subtotal=quotation.subtotal,
             discount_amount=quotation.discount_amount,
@@ -600,6 +608,7 @@ class SalesOrderViewSet(Base):
                     {
                         "id": product.id,
                         "product_name": product.product_name,
+                        "name": product.product_name,
                         "sku": getattr(product, "sku", ""),
                         "description": getattr(product, "description", ""),
                         "selling_price": getattr(product, "selling_price", 0),
@@ -1335,8 +1344,26 @@ class POSSaleViewSet(Base):
                 branch_id=branch_id,
             )
 
+        branches = Branch.objects.filter(is_active=True).order_by("branch_name")
+        categories = sorted(
+            {
+                str(getattr(customer, "category", "") or "").strip()
+                for customer in customers
+                if str(getattr(customer, "category", "") or "").strip()
+            }
+        )
+
         return Response(
             {
+                "branches": [
+                    {
+                        "id": branch.id,
+                        "branch_name": branch.branch_name,
+                        "branch_code": getattr(branch, "branch_code", ""),
+                    }
+                    for branch in branches
+                ],
+                "customer_categories": categories,
                 "customers": [
                     {
                         "id": customer.id,
@@ -1938,8 +1965,11 @@ class SalesPaymentViewSet(Base):
 
         invoices = (
             SalesInvoice.objects.select_related("customer", "branch")
-            .filter(balance_due__gt=0)
             .exclude(payment_status="VOID")
+            .filter(
+                Q(balance_due__gt=0)
+                | Q(payment_status__in=["UNPAID", "PARTIALLY_PAID", "OVERDUE"])
+            )
             .order_by("-invoice_date", "-id")
         )
         bank_accounts = BankAccount.objects.filter(is_active=True)
@@ -2328,6 +2358,9 @@ class PriceListViewSet(Base):
         "status",
         "applies_to",
         "discount_type",
+        "price_list_type",
+        "auto_apply",
+        "stackable",
     ]
     ordering_fields = [
         "name",
@@ -2365,6 +2398,7 @@ class PriceListViewSet(Base):
                     {
                         "id": product.id,
                         "product_name": product.product_name,
+                        "name": product.product_name,
                         "sku": getattr(product, "sku", ""),
                         "selling_price": getattr(
                             product,
@@ -3210,3 +3244,158 @@ class SalesReportViewSet(Base):
         )
 
         return Response(self.get_serializer(report).data)
+
+
+class DeliveryNoteViewSet(Base):
+    queryset = DeliveryNote.objects.select_related(
+        "sales_order", "customer", "branch"
+    ).prefetch_related("items__product", "items__variant")
+    serializer_class = DeliveryNoteSerializer
+    search_fields = [
+        "delivery_note_number",
+        "sales_order__order_number",
+        "customer__customer_name",
+        "tracking_number",
+        "courier",
+    ]
+    filterset_fields = ["branch", "sales_order", "customer", "status"]
+    ordering_fields = ["delivery_note_number", "delivery_date", "status", "created_at"]
+    ordering = ["-delivery_date", "-id"]
+
+    @action(detail=False, methods=["get"], url_path="form-options")
+    def form_options(self, request):
+        branch_id = request.query_params.get("branch")
+        # A delivery note can only be created for an order that is confirmed and
+        # still has an outstanding quantity. Do not silently hide eligible orders
+        # because the global branch selector is pointing at another branch; the
+        # branch is populated from the chosen order on the form.
+        orders = (
+            SalesOrder.objects.select_related("customer", "branch")
+            .prefetch_related("items")
+            .filter(
+                status__in=[
+                    "CONFIRMED",
+                    "AWAITING_FULFILLMENT",
+                    "PARTIALLY_FULFILLED",
+                ]
+            )
+            .order_by("-order_date", "-id")
+        )
+        orders = [
+            order
+            for order in orders
+            if any(
+                (item.quantity or 0) > (item.fulfilled_quantity or 0)
+                for item in order.items.all()
+            )
+        ]
+        return Response(
+            {
+                "sales_orders": [
+                    {
+                        "id": order.id,
+                        "order_number": order.order_number,
+                        "customer_name": (
+                            order.customer.customer_name if order.customer else ""
+                        ),
+                        "status": order.status,
+                        "branch_id": order.branch_id,
+                        "branch_name": order.branch.branch_name if order.branch else "",
+                        "delivery_date": order.delivery_date,
+                    }
+                    for order in orders
+                ]
+            }
+        )
+
+    @action(
+        detail=False, methods=["get"], url_path=r"order-options/(?P<order_id>[^/.]+)"
+    )
+    def order_options(self, request, order_id=None):
+        order = (
+            SalesOrder.objects.select_related("customer", "branch")
+            .prefetch_related("items__product", "items__variant")
+            .get(pk=order_id)
+        )
+        return Response(
+            {
+                "sales_order_id": order.id,
+                "order_number": order.order_number,
+                "branch_id": order.branch_id,
+                "customer_id": order.customer_id,
+                "customer_name": order.customer.customer_name if order.customer else "",
+                "delivery_date": order.delivery_date,
+                "delivery_address": order.shipping_address or "",
+                "items": [
+                    {
+                        "sales_order_item": item.id,
+                        "product": item.product_id,
+                        "variant": item.variant_id,
+                        "product_name": (
+                            item.product.product_name
+                            if item.product
+                            else item.description
+                        ),
+                        "product_sku": (
+                            getattr(item.product, "sku", "") if item.product else ""
+                        ),
+                        "description": item.description,
+                        "ordered_quantity": item.quantity,
+                        "delivered_quantity": max(
+                            Decimal("0"),
+                            (item.quantity or 0) - (item.fulfilled_quantity or 0),
+                        ),
+                    }
+                    for item in order.items.all()
+                    if (item.quantity or 0) > (item.fulfilled_quantity or 0)
+                ],
+            }
+        )
+
+    @action(detail=True, methods=["post"])
+    def dispatch(self, request, pk=None):
+        note = self.get_object()
+        note.status = "IN_TRANSIT"
+        note.dispatched_at = timezone.now()
+        if not note.dispatch_datetime:
+            note.dispatch_datetime = note.dispatched_at
+        note.save(
+            update_fields=["status", "dispatched_at", "dispatch_datetime", "updated_at"]
+        )
+        return Response(self.get_serializer(note).data)
+
+    @action(detail=True, methods=["post"])
+    def deliver(self, request, pk=None):
+        note = self.get_object()
+        with transaction.atomic():
+            for row in note.items.select_related("sales_order_item"):
+                if row.sales_order_item:
+                    row.sales_order_item.fulfilled_quantity = min(
+                        row.sales_order_item.quantity,
+                        (row.sales_order_item.fulfilled_quantity or 0)
+                        + row.delivered_quantity,
+                    )
+                    row.sales_order_item.save(update_fields=["fulfilled_quantity"])
+            order = note.sales_order
+            quantities = list(order.items.values_list("quantity", "fulfilled_quantity"))
+            if quantities and all(
+                (fulfilled or 0) >= (qty or 0) for qty, fulfilled in quantities
+            ):
+                order.status = "FULFILLED"
+                order.fulfilled_at = timezone.now()
+            else:
+                order.status = "PARTIALLY_FULFILLED"
+            order.save(update_fields=["status", "fulfilled_at", "updated_at"])
+            note.status = "DELIVERED"
+            note.delivered_at = timezone.now()
+            if not note.actual_delivery_datetime:
+                note.actual_delivery_datetime = note.delivered_at
+            note.save(
+                update_fields=[
+                    "status",
+                    "delivered_at",
+                    "actual_delivery_datetime",
+                    "updated_at",
+                ]
+            )
+        return Response(self.get_serializer(note).data)

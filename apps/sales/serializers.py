@@ -2113,29 +2113,43 @@ class PriceListItemSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
     )
+    product_sku = serializers.CharField(
+        source="product.sku",
+        read_only=True,
+        allow_null=True,
+    )
+    base_price = serializers.SerializerMethodField()
+    final_price = serializers.SerializerMethodField()
 
     class Meta:
         model = PriceListItem
         exclude = ["price_list"]
 
+    def get_base_price(self, obj):
+        return getattr(obj.product, "selling_price", 0) or 0
+
+    def get_final_price(self, obj):
+        base = Decimal(str(self.get_base_price(obj)))
+        if obj.custom_price is not None:
+            return obj.custom_price
+        discount = Decimal(str(obj.discount_percentage or 0))
+        return (base - (base * discount / Decimal("100"))).quantize(Decimal("0.01"))
+
 
 class PriceListSerializer(serializers.ModelSerializer):
-    items = PriceListItemSerializer(
-        many=True,
-        required=False,
-    )
+    items = PriceListItemSerializer(many=True, required=False)
     customer_ids = serializers.ListField(
-        child=serializers.IntegerField(),
-        write_only=True,
-        required=False,
+        child=serializers.IntegerField(), write_only=True, required=False
     )
-    item_count = serializers.IntegerField(
-        source="items.count",
-        read_only=True,
-    )
+    item_count = serializers.IntegerField(source="items.count", read_only=True)
     applies_to_display = serializers.CharField(
-        source="get_applies_to_display",
-        read_only=True,
+        source="get_applies_to_display", read_only=True
+    )
+    type_display = serializers.CharField(
+        source="get_price_list_type_display", read_only=True
+    )
+    branch_name = serializers.CharField(
+        source="branch.branch_name", read_only=True, allow_null=True
     )
     discount_display = serializers.SerializerMethodField()
 
@@ -2144,48 +2158,92 @@ class PriceListSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
     def get_discount_display(self, obj):
+        item_discounts = list(obj.items.values_list("discount_percentage", flat=True))
         if obj.discount_type == "PERCENTAGE":
             return f"{obj.discount_percentage}%"
         if obj.discount_type == "FIXED":
-            return f"AED {obj.fixed_discount}"
-        return "Custom prices"
+            return f"{obj.currency or 'AED'} {obj.fixed_discount}"
+        if item_discounts and any(Decimal(str(v or 0)) > 0 for v in item_discounts):
+            return "Product rules"
+        return "Fixed prices"
 
     def validate(self, attrs):
-        valid_from = attrs.get(
-            "valid_from",
-            getattr(self.instance, "valid_from", None),
-        )
+        valid_from = attrs.get("valid_from", getattr(self.instance, "valid_from", None))
         valid_until = attrs.get(
-            "valid_until",
-            getattr(self.instance, "valid_until", None),
+            "valid_until", getattr(self.instance, "valid_until", None)
         )
+        status = attrs.get("status", getattr(self.instance, "status", "DRAFT"))
+        price_list_type = attrs.get(
+            "price_list_type",
+            getattr(self.instance, "price_list_type", "CUSTOMER_TIER"),
+        )
+        branch = attrs.get("branch", getattr(self.instance, "branch", None))
 
         if valid_from and valid_until and valid_until < valid_from:
             raise serializers.ValidationError(
                 {"valid_until": "Valid-until date cannot be before valid-from date."}
             )
+        if price_list_type == "BRANCH_SPECIFIC" and not branch:
+            raise serializers.ValidationError(
+                {"branch": "Branch is required for a branch-specific price list."}
+            )
+        if status == "SCHEDULED" and not valid_from:
+            raise serializers.ValidationError(
+                {
+                    "valid_from": "Valid-from date is required for a scheduled price list."
+                }
+            )
         return attrs
+
+    def _save_relations(self, price_list, items, customer_ids):
+        price_list.items.all().delete()
+        for item in items:
+            PriceListItem.objects.create(price_list=price_list, **item)
+
+        price_list.customers.all().delete()
+        for customer_id in customer_ids:
+            PriceListCustomer.objects.get_or_create(
+                price_list=price_list, customer_id=customer_id
+            )
 
     @transaction.atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         customer_ids = validated_data.pop("customer_ids", [])
-
         price_list = PriceList.objects.create(**validated_data)
-
-        for item in items:
-            PriceListItem.objects.create(
-                price_list=price_list,
-                **item,
-            )
-
-        for customer_id in customer_ids:
-            PriceListCustomer.objects.get_or_create(
-                price_list=price_list,
-                customer_id=customer_id,
-            )
-
+        self._save_relations(price_list, items, customer_ids)
         return price_list
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items = validated_data.pop("items", None)
+        customer_ids = validated_data.pop("customer_ids", None)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.save()
+        if items is not None or customer_ids is not None:
+            self._save_relations(
+                instance,
+                (
+                    items
+                    if items is not None
+                    else list(
+                        instance.items.values(
+                            "product",
+                            "variant",
+                            "custom_price",
+                            "discount_percentage",
+                            "minimum_quantity",
+                        )
+                    )
+                ),
+                (
+                    customer_ids
+                    if customer_ids is not None
+                    else list(instance.customers.values_list("customer_id", flat=True))
+                ),
+            )
+        return instance
 
 
 class SalesReportSerializer(serializers.ModelSerializer):
@@ -2301,3 +2359,104 @@ class SalesReportSerializer(serializers.ModelSerializer):
             validated_data["last_run_at"] = timezone.now()
 
         return super().create(validated_data)
+
+
+class DeliveryNoteItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.product_name", read_only=True)
+    product_sku = serializers.CharField(source="product.sku", read_only=True)
+
+    class Meta:
+        model = DeliveryNoteItem
+        exclude = ["delivery_note"]
+
+
+class DeliveryNoteSerializer(serializers.ModelSerializer):
+    items = DeliveryNoteItemSerializer(many=True)
+    sales_order_number = serializers.CharField(
+        source="sales_order.order_number", read_only=True
+    )
+    customer_name = serializers.CharField(
+        source="customer.customer_name", read_only=True, allow_null=True
+    )
+    branch_name = serializers.CharField(
+        source="branch.branch_name", read_only=True, allow_null=True
+    )
+    invoice_number = serializers.CharField(
+        source="invoice.invoice_number", read_only=True, allow_null=True
+    )
+
+    class Meta:
+        model = DeliveryNote
+        fields = "__all__"
+        read_only_fields = [
+            "delivery_note_number",
+            "dispatched_at",
+            "delivered_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def _generate_number(self, branch):
+        code = getattr(branch, "branch_code", None) or "DN"
+        prefix = timezone.now().strftime(f"DN-{code}-%Y%m")
+        count = DeliveryNote.objects.filter(
+            delivery_note_number__startswith=prefix
+        ).count()
+        return f"{prefix}-{count + 1:04d}"
+
+    def validate(self, attrs):
+        order = attrs.get("sales_order", getattr(self.instance, "sales_order", None))
+        items = attrs.get("items")
+        if not order:
+            raise serializers.ValidationError(
+                {"sales_order": "Sales order is required."}
+            )
+        if order.status == "CANCELLED":
+            raise serializers.ValidationError(
+                {"sales_order": "Cancelled sales orders cannot be delivered."}
+            )
+        if items is not None and not items:
+            raise serializers.ValidationError(
+                {"items": "Add at least one delivery item."}
+            )
+        for index, item in enumerate(items or [], start=1):
+            qty = Decimal(str(item.get("delivered_quantity", 0) or 0))
+            ordered = Decimal(str(item.get("ordered_quantity", 0) or 0))
+            if qty <= 0:
+                raise serializers.ValidationError(
+                    {
+                        "items": f"Line {index}: delivered quantity must be greater than zero."
+                    }
+                )
+            if qty > ordered:
+                raise serializers.ValidationError(
+                    {
+                        "items": f"Line {index}: delivered quantity cannot exceed ordered quantity."
+                    }
+                )
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items = validated_data.pop("items", [])
+        order = validated_data["sales_order"]
+        validated_data.setdefault("branch", order.branch)
+        validated_data.setdefault("customer", order.customer)
+        validated_data.setdefault("delivery_address", order.shipping_address)
+        validated_data["delivery_note_number"] = self._generate_number(order.branch)
+        note = DeliveryNote.objects.create(**validated_data)
+        for item in items:
+            DeliveryNoteItem.objects.create(delivery_note=note, **item)
+        return note
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items = validated_data.pop("items", None)
+        for key, value in validated_data.items():
+            setattr(instance, key, value)
+        instance.save()
+        if items is not None:
+            instance.items.all().delete()
+            for item in items:
+                DeliveryNoteItem.objects.create(delivery_note=instance, **item)
+        return instance

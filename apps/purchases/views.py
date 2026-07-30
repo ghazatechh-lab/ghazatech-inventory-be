@@ -2191,6 +2191,10 @@ class PurchaseExpenseViewSet(Base):
         return Response(
             {
                 "categories": [
+                    {"value": c.code, "label": c.name, "id": c.id}
+                    for c in PurchaseExpenseCategory.objects.filter(is_active=True)
+                ]
+                or [
                     {"value": v, "label": l}
                     for v, l in PurchaseExpense.CATEGORY_CHOICES
                 ],
@@ -2212,6 +2216,30 @@ class PurchaseExpenseViewSet(Base):
                 ],
             }
         )
+
+    @action(detail=False, methods=["get", "post"], url_path="categories")
+    def categories(self, request):
+        if request.method == "POST":
+            name = str(request.data.get("name", "")).strip()
+            if not name:
+                raise serializers.ValidationError(
+                    {"name": "Category name is required."}
+                )
+            from django.utils.text import slugify
+
+            base = slugify(name).upper().replace("-", "_")[:50] or "CATEGORY"
+            code = base
+            suffix = 2
+            while PurchaseExpenseCategory.objects.filter(code=code).exists():
+                code = f"{base}_{suffix}"
+                suffix += 1
+            category = PurchaseExpenseCategory.objects.create(name=name, code=code)
+            return Response(
+                PurchaseExpenseCategorySerializer(category).data,
+                status=status.HTTP_201_CREATED,
+            )
+        categories = PurchaseExpenseCategory.objects.filter(is_active=True)
+        return Response(PurchaseExpenseCategorySerializer(categories, many=True).data)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):

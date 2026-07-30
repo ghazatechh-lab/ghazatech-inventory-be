@@ -871,6 +871,83 @@ class SalesPayment(TimeStampedModel, BranchAware):
         return self.payment_number
 
 
+class DeliveryNote(TimeStampedModel, BranchAware):
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("IN_TRANSIT", "In Transit"),
+        ("DELIVERED", "Delivered"),
+        ("PARTIALLY_DELIVERED", "Partially Delivered"),
+        ("FAILED", "Failed"),
+        ("CANCELLED", "Cancelled"),
+        # Legacy statuses retained for existing records.
+        ("DRAFT", "Draft"),
+        ("READY", "Ready for Delivery"),
+        ("DISPATCHED", "Dispatched"),
+    ]
+
+    delivery_note_number = models.CharField(max_length=50, unique=True)
+    sales_order = models.ForeignKey(
+        SalesOrder, on_delete=models.PROTECT, related_name="delivery_notes"
+    )
+    customer = models.ForeignKey(
+        "customers.Customer", null=True, blank=True, on_delete=models.PROTECT
+    )
+    delivery_date = models.DateField(null=True, blank=True)
+    courier = models.CharField(max_length=150, null=True, blank=True)
+    tracking_number = models.CharField(max_length=120, null=True, blank=True)
+    invoice = models.ForeignKey(
+        "SalesInvoice",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="delivery_notes",
+    )
+    driver_name = models.CharField(max_length=150, null=True, blank=True)
+    vehicle = models.CharField(max_length=150, null=True, blank=True)
+    dispatch_datetime = models.DateTimeField(null=True, blank=True)
+    expected_delivery_datetime = models.DateTimeField(null=True, blank=True)
+    received_by = models.CharField(max_length=150, null=True, blank=True)
+    actual_delivery_datetime = models.DateTimeField(null=True, blank=True)
+    signature_stamp = models.TextField(null=True, blank=True)
+    delivery_address = models.TextField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="DRAFT")
+    notes = models.TextField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-delivery_date", "-id"]
+
+    def __str__(self):
+        return self.delivery_note_number
+
+
+class DeliveryNoteItem(models.Model):
+    delivery_note = models.ForeignKey(
+        DeliveryNote, on_delete=models.CASCADE, related_name="items"
+    )
+    sales_order_item = models.ForeignKey(
+        SalesOrderItem, null=True, blank=True, on_delete=models.PROTECT
+    )
+    product = models.ForeignKey(
+        "inventory.Product", null=True, blank=True, on_delete=models.PROTECT
+    )
+    variant = models.ForeignKey(
+        "inventory.ProductVariant", null=True, blank=True, on_delete=models.PROTECT
+    )
+    description = models.CharField(max_length=255, null=True, blank=True)
+    ordered_quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    delivered_quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    serial_imei = models.CharField(max_length=255, null=True, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.delivery_note.delivery_note_number} - {self.product or self.description}"
+
+
 class SalesReturn(DocumentBase):
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
@@ -968,6 +1045,25 @@ class SalesReturn(DocumentBase):
         related_name="approved_sales_returns",
     )
 
+    DISPOSITION_CHOICES = [
+        ("RESTOCK", "Restock"),
+        ("SCRAP", "Scrap"),
+        ("RETURN_TO_SUPPLIER", "Return to Supplier"),
+    ]
+    disposition = models.CharField(
+        max_length=30, choices=DISPOSITION_CHOICES, default="RESTOCK"
+    )
+    restock_branch = models.ForeignKey(
+        "branches.Branch",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="restocked_sales_returns",
+    )
+    refund_method = models.CharField(max_length=60, null=True, blank=True)
+    approver_name = models.CharField(max_length=150, null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
     class Meta:
         ordering = [
             "-return_date",
@@ -1038,6 +1134,9 @@ class SalesReturnItem(models.Model):
         default="SELLABLE",
     )
 
+    serial_imei = models.CharField(max_length=255, null=True, blank=True)
+    inspected_by_name = models.CharField(max_length=150, null=True, blank=True)
+
     unit_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -1064,9 +1163,16 @@ class SalesReturnItem(models.Model):
 class PriceList(TimeStampedModel, BranchAware):
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
+        ("SCHEDULED", "Scheduled"),
         ("ACTIVE", "Active"),
         ("INACTIVE", "Inactive"),
         ("EXPIRED", "Expired"),
+    ]
+
+    TYPE_CHOICES = [
+        ("CUSTOMER_TIER", "Customer-Tier"),
+        ("BRANCH_SPECIFIC", "Branch-Specific"),
+        ("PROMOTIONAL", "Promotional"),
     ]
 
     APPLIES_TO_CHOICES = [
@@ -1084,6 +1190,18 @@ class PriceList(TimeStampedModel, BranchAware):
     name = models.CharField(
         max_length=120,
     )
+
+    currency = models.CharField(max_length=3, default="AED")
+
+    price_list_type = models.CharField(
+        max_length=30,
+        choices=TYPE_CHOICES,
+        default="CUSTOMER_TIER",
+    )
+
+    auto_apply = models.BooleanField(default=True)
+    stackable = models.BooleanField(default=False)
+    usage_limit_per_customer = models.PositiveIntegerField(null=True, blank=True)
 
     status = models.CharField(
         max_length=20,
@@ -1178,6 +1296,14 @@ class PriceListItem(models.Model):
         null=True,
         blank=True,
     )
+
+    discount_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+    )
+
+    minimum_quantity = models.PositiveIntegerField(default=1)
 
     class Meta:
         ordering = ["id"]
