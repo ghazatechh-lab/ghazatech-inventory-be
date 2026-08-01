@@ -6,10 +6,11 @@ from apps.inventory.services import adjust_stock
 def confirm_grn(grn, user):
     if grn.is_confirmed:
         return grn
-    for i in grn.items.select_related("product"):
+    for i in grn.items.select_related("product", "variant"):
         q = i.accepted_quantity or max(0, i.received_quantity - i.damaged_quantity)
         adjust_stock(
             product=i.product,
+            variant=i.variant,
             branch=grn.branch,
             quantity=q,
             movement_type="PURCHASE",
@@ -17,7 +18,10 @@ def confirm_grn(grn, user):
             reference_type="GRN",
             reference_id=grn.id,
         )
-        poi = grn.purchase_order.items.filter(product=i.product).first()
+        poi = grn.purchase_order.items.filter(
+            product=i.product,
+            variant=i.variant,
+        ).first()
         if poi:
             poi.received_quantity += q
             poi.save(update_fields=["received_quantity"])

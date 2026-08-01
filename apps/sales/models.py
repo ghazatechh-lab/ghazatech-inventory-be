@@ -12,6 +12,19 @@ class BranchAware(models.Model):
         on_delete=models.PROTECT,
     )
 
+    TAX_TREATMENTS = [
+        ("STANDARD_VAT", "Standard VAT"),
+        ("ZERO_RATED", "Zero Rated"),
+        ("EXEMPT", "Exempt"),
+        ("NON_TAXABLE", "Non Taxable"),
+    ]
+    tax_treatment = models.CharField(
+        max_length=30, choices=TAX_TREATMENTS, default="STANDARD_VAT"
+    )
+    tax_inclusive = models.BooleanField(default=False)
+    tax_reason = models.CharField(max_length=255, blank=True, default="")
+    supporting_reference = models.CharField(max_length=120, blank=True, default="")
+
     class Meta:
         abstract = True
 
@@ -449,6 +462,27 @@ class SalesLineBase(models.Model):
         blank=True,
         default=5,
     )
+
+    TAX_TREATMENTS = [
+        ("STANDARD_VAT", "Standard VAT"),
+        ("ZERO_RATED", "Zero Rated"),
+        ("EXEMPT", "Exempt"),
+        ("NON_TAXABLE", "Non Taxable"),
+    ]
+    STOCK_CLASSIFICATIONS = [
+        ("REGULAR", "Regular"),
+        ("RESTRICTED", "Restricted"),
+    ]
+    stock_classification = models.CharField(
+        max_length=20, choices=STOCK_CLASSIFICATIONS, default="REGULAR"
+    )
+    tax_treatment = models.CharField(
+        max_length=30, choices=TAX_TREATMENTS, default="STANDARD_VAT"
+    )
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=5)
+    taxable_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    tax_reason = models.CharField(max_length=255, blank=True, default="")
 
     line_total = models.DecimalField(
         max_digits=14,

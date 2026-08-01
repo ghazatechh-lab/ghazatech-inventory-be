@@ -11,7 +11,6 @@ from .models import (
     GoodsReceivedNote,
     GRNAttachment,
     PurchaseExpense,
-    PurchaseExpenseCategory,
     PurchaseExpenseAttachment,
     PurchaseOrder,
     PurchaseOrderItem,
@@ -43,6 +42,7 @@ class POItemSerializer(serializers.ModelSerializer):
     product_image = serializers.SerializerMethodField()
     variant_name = serializers.SerializerMethodField()
     remaining_quantity = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseOrderItem
@@ -80,6 +80,9 @@ class POItemSerializer(serializers.ModelSerializer):
             or str(obj.variant)
         )
 
+    def get_total_quantity(self, obj):
+        return (obj.regular_quantity or 0) + (obj.restricted_quantity or 0)
+
     def get_remaining_quantity(self, obj):
         ordered = Decimal(str(obj.quantity or 0))
         received = Decimal(str(obj.received_quantity or 0))
@@ -90,6 +93,34 @@ class POItemSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
+        from apps.common.sensitive_permissions import has_sensitive_permission
+
+        request = self.context.get("request")
+        regular = int(
+            attrs.get("regular_quantity", getattr(self.instance, "regular_quantity", 0))
+            or 0
+        )
+        restricted = int(
+            attrs.get(
+                "restricted_quantity", getattr(self.instance, "restricted_quantity", 0)
+            )
+            or 0
+        )
+        if restricted and not has_sensitive_permission(
+            getattr(request, "user", None), "create_restricted_purchase"
+        ):
+            raise serializers.ValidationError(
+                {
+                    "restricted_quantity": "You are not authorized to enter restricted purchase quantity."
+                }
+            )
+        attrs["quantity"] = (
+            regular + restricted
+            if (regular or restricted)
+            else attrs.get("quantity", getattr(self.instance, "quantity", 0))
+        )
+        if attrs.get("tax_treatment") != "STANDARD_VAT":
+            attrs["vat_percentage"] = Decimal("0")
         quantity = Decimal(
             str(
                 attrs.get(
@@ -150,6 +181,23 @@ class POItemSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
 
         return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from apps.common.sensitive_permissions import has_sensitive_permission
+
+        request = self.context.get("request")
+        if not has_sensitive_permission(
+            getattr(request, "user", None), "view_restricted_purchase"
+        ):
+            for field in (
+                "restricted_quantity",
+                "received_restricted_quantity",
+                "total_quantity",
+            ):
+                data.pop(field, None)
+            data["quantity"] = instance.regular_quantity or instance.quantity
+        return data
 
 
 class POSerializer(serializers.ModelSerializer):
@@ -636,11 +684,43 @@ class GRNItemSerializer(serializers.ModelSerializer):
             getattr(self.instance, "damaged_quantity", 0),
         )
 
-        if accepted + damaged != received:
-            raise serializers.ValidationError(
-                "Accepted plus rejected quantity must equal received quantity."
+        regular_received = (
+            attrs.get(
+                "regular_received_quantity",
+                getattr(self.instance, "regular_received_quantity", 0),
             )
-
+            or 0
+        )
+        restricted_received = (
+            attrs.get(
+                "restricted_received_quantity",
+                getattr(self.instance, "restricted_received_quantity", 0),
+            )
+            or 0
+        )
+        regular_accepted = (
+            attrs.get(
+                "regular_accepted_quantity",
+                getattr(self.instance, "regular_accepted_quantity", 0),
+            )
+            or 0
+        )
+        restricted_accepted = (
+            attrs.get(
+                "restricted_accepted_quantity",
+                getattr(self.instance, "restricted_accepted_quantity", 0),
+            )
+            or 0
+        )
+        if regular_received or restricted_received:
+            attrs["received_quantity"] = regular_received + restricted_received
+            attrs["accepted_quantity"] = regular_accepted + restricted_accepted
+            received = attrs["received_quantity"]
+            accepted = attrs["accepted_quantity"]
+        if accepted + damaged + (attrs.get("rejected_quantity", 0) or 0) != received:
+            raise serializers.ValidationError(
+                "Accepted, damaged, and rejected quantities must equal received quantity."
+            )
         return attrs
 
 
@@ -844,26 +924,428 @@ class GRNSerializer(serializers.ModelSerializer):
         return instance
 
 
-class SupplierBillSerializer(serializers.ModelSerializer):
-    supplier_name = serializers.CharField(
-        source="supplier.supplier_name", read_only=True
+class SupplierBillItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.product_name",
+        read_only=True,
     )
-    po_number = serializers.CharField(source="purchase_order.po_number", read_only=True)
+    sku = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierBillItem
+        exclude = ["bill"]
+        read_only_fields = [
+            "vat_amount",
+            "line_total",
+        ]
+
+    def get_sku(self, obj):
+        if obj.variant and getattr(obj.variant, "sku", None):
+            return obj.variant.sku
+
+        return getattr(
+            obj.product,
+            "sku",
+            "",
+        )
+
+
+class SupplierBillAttachmentSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierBillAttachment
+        fields = [
+            "id",
+            "file",
+            "file_url",
+            "original_name",
+            "file_size",
+            "content_type",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+
+        request = self.context.get("request")
+
+        return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+
+
+class SupplierBillSerializer(serializers.ModelSerializer):
+    bill_number = serializers.CharField(read_only=True)
+
+    supplier_name = serializers.CharField(
+        source="supplier.supplier_name",
+        read_only=True,
+    )
+    po_number = serializers.CharField(
+        source="purchase_order.po_number",
+        read_only=True,
+    )
+    grn_number = serializers.CharField(
+        source="grn.grn_number",
+        read_only=True,
+    )
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
+        read_only=True,
+    )
+
+    items = SupplierBillItemSerializer(
+        many=True,
+        required=True,
+    )
+
+    attachments = SupplierBillAttachmentSerializer(
+        many=True,
+        read_only=True,
+    )
 
     class Meta:
         model = SupplierBill
         fields = "__all__"
 
-    def validate(self, attrs):
-        total = attrs.get("total_amount", getattr(self.instance, "total_amount", 0))
-        paid = attrs.get("paid_amount", getattr(self.instance, "paid_amount", 0))
-        attrs["balance_due"] = max(Decimal("0"), total - paid)
-        attrs["payment_status"] = (
-            "PAID"
-            if attrs["balance_due"] == 0
-            else ("PARTIALLY_PAID" if paid else "UNPAID")
+        read_only_fields = [
+            "bill_number",
+            "balance_due",
+            "approved_by",
+            "approved_at",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+        extra_kwargs = {
+            "bill_number": {
+                "required": False,
+            },
+        }
+
+    def _generate_number(self):
+        prefix = timezone.localdate().strftime("SB-%Y%m-")
+
+        last_bill = (
+            SupplierBill.objects.select_for_update()
+            .filter(
+                bill_number__startswith=prefix,
+            )
+            .order_by("-bill_number")
+            .values_list(
+                "bill_number",
+                flat=True,
+            )
+            .first()
         )
+
+        sequence = 1
+
+        if last_bill:
+            try:
+                sequence = (
+                    int(
+                        last_bill.rsplit(
+                            "-",
+                            1,
+                        )[-1]
+                    )
+                    + 1
+                )
+            except (TypeError, ValueError):
+                sequence = (
+                    SupplierBill.objects.filter(
+                        bill_number__startswith=prefix,
+                    ).count()
+                    + 1
+                )
+
+        bill_number = f"{prefix}{sequence:04d}"
+
+        while SupplierBill.objects.filter(
+            bill_number=bill_number,
+        ).exists():
+            sequence += 1
+            bill_number = f"{prefix}{sequence:04d}"
+
+        return bill_number
+
+    def validate(self, attrs):
+        purchase_order = attrs.get(
+            "purchase_order",
+            getattr(
+                self.instance,
+                "purchase_order",
+                None,
+            ),
+        )
+
+        grn = attrs.get(
+            "grn",
+            getattr(
+                self.instance,
+                "grn",
+                None,
+            ),
+        )
+
+        supplier = attrs.get(
+            "supplier",
+            getattr(
+                self.instance,
+                "supplier",
+                None,
+            ),
+        )
+
+        branch = attrs.get(
+            "branch",
+            getattr(
+                self.instance,
+                "branch",
+                None,
+            ),
+        )
+
+        errors = {}
+
+        if not purchase_order:
+            errors["purchase_order"] = "Purchase Order Reference is required."
+
+        if not grn:
+            errors["grn"] = "A confirmed GRN is required."
+
+        if purchase_order:
+            if supplier and purchase_order.supplier_id != supplier.id:
+                errors["supplier"] = (
+                    "Supplier must match the " "selected Purchase Order."
+                )
+
+            if branch and purchase_order.branch_id != branch.id:
+                errors["branch"] = "Branch must match the " "selected Purchase Order."
+
+        if grn:
+            if not grn.is_confirmed:
+                errors["grn"] = (
+                    "Only a confirmed GRN can be " "used for a Supplier Bill."
+                )
+
+            if purchase_order and grn.purchase_order_id != purchase_order.id:
+                errors["grn"] = (
+                    "The selected GRN does not belong "
+                    "to the selected Purchase Order."
+                )
+
+            if supplier and grn.supplier_id != supplier.id:
+                errors["supplier"] = "Supplier must match the " "selected GRN."
+
+            if branch and grn.branch_id != branch.id:
+                errors["branch"] = "Branch must match the " "selected GRN."
+
+        total = Decimal(
+            str(
+                attrs.get(
+                    "total_amount",
+                    getattr(
+                        self.instance,
+                        "total_amount",
+                        0,
+                    ),
+                )
+                or 0
+            )
+        )
+
+        paid = Decimal(
+            str(
+                attrs.get(
+                    "paid_amount",
+                    getattr(
+                        self.instance,
+                        "paid_amount",
+                        0,
+                    ),
+                )
+                or 0
+            )
+        )
+
+        if paid < 0:
+            errors["paid_amount"] = "Paid amount cannot be negative."
+
+        if paid > total:
+            errors["paid_amount"] = "Paid amount cannot exceed " "the bill total."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs["balance_due"] = max(
+            Decimal("0"),
+            total - paid,
+        )
+
+        requested_status = attrs.get(
+            "status",
+            getattr(
+                self.instance,
+                "status",
+                "DRAFT",
+            ),
+        )
+
+        if requested_status not in {
+            "DRAFT",
+            "UNMATCHED",
+            "CANCELLED",
+        }:
+            attrs["status"] = (
+                "PAID"
+                if attrs["balance_due"] == 0
+                else ("PARTIALLY_PAID" if paid > 0 else "UNPAID")
+            )
+
         return attrs
+
+    def _save_items(
+        self,
+        bill,
+        items,
+    ):
+        bill.items.all().delete()
+
+        for item in items:
+            received_quantity = int(item["received_quantity"])
+
+            bill_quantity = int(item["bill_quantity"])
+
+            unit_cost = Decimal(str(item["unit_cost"]))
+
+            discount_amount = Decimal(
+                str(
+                    item.get(
+                        "discount_amount",
+                        0,
+                    )
+                    or 0
+                )
+            )
+
+            vat_percentage = Decimal(
+                str(
+                    item.get(
+                        "vat_percentage",
+                        0,
+                    )
+                    or 0
+                )
+            )
+
+            if bill_quantity <= 0:
+                raise serializers.ValidationError(
+                    {"items": ("Bill quantity must be " "greater than zero.")}
+                )
+
+            if bill_quantity > received_quantity:
+                raise serializers.ValidationError(
+                    {"items": ("Bill quantity cannot exceed " "the received quantity.")}
+                )
+
+            gross = Decimal(str(bill_quantity)) * unit_cost
+
+            taxable = max(
+                Decimal("0"),
+                gross - discount_amount,
+            )
+
+            vat_amount = taxable * vat_percentage / Decimal("100")
+
+            line_total = taxable + vat_amount
+
+            SupplierBillItem.objects.create(
+                bill=bill,
+                grn_item=item["grn_item"],
+                product=item["product"],
+                variant=item.get("variant"),
+                received_quantity=(received_quantity),
+                bill_quantity=(bill_quantity),
+                unit_cost=unit_cost,
+                discount_amount=(discount_amount),
+                vat_percentage=(vat_percentage),
+                vat_amount=vat_amount,
+                line_total=line_total,
+            )
+
+    @transaction.atomic
+    def create(
+        self,
+        validated_data,
+    ):
+        items = validated_data.pop(
+            "items",
+            [],
+        )
+
+        if not items:
+            raise serializers.ValidationError(
+                {"items": ("At least one Supplier Bill " "item is required.")}
+            )
+
+        # Ignore any bill number submitted by older frontend code.
+        validated_data.pop(
+            "bill_number",
+            None,
+        )
+
+        validated_data["bill_number"] = self._generate_number()
+
+        bill = SupplierBill.objects.create(
+            **validated_data,
+        )
+
+        self._save_items(
+            bill,
+            items,
+        )
+
+        return bill
+
+    @transaction.atomic
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        items = validated_data.pop(
+            "items",
+            None,
+        )
+
+        # Bill number must never change during edit.
+        validated_data.pop(
+            "bill_number",
+            None,
+        )
+
+        instance = super().update(
+            instance,
+            validated_data,
+        )
+
+        if items is not None:
+            if not items:
+                raise serializers.ValidationError(
+                    {"items": ("At least one Supplier Bill " "item is required.")}
+                )
+
+            self._save_items(
+                instance,
+                items,
+            )
+
+        return instance
 
 
 class SupplierPaymentAttachmentSerializer(serializers.ModelSerializer):
@@ -899,48 +1381,117 @@ class PaymentAllocationSerializer(serializers.ModelSerializer):
 
 class SupplierPaymentSerializer(serializers.ModelSerializer):
     payment_number = serializers.CharField(read_only=True)
-    allocations = PaymentAllocationSerializer(many=True, required=False)
-    attachments = SupplierPaymentAttachmentSerializer(many=True, read_only=True)
+    allocations = PaymentAllocationSerializer(
+        many=True,
+        required=False,
+    )
+    attachments = SupplierPaymentAttachmentSerializer(
+        many=True,
+        read_only=True,
+    )
     supplier_name = serializers.CharField(
-        source="supplier.supplier_name", read_only=True
+        source="supplier.supplier_name",
+        read_only=True,
     )
 
     class Meta:
         model = SupplierPayment
         fields = "__all__"
-        read_only_fields = ["paid_by", "created_by", "updated_by"]
+        read_only_fields = [
+            "paid_by",
+            "created_by",
+            "updated_by",
+        ]
 
     @transaction.atomic
     def create(self, validated_data):
-        allocations = validated_data.pop("allocations", [])
+        allocations = validated_data.pop(
+            "allocations",
+            [],
+        )
+
         payment = SupplierPayment.objects.create(**validated_data)
-        allocated = Decimal("0")
+
+        allocated_total = Decimal("0.00")
+
         for allocation in allocations:
-            bill = allocation["bill"]
-            amount = allocation["amount"]
-            if amount > bill.balance_due:
+            bill = SupplierBill.objects.select_for_update().get(
+                pk=allocation["bill"].pk
+            )
+
+            amount = Decimal(
+                str(
+                    allocation.get(
+                        "amount",
+                        0,
+                    )
+                    or 0
+                )
+            )
+
+            if amount <= Decimal("0.00"):
+                raise serializers.ValidationError(
+                    {"allocations": ("Allocation amount must be greater than zero.")}
+                )
+
+            current_balance = Decimal(
+                str(
+                    bill.balance_due
+                    if bill.balance_due is not None
+                    else bill.total_amount or 0
+                )
+            )
+
+            if amount > current_balance:
                 raise serializers.ValidationError(
                     {
-                        "allocations": f"Allocation exceeds balance for {bill.bill_number}."
+                        "allocations": (
+                            f"Allocation exceeds balance for "
+                            f"{bill.bill_number}. "
+                            f"Available balance is "
+                            f"{current_balance:.2f}."
+                        )
                     }
                 )
-            SupplierPaymentAllocation.objects.create(payment=payment, **allocation)
-            bill.paid_amount += amount
-            bill.balance_due -= amount
-            bill.payment_status = "PAID" if bill.balance_due == 0 else "PARTIALLY_PAID"
+
+            if allocated_total + amount > payment.amount:
+                raise serializers.ValidationError(
+                    {"allocations": ("Allocated amount exceeds payment amount.")}
+                )
+
+            SupplierPaymentAllocation.objects.create(
+                payment=payment,
+                bill=bill,
+                amount=amount,
+            )
+
+            bill.paid_amount = Decimal(str(bill.paid_amount or 0)) + amount
+
+            bill.balance_due = max(
+                Decimal("0.00"),
+                Decimal(str(bill.total_amount or 0)) - bill.paid_amount,
+            )
+
+            if bill.balance_due == Decimal("0.00"):
+                bill.status = "PAID"
+
+            elif bill.paid_amount > Decimal("0.00"):
+                bill.status = "PARTIALLY_PAID"
+
+            else:
+                bill.status = "UNPAID"
+
             bill.save(
                 update_fields=[
                     "paid_amount",
                     "balance_due",
-                    "payment_status",
+                    "status",
                     "updated_at",
                 ]
             )
-            allocated += amount
-        if allocated > payment.amount:
-            raise serializers.ValidationError(
-                {"allocations": "Allocated amount exceeds payment amount."}
-            )
+
+            allocated_total += amount
+
         return payment
 
 
@@ -979,74 +1530,191 @@ class SupplierReturnAttachmentSerializer(
         )
 
 
-class SupplierReturnItemSerializer(
-    serializers.ModelSerializer,
-):
+class SupplierReturnItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
     )
-
     sku = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    available_regular_quantity = serializers.SerializerMethodField()
+    available_restricted_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReturnItem
-        exclude = [
-            "supplier_return",
+        exclude = ["supplier_return"]
+        read_only_fields = [
+            "quantity",
+            "line_total",
+            "total_quantity",
+            "available_regular_quantity",
+            "available_restricted_quantity",
         ]
 
     def get_sku(self, obj):
-        if obj.variant and getattr(
-            obj.variant,
-            "sku",
-            None,
-        ):
+        if obj.variant and getattr(obj.variant, "sku", None):
             return obj.variant.sku
+        return getattr(obj.product, "sku", "")
 
-        return getattr(
-            obj.product,
-            "sku",
-            "",
+    def get_total_quantity(self, obj):
+        return int(obj.regular_quantity or 0) + int(obj.restricted_quantity or 0)
+
+    def _already_returned(self, grn_item, classification):
+        if not grn_item:
+            return 0
+
+        field = (
+            "regular_quantity" if classification == "REGULAR" else "restricted_quantity"
+        )
+        queryset = SupplierReturnItem.objects.filter(
+            grn_item=grn_item,
+            supplier_return__status__in=[
+                "PENDING_APPROVAL",
+                "APPROVED",
+                "CREDIT_ISSUED",
+            ],
+        )
+        if self.instance:
+            queryset = queryset.exclude(pk=self.instance.pk)
+
+        return int(queryset.aggregate(total=Sum(field))["total"] or 0)
+
+    def get_available_regular_quantity(self, obj):
+        source = obj.grn_item
+        accepted = int(getattr(source, "regular_accepted_quantity", 0) or 0)
+        return max(0, accepted - self._already_returned(source, "REGULAR"))
+
+    def get_available_restricted_quantity(self, obj):
+        source = obj.grn_item
+        accepted = int(getattr(source, "restricted_accepted_quantity", 0) or 0)
+        return max(
+            0,
+            accepted - self._already_returned(source, "RESTRICTED"),
         )
 
     def validate(self, attrs):
-        quantity = attrs.get(
-            "quantity",
-            getattr(
-                self.instance,
-                "quantity",
+        from apps.common.sensitive_permissions import has_sensitive_permission
+
+        grn_item = attrs.get(
+            "grn_item",
+            getattr(self.instance, "grn_item", None),
+        )
+        regular = int(
+            attrs.get(
+                "regular_quantity",
+                getattr(self.instance, "regular_quantity", 0),
+            )
+            or 0
+        )
+        restricted = int(
+            attrs.get(
+                "restricted_quantity",
+                getattr(self.instance, "restricted_quantity", 0),
+            )
+            or 0
+        )
+
+        errors = {}
+
+        if not grn_item:
+            errors["grn_item"] = "Select a GRN item."
+
+        if regular < 0:
+            errors["regular_quantity"] = "Regular return quantity cannot be negative."
+
+        if restricted < 0:
+            errors["restricted_quantity"] = (
+                "Restricted return quantity cannot be negative."
+            )
+
+        total = regular + restricted
+        if total <= 0:
+            errors["quantity"] = "Enter a regular or restricted return quantity."
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if restricted > 0 and not has_sensitive_permission(
+            user,
+            "create_restricted_purchase",
+        ):
+            errors["restricted_quantity"] = (
+                "You are not authorized to return restricted stock."
+            )
+
+        if grn_item:
+            accepted_regular = int(
+                getattr(grn_item, "regular_accepted_quantity", 0) or 0
+            )
+            accepted_restricted = int(
+                getattr(grn_item, "restricted_accepted_quantity", 0) or 0
+            )
+
+            returned_regular = self._already_returned(
+                grn_item,
+                "REGULAR",
+            )
+            returned_restricted = self._already_returned(
+                grn_item,
+                "RESTRICTED",
+            )
+
+            available_regular = max(
                 0,
-            ),
-        )
-
-        received = attrs.get(
-            "received_quantity",
-            getattr(
-                self.instance,
-                "received_quantity",
-                None,
-            ),
-        )
-
-        if quantity <= 0:
-            raise serializers.ValidationError(
-                {"quantity": "Return quantity must be greater than zero."}
+                accepted_regular - returned_regular,
+            )
+            available_restricted = max(
+                0,
+                accepted_restricted - returned_restricted,
             )
 
-        if received is not None and quantity > received:
-            raise serializers.ValidationError(
-                {"quantity": "Return quantity cannot exceed accepted GRN quantity."}
-            )
+            if regular > available_regular:
+                errors["regular_quantity"] = (
+                    f"Regular return quantity cannot exceed " f"{available_regular}."
+                )
 
+            if restricted > available_restricted:
+                errors["restricted_quantity"] = (
+                    f"Restricted return quantity cannot exceed "
+                    f"{available_restricted}."
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs["quantity"] = total
+        attrs["received_quantity"] = total
         return attrs
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
 
-class SupplierReturnSerializer(
-    serializers.ModelSerializer,
-):
-    return_number = serializers.CharField(read_only=True)
+        from apps.common.sensitive_permissions import has_sensitive_permission
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not has_sensitive_permission(user, "view_restricted_purchase"):
+            data.pop("restricted_quantity", None)
+            data.pop("available_restricted_quantity", None)
+            data["quantity"] = int(instance.regular_quantity or 0)
+            data["total_quantity"] = int(instance.regular_quantity or 0)
+
+        return data
+
+
+class SupplierReturnSerializer(serializers.ModelSerializer):
+    return_number = serializers.CharField(
+        read_only=True,
+    )
+
+    total_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+
     items = SupplierReturnItemSerializer(
         many=True,
+        required=True,
     )
 
     attachments = SupplierReturnAttachmentSerializer(
@@ -1094,24 +1762,75 @@ class SupplierReturnSerializer(
         fields = "__all__"
 
         read_only_fields = [
+            "return_number",
+            "total_amount",
             "approved_at",
             "approved_by",
             "submitted_at",
             "vendor_credit",
             "created_by",
             "updated_by",
+            "created_at",
+            "updated_at",
         ]
 
+        extra_kwargs = {
+            "return_number": {
+                "required": False,
+            },
+            "total_amount": {
+                "required": False,
+            },
+        }
+
     def _generate_number(self):
-        prefix = timezone.now().strftime(
-            "RTN-%Y%m",
+        prefix = timezone.localdate().strftime(
+            "RTN-%Y%m-",
         )
 
-        count = SupplierReturn.objects.filter(
-            return_number__startswith=prefix,
-        ).count()
+        last_number = (
+            SupplierReturn.objects.select_for_update()
+            .filter(
+                return_number__startswith=prefix,
+            )
+            .order_by("-return_number")
+            .values_list(
+                "return_number",
+                flat=True,
+            )
+            .first()
+        )
 
-        return f"{prefix}-{count + 1:04d}"
+        sequence = 1
+
+        if last_number:
+            try:
+                sequence = (
+                    int(
+                        last_number.rsplit(
+                            "-",
+                            1,
+                        )[-1]
+                    )
+                    + 1
+                )
+            except (TypeError, ValueError):
+                sequence = (
+                    SupplierReturn.objects.filter(
+                        return_number__startswith=prefix,
+                    ).count()
+                    + 1
+                )
+
+        candidate = f"{prefix}{sequence:04d}"
+
+        while SupplierReturn.objects.filter(
+            return_number=candidate,
+        ).exists():
+            sequence += 1
+            candidate = f"{prefix}{sequence:04d}"
+
+        return candidate
 
     def validate(self, attrs):
         grn = attrs.get(
@@ -1141,20 +1860,22 @@ class SupplierReturnSerializer(
             ),
         )
 
-        if not grn or not grn.is_confirmed:
-            raise serializers.ValidationError(
-                {"grn": "Only a confirmed GRN can be returned."}
-            )
+        errors = {}
 
-        if supplier and supplier.id != grn.supplier_id:
-            raise serializers.ValidationError(
-                {"supplier": "Supplier must match the selected GRN."}
-            )
+        if not grn:
+            errors["grn"] = "A confirmed GRN is required."
 
-        if branch and branch.id != grn.branch_id:
-            raise serializers.ValidationError(
-                {"branch": "Branch must match the selected GRN."}
-            )
+        elif not grn.is_confirmed:
+            errors["grn"] = "Only a confirmed GRN can be returned."
+
+        if grn and supplier and supplier.id != grn.supplier_id:
+            errors["supplier"] = "Supplier must match the selected GRN."
+
+        if grn and branch and branch.id != grn.branch_id:
+            errors["branch"] = "Branch must match the selected GRN."
+
+        if errors:
+            raise serializers.ValidationError(errors)
 
         return attrs
 
@@ -1166,18 +1887,32 @@ class SupplierReturnSerializer(
         grn_items = {item.id: item for item in grn.items.all()}
 
         for item in items:
-            grn_item = item.get(
-                "grn_item",
-            )
+            grn_item = item.get("grn_item")
 
             if not grn_item or grn_item.id not in grn_items:
                 raise serializers.ValidationError(
-                    {"items": "Each return item must belong to the selected GRN."}
+                    {"items": ("Each return item must belong " "to the selected GRN.")}
                 )
 
             source = grn_items[grn_item.id]
 
-            already_returned = (
+            product = item.get("product")
+
+            if not product or product.id != source.product_id:
+                raise serializers.ValidationError(
+                    {"items": ("Return product does not match " "the GRN item.")}
+                )
+
+            variant = item.get("variant")
+
+            variant_id = variant.id if variant else None
+
+            if variant_id != source.variant_id:
+                raise serializers.ValidationError(
+                    {"items": ("Return variant does not match " "the GRN item.")}
+                )
+
+            previously_returned = (
                 SupplierReturnItem.objects.filter(
                     grn_item=source,
                     supplier_return__status__in=[
@@ -1189,26 +1924,107 @@ class SupplierReturnSerializer(
                 .exclude(
                     supplier_return=self.instance,
                 )
-                .aggregate(total=Sum("quantity"))["total"]
+                .aggregate(
+                    regular=Sum("regular_quantity"),
+                    restricted=Sum("restricted_quantity"),
+                )
+            )
+
+            accepted_regular = int(
+                getattr(
+                    source,
+                    "regular_accepted_quantity",
+                    0,
+                )
                 or 0
             )
 
-            available = max(
-                0,
-                source.accepted_quantity - already_returned,
+            accepted_restricted = int(
+                getattr(
+                    source,
+                    "restricted_accepted_quantity",
+                    0,
+                )
+                or 0
             )
 
-            if item["quantity"] > available:
+            # Backward compatibility for older GRN records.
+            if (
+                accepted_regular == 0
+                and accepted_restricted == 0
+                and int(source.accepted_quantity or 0) > 0
+            ):
+                accepted_regular = int(source.accepted_quantity or 0)
+
+            already_regular = int(previously_returned["regular"] or 0)
+
+            already_restricted = int(previously_returned["restricted"] or 0)
+
+            available_regular = max(
+                0,
+                accepted_regular - already_regular,
+            )
+
+            available_restricted = max(
+                0,
+                accepted_restricted - already_restricted,
+            )
+
+            regular_quantity = int(
+                item.get(
+                    "regular_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            restricted_quantity = int(
+                item.get(
+                    "restricted_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            total_quantity = regular_quantity + restricted_quantity
+
+            if total_quantity <= 0:
                 raise serializers.ValidationError(
                     {
-                        "items": f"Return quantity for {source.product} exceeds the remaining returnable quantity."
+                        "items": (
+                            "Enter at least one regular "
+                            "or restricted return quantity."
+                        )
                     }
                 )
 
-            if item["product"].id != source.product_id:
+            if regular_quantity > available_regular:
                 raise serializers.ValidationError(
-                    {"items": "Return product does not match the GRN item."}
+                    {
+                        "items": (
+                            f"Regular return quantity for "
+                            f"{source.product} exceeds "
+                            f"the available quantity of "
+                            f"{available_regular}."
+                        )
+                    }
                 )
+
+            if restricted_quantity > available_restricted:
+                raise serializers.ValidationError(
+                    {
+                        "items": (
+                            f"Restricted return quantity for "
+                            f"{source.product} exceeds "
+                            f"the available quantity of "
+                            f"{available_restricted}."
+                        )
+                    }
+                )
+
+            item["quantity"] = total_quantity
+
+            item["received_quantity"] = total_quantity
 
     def _save_items(
         self,
@@ -1217,10 +2033,51 @@ class SupplierReturnSerializer(
     ):
         supplier_return.items.all().delete()
 
-        for item in items:
-            item.pop("id", None)
+        for source_item in items:
+            item = dict(source_item)
 
-            quantity = Decimal(str(item["quantity"]))
+            item.pop(
+                "id",
+                None,
+            )
+
+            item.pop(
+                "supplier_return",
+                None,
+            )
+
+            item.pop(
+                "line_total",
+                None,
+            )
+
+            regular_quantity = int(
+                item.get(
+                    "regular_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            restricted_quantity = int(
+                item.get(
+                    "restricted_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            total_quantity = regular_quantity + restricted_quantity
+
+            if total_quantity <= 0:
+                raise serializers.ValidationError(
+                    {
+                        "items": (
+                            "Enter at least one regular "
+                            "or restricted return quantity."
+                        )
+                    }
+                )
 
             unit_price = Decimal(
                 str(
@@ -1228,14 +2085,61 @@ class SupplierReturnSerializer(
                         "unit_price",
                         0,
                     )
+                    or 0
                 )
             )
 
+            item["regular_quantity"] = regular_quantity
+
+            item["restricted_quantity"] = restricted_quantity
+
+            item["quantity"] = total_quantity
+
+            item["received_quantity"] = total_quantity
+
             SupplierReturnItem.objects.create(
                 supplier_return=supplier_return,
-                line_total=quantity * unit_price,
+                line_total=(Decimal(str(total_quantity)) * unit_price),
                 **item,
             )
+
+    def _calculate_total(
+        self,
+        items,
+    ):
+        return sum(
+            (
+                Decimal(
+                    str(
+                        int(
+                            item.get(
+                                "regular_quantity",
+                                0,
+                            )
+                            or 0
+                        )
+                        + int(
+                            item.get(
+                                "restricted_quantity",
+                                0,
+                            )
+                            or 0
+                        )
+                    )
+                )
+                * Decimal(
+                    str(
+                        item.get(
+                            "unit_price",
+                            0,
+                        )
+                        or 0
+                    )
+                )
+                for item in items
+            ),
+            Decimal("0.00"),
+        )
 
     @transaction.atomic
     def create(
@@ -1249,44 +2153,37 @@ class SupplierReturnSerializer(
 
         if not items:
             raise serializers.ValidationError(
-                {"items": "Select at least one item to return."}
+                {"items": ("Select at least one item " "to return.")}
             )
 
-        grn = validated_data["grn"]
+        grn = validated_data.get("grn")
+
+        if not grn:
+            raise serializers.ValidationError({"grn": ("A confirmed GRN is required.")})
 
         self._validate_items(
             grn,
             items,
         )
 
-        if not validated_data.get(
+        validated_data.pop(
             "return_number",
-        ):
-            validated_data["return_number"] = self._generate_number()
+            None,
+        )
+
+        validated_data.pop(
+            "total_amount",
+            None,
+        )
+
+        validated_data["return_number"] = self._generate_number()
+
+        validated_data["total_amount"] = self._calculate_total(items)
 
         if validated_data.get("status") == "PENDING_APPROVAL":
             validated_data["submitted_at"] = timezone.now()
 
-        total = sum(
-            (
-                Decimal(str(item["quantity"]))
-                * Decimal(
-                    str(
-                        item.get(
-                            "unit_price",
-                            0,
-                        )
-                    )
-                )
-                for item in items
-            ),
-            Decimal("0"),
-        )
-
-        supplier_return = SupplierReturn.objects.create(
-            total_amount=total,
-            **validated_data,
-        )
+        supplier_return = SupplierReturn.objects.create(**validated_data)
 
         self._save_items(
             supplier_return,
@@ -1301,13 +2198,13 @@ class SupplierReturnSerializer(
         instance,
         validated_data,
     ):
-        if instance.status in [
+        if instance.status in {
             "APPROVED",
             "CREDIT_ISSUED",
             "CANCELLED",
-        ]:
+        }:
             raise serializers.ValidationError(
-                "Approved, credited, or cancelled returns cannot be edited."
+                ("Approved, credited, or cancelled " "returns cannot be edited.")
             )
 
         items = validated_data.pop(
@@ -1315,32 +2212,33 @@ class SupplierReturnSerializer(
             None,
         )
 
+        validated_data.pop(
+            "return_number",
+            None,
+        )
+
+        validated_data.pop(
+            "total_amount",
+            None,
+        )
+
         if items is not None:
+            if not items:
+                raise serializers.ValidationError(
+                    {"items": ("Select at least one item " "to return.")}
+                )
+
+            grn = validated_data.get(
+                "grn",
+                instance.grn,
+            )
+
             self._validate_items(
-                validated_data.get(
-                    "grn",
-                    instance.grn,
-                ),
+                grn,
                 items,
             )
 
-            total = sum(
-                (
-                    Decimal(str(item["quantity"]))
-                    * Decimal(
-                        str(
-                            item.get(
-                                "unit_price",
-                                0,
-                            )
-                        )
-                    )
-                    for item in items
-                ),
-                Decimal("0"),
-            )
-
-            validated_data["total_amount"] = total
+            validated_data["total_amount"] = self._calculate_total(items)
 
         if (
             validated_data.get("status") == "PENDING_APPROVAL"
@@ -1348,10 +2246,14 @@ class SupplierReturnSerializer(
         ):
             validated_data["submitted_at"] = timezone.now()
 
-        instance = super().update(
-            instance,
-            validated_data,
-        )
+        for field, value in validated_data.items():
+            setattr(
+                instance,
+                field,
+                value,
+            )
+
+        instance.save()
 
         if items is not None:
             self._save_items(
@@ -1908,23 +2810,15 @@ class PurchaseExpenseAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
-class PurchaseExpenseCategorySerializer(serializers.ModelSerializer):
-    value = serializers.CharField(source="code", read_only=True)
-    label = serializers.CharField(source="name", read_only=True)
-
-    class Meta:
-        model = PurchaseExpenseCategory
-        fields = ["id", "name", "code", "value", "label", "is_active"]
-
-
 class PurchaseExpenseSerializer(serializers.ModelSerializer):
-    category = serializers.CharField()
     expense_number = serializers.CharField(read_only=True)
     attachments = PurchaseExpenseAttachmentSerializer(many=True, read_only=True)
     branch_name = serializers.CharField(
         source="branch.branch_name", read_only=True, allow_null=True
     )
-    category_display = serializers.SerializerMethodField()
+    category_display = serializers.CharField(
+        source="get_category_display", read_only=True
+    )
     payment_method_display = serializers.CharField(
         source="get_payment_method_display", read_only=True
     )
@@ -1940,10 +2834,6 @@ class PurchaseExpenseSerializer(serializers.ModelSerializer):
             "created_by",
             "updated_by",
         ]
-
-    def get_category_display(self, obj):
-        category = PurchaseExpenseCategory.objects.filter(code=obj.category).first()
-        return category.name if category else obj.get_category_display()
 
     def validate(self, attrs):
         amount = attrs.get("amount", getattr(self.instance, "amount", 0))

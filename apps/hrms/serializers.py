@@ -500,13 +500,10 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
                     {"from_date": "Leave overlaps an existing request."}
                 )
 
-            balance = LeaveBalance.objects.filter(
-                employee=employee, leave_type=leave_type, year=start.year
-            ).first()
-            if balance and days > balance.remaining_days:
-                raise serializers.ValidationError(
-                    {"days": f"Only {balance.remaining_days} day(s) available."}
-                )
+            # Leave requests may be submitted even when a paid entitlement is
+            # exhausted. The approval endpoint performs the final balance check
+            # and lets authorised HR users explicitly override it. Unpaid leave
+            # is never restricted by the paid annual entitlement.
 
         if employee and not attrs.get("branch"):
             attrs["branch"] = employee.branch
@@ -649,7 +646,45 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         if deductions < 0:
             errors["deductions"] = "Deductions cannot be negative."
 
-        gross_salary = basic_salary + allowances
+        total_period_days = Decimal(
+            attrs.get(
+                "total_period_days",
+                getattr(self.instance, "total_period_days", 30) or 30,
+            )
+            or 30
+        )
+        payable_days = Decimal(
+            attrs.get(
+                "payable_days",
+                getattr(self.instance, "payable_days", total_period_days)
+                or total_period_days,
+            )
+            or 0
+        )
+        calculation_method = attrs.get(
+            "salary_calculation_method",
+            getattr(self.instance, "salary_calculation_method", "FULL"),
+        )
+
+        if total_period_days <= 0:
+            errors["total_period_days"] = "Total period days must be greater than zero."
+        if payable_days < 0:
+            errors["payable_days"] = "Payable days cannot be negative."
+        if payable_days > total_period_days:
+            errors["payable_days"] = "Payable days cannot exceed total period days."
+
+        full_gross_salary = basic_salary + allowances
+        if calculation_method == "PRORATED" and total_period_days > 0:
+            factor = payable_days / total_period_days
+            prorated_basic = (basic_salary * factor).quantize(Decimal("0.01"))
+            prorated_allowances = (allowances * factor).quantize(Decimal("0.01"))
+            attrs["basic_salary"] = prorated_basic
+            attrs["allowances"] = prorated_allowances
+            gross_salary = prorated_basic + prorated_allowances
+        else:
+            attrs["payable_days"] = total_period_days
+            attrs["unpaid_leave_days"] = Decimal("0")
+            gross_salary = full_gross_salary
 
         if deductions > gross_salary:
             errors["deductions"] = "Deductions cannot exceed gross salary."

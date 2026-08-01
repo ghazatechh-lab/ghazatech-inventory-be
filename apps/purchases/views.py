@@ -18,6 +18,10 @@ from apps.finance.models import BankAccount, CashRegister
 from apps.inventory.models import ProductStock, StockMovement
 from apps.branches.models import Branch
 from apps.inventory.models import Rack
+from apps.common.sensitive_permissions import (
+    has_sensitive_permission,
+)
+from apps.inventory.services import adjust_stock
 
 User = get_user_model()
 
@@ -377,7 +381,10 @@ class GRNViewSet(Base):
         branch_id = request.query_params.get("branch")
 
         orders = (
-            PurchaseOrder.objects.select_related("supplier", "branch")
+            PurchaseOrder.objects.select_related(
+                "supplier",
+                "branch",
+            )
             .prefetch_related(
                 "items__product",
                 "items__variant",
@@ -389,61 +396,220 @@ class GRNViewSet(Base):
                     "PARTIALLY_RECEIVED",
                 ]
             )
-            .order_by("-order_date", "-id")
+            .order_by(
+                "-order_date",
+                "-id",
+            )
         )
 
         if branch_id not in (None, "", "all"):
             orders = orders.filter(branch_id=branch_id)
 
-        branches = Branch.objects.filter(is_active=True).order_by("branch_code")
-        racks = Rack.objects.filter(is_active=True).select_related("branch")
+        branches = Branch.objects.filter(
+            is_active=True,
+        ).order_by("branch_code")
+
+        racks = Rack.objects.filter(
+            is_active=True,
+        ).select_related("branch")
 
         if branch_id not in (None, "", "all"):
             racks = racks.filter(branch_id=branch_id)
 
-        receivers = User.objects.filter(is_active=True).order_by(
+        receivers = User.objects.filter(
+            is_active=True,
+        ).order_by(
             "first_name",
             "username",
         )
 
-        if branch_id and hasattr(User, "branch"):
-            receivers = receivers.filter(branch_id=branch_id)
+        if branch_id not in (None, "", "all"):
+            receivers = receivers.filter(
+                Q(branch_id=branch_id) | Q(branch__isnull=True)
+            )
 
         order_options = []
 
         for order in orders:
+            order_items = []
+
+            for item in order.items.all():
+                regular_quantity = int(
+                    getattr(
+                        item,
+                        "regular_quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                restricted_quantity = int(
+                    getattr(
+                        item,
+                        "restricted_quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                total_ordered_quantity = int(
+                    getattr(
+                        item,
+                        "quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                # Backward compatibility for old purchase-order records.
+                # When classified values are empty, treat the aggregate
+                # PO quantity as regular quantity.
+                if (
+                    regular_quantity == 0
+                    and restricted_quantity == 0
+                    and total_ordered_quantity > 0
+                ):
+                    regular_quantity = total_ordered_quantity
+
+                received_regular_quantity = int(
+                    getattr(
+                        item,
+                        "received_regular_quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                received_restricted_quantity = int(
+                    getattr(
+                        item,
+                        "received_restricted_quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                aggregate_received_quantity = int(
+                    getattr(
+                        item,
+                        "received_quantity",
+                        0,
+                    )
+                    or 0
+                )
+
+                # Backward compatibility for GRNs created before classified
+                # received quantities were introduced.
+                if (
+                    received_regular_quantity == 0
+                    and received_restricted_quantity == 0
+                    and aggregate_received_quantity > 0
+                ):
+                    received_regular_quantity = min(
+                        aggregate_received_quantity,
+                        regular_quantity,
+                    )
+
+                    remaining_aggregate_received = max(
+                        0,
+                        aggregate_received_quantity - received_regular_quantity,
+                    )
+
+                    received_restricted_quantity = min(
+                        remaining_aggregate_received,
+                        restricted_quantity,
+                    )
+
+                remaining_regular_quantity = max(
+                    0,
+                    regular_quantity - received_regular_quantity,
+                )
+
+                remaining_restricted_quantity = max(
+                    0,
+                    restricted_quantity - received_restricted_quantity,
+                )
+
+                remaining_total_quantity = (
+                    remaining_regular_quantity + remaining_restricted_quantity
+                )
+
+                if remaining_total_quantity <= 0:
+                    continue
+
+                order_items.append(
+                    {
+                        "id": item.id,
+                        "po_item_id": item.id,
+                        "product_id": item.product_id,
+                        "variant_id": item.variant_id,
+                        "product_name": (item.product.product_name),
+                        "sku": (
+                            getattr(
+                                item.variant,
+                                "sku",
+                                "",
+                            )
+                            if item.variant
+                            else getattr(
+                                item.product,
+                                "sku",
+                                "",
+                            )
+                        ),
+                        # Aggregate quantities retained for old frontend code.
+                        "quantity": total_ordered_quantity,
+                        "ordered_quantity": (regular_quantity + restricted_quantity),
+                        "received_quantity": (
+                            received_regular_quantity + received_restricted_quantity
+                        ),
+                        "previously_received_quantity": (
+                            received_regular_quantity + received_restricted_quantity
+                        ),
+                        "remaining_quantity": (remaining_total_quantity),
+                        # Classified ordered quantities.
+                        "regular_quantity": (regular_quantity),
+                        "restricted_quantity": (restricted_quantity),
+                        "ordered_regular_quantity": (regular_quantity),
+                        "ordered_restricted_quantity": (restricted_quantity),
+                        # Classified previously received quantities.
+                        "received_regular_quantity": (received_regular_quantity),
+                        "received_restricted_quantity": (received_restricted_quantity),
+                        "previously_received_regular_quantity": (
+                            received_regular_quantity
+                        ),
+                        "previously_received_restricted_quantity": (
+                            received_restricted_quantity
+                        ),
+                        # Classified remaining quantities.
+                        "remaining_regular_quantity": (remaining_regular_quantity),
+                        "remaining_restricted_quantity": (
+                            remaining_restricted_quantity
+                        ),
+                    }
+                )
+
+            if not order_items:
+                continue
+
+            shipment = order.shipments.first() if hasattr(order, "shipments") else None
+
             order_options.append(
                 {
                     "id": order.id,
                     "po_number": order.po_number,
                     "supplier_id": order.supplier_id,
-                    "supplier_name": order.supplier.supplier_name,
+                    "supplier_name": (order.supplier.supplier_name),
                     "branch_id": order.branch_id,
-                    "branch_name": order.branch.branch_name,
-                    "currency": getattr(order, "currency", "AED"),
-                    "total_amount": order.total_amount,
-                    "shipment_number": (
-                        order.shipments.first().shipment_number
-                        if hasattr(order, "shipments") and order.shipments.exists()
-                        else ""
+                    "branch_name": (order.branch.branch_name),
+                    "currency": getattr(
+                        order,
+                        "currency",
+                        "AED",
                     ),
-                    "items": [
-                        {
-                            "id": item.id,
-                            "product_id": item.product_id,
-                            "variant_id": item.variant_id,
-                            "product_name": item.product.product_name,
-                            "sku": (
-                                getattr(item.variant, "sku", "")
-                                if item.variant
-                                else getattr(item.product, "sku", "")
-                            ),
-                            "quantity": item.quantity,
-                            "received_quantity": item.received_quantity,
-                        }
-                        for item in order.items.all()
-                        if item.received_quantity < item.quantity
-                    ],
+                    "total_amount": order.total_amount,
+                    "shipment_number": (shipment.shipment_number if shipment else ""),
+                    "items": order_items,
                 }
             )
 
@@ -453,8 +619,8 @@ class GRNViewSet(Base):
                 "branches": [
                     {
                         "id": branch.id,
-                        "branch_code": branch.branch_code,
-                        "branch_name": branch.branch_name,
+                        "branch_code": (branch.branch_code),
+                        "branch_name": (branch.branch_name),
                     }
                     for branch in branches
                 ],
@@ -468,8 +634,12 @@ class GRNViewSet(Base):
                 "racks": [
                     {
                         "id": rack.id,
-                        "rack_code": rack.rack_code,
-                        "rack_name": getattr(rack, "rack_name", ""),
+                        "rack_code": (rack.rack_code),
+                        "rack_name": getattr(
+                            rack,
+                            "rack_name",
+                            "",
+                        ),
                         "branch_id": rack.branch_id,
                     }
                     for rack in racks
@@ -524,27 +694,21 @@ class SupplierBillViewSet(Base):
         "purchase_order",
         "grn",
         "branch",
-        "approved_by",
     ).prefetch_related(
-        "items__product",
-        "items__variant",
-        "items__grn_item",
+        "items",
         "attachments",
     )
+
     serializer_class = SupplierBillSerializer
-    parser_classes = [
-        MultiPartParser,
-        FormParser,
-        JSONParser,
-    ]
+
     filterset_fields = [
-        "branch",
         "supplier",
         "status",
-        "match_status",
+        "branch",
         "purchase_order",
         "grn",
     ]
+
     search_fields = [
         "bill_number",
         "supplier_invoice_number",
@@ -601,7 +765,10 @@ class SupplierBillViewSet(Base):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=self._payload(request))
         serializer.is_valid(raise_exception=True)
-        bill = serializer.save()
+        bill = serializer.save(
+            created_by=request.user if request.user.is_authenticated else None,
+            updated_by=request.user if request.user.is_authenticated else None,
+        )
         self._save_attachments(bill, request)
         return Response(
             self.get_serializer(bill).data,
@@ -618,7 +785,9 @@ class SupplierBillViewSet(Base):
             partial=partial,
         )
         serializer.is_valid(raise_exception=True)
-        bill = serializer.save()
+        bill = serializer.save(
+            updated_by=request.user if request.user.is_authenticated else None,
+        )
         self._save_attachments(bill, request)
         return Response(self.get_serializer(bill).data)
 
@@ -629,6 +798,9 @@ class SupplierBillViewSet(Base):
     )
     def form_options(self, request):
         branch_id = request.query_params.get("branch")
+        include_all_branches = str(
+            request.query_params.get("include_all_branches", "")
+        ).lower() in {"1", "true", "yes"}
 
         purchase_orders = (
             PurchaseOrder.objects.select_related("supplier", "branch")
@@ -657,7 +829,11 @@ class SupplierBillViewSet(Base):
             .order_by("-received_date", "-id")
         )
 
-        if branch_id:
+        # Supplier Bills follow a PO-first workflow. By default the form may
+        # request all eligible POs so a global branch override does not hide
+        # valid references. Once a PO is selected, its branch is populated in
+        # the bill automatically.
+        if branch_id and not include_all_branches:
             purchase_orders = purchase_orders.filter(branch_id=branch_id)
             grns = grns.filter(branch_id=branch_id)
 
@@ -1003,10 +1179,11 @@ class SupplierPaymentViewSet(Base):
             "account_name",
         )
 
-        cash_registers = CashRegister.objects.filter(
-            is_active=True,
+        cash_registers = CashRegister.objects.exclude(
+            status__in=["CLOSED", "INACTIVE"],
         ).order_by(
-            "name",
+            "-register_date",
+            "-id",
         )
 
         if branch_id:
@@ -1078,11 +1255,12 @@ class SupplierPaymentViewSet(Base):
                 "cash_registers": [
                     {
                         "id": register.id,
-                        "name": getattr(
-                            register,
-                            "name",
-                            str(register),
+                        "name": (
+                            f"Cash Register #{register.id} - "
+                            f"{register.register_date} ({register.status})"
                         ),
+                        "branch": register.branch_id,
+                        "status": register.status,
                     }
                     for register in cash_registers
                 ],
@@ -1157,6 +1335,10 @@ class SupplierReturnViewSet(Base):
     ]
 
     def _payload(self, request):
+        """
+        Support both normal JSON requests and multipart requests
+        containing a JSON string under the payload field.
+        """
         if "payload" in request.data:
             try:
                 return json.loads(request.data["payload"])
@@ -1164,10 +1346,10 @@ class SupplierReturnViewSet(Base):
                 TypeError,
                 ValueError,
                 json.JSONDecodeError,
-            ):
+            ) as exc:
                 raise serializers.ValidationError(
-                    {"payload": "Invalid supplier return payload."}
-                )
+                    {"payload": ("Invalid supplier return payload.")}
+                ) from exc
 
         return request.data
 
@@ -1181,12 +1363,12 @@ class SupplierReturnViewSet(Base):
 
             if extension not in ALLOWED_RETURN_ATTACHMENT_EXTENSIONS:
                 raise serializers.ValidationError(
-                    {"attachments": f"{file.name}: unsupported file type."}
+                    {"attachments": (f"{file.name}: unsupported file type.")}
                 )
 
             if file.size > MAX_RETURN_ATTACHMENT_SIZE:
                 raise serializers.ValidationError(
-                    {"attachments": f"{file.name}: file exceeds 10 MB."}
+                    {"attachments": (f"{file.name}: file exceeds 10 MB.")}
                 )
 
             SupplierReturnAttachment.objects.create(
@@ -1194,8 +1376,8 @@ class SupplierReturnViewSet(Base):
                 file=file,
                 original_name=file.name,
                 file_size=file.size,
-                content_type=file.content_type or "",
-                uploaded_by=request.user if request.user.is_authenticated else None,
+                content_type=(file.content_type or ""),
+                uploaded_by=(request.user if request.user.is_authenticated else None),
             )
 
     @transaction.atomic
@@ -1206,16 +1388,15 @@ class SupplierReturnViewSet(Base):
         **kwargs,
     ):
         serializer = self.get_serializer(
-            data=self._payload(
-                request,
-            )
+            data=self._payload(request),
         )
 
-        serializer.is_valid(
-            raise_exception=True,
-        )
+        serializer.is_valid(raise_exception=True)
 
-        supplier_return = serializer.save()
+        supplier_return = serializer.save(
+            created_by=request.user,
+            updated_by=request.user,
+        )
 
         self._save_attachments(
             supplier_return,
@@ -1223,9 +1404,7 @@ class SupplierReturnViewSet(Base):
         )
 
         return Response(
-            self.get_serializer(
-                supplier_return,
-            ).data,
+            self.get_serializer(supplier_return).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -1245,39 +1424,38 @@ class SupplierReturnViewSet(Base):
 
         serializer = self.get_serializer(
             instance,
-            data=self._payload(
-                request,
-            ),
+            data=self._payload(request),
             partial=partial,
         )
 
-        serializer.is_valid(
-            raise_exception=True,
-        )
+        serializer.is_valid(raise_exception=True)
 
-        supplier_return = serializer.save()
+        supplier_return = serializer.save(
+            updated_by=request.user,
+        )
 
         self._save_attachments(
             supplier_return,
             request,
         )
 
-        return Response(
-            self.get_serializer(
-                supplier_return,
-            ).data
-        )
+        return Response(self.get_serializer(supplier_return).data)
 
     @action(
         detail=False,
         methods=["get"],
         url_path="form-options",
     )
-    def form_options(
-        self,
-        request,
-    ):
-        branch_id = request.query_params.get("branch")
+    def form_options(self, request):
+        can_view_restricted = has_sensitive_permission(
+            request.user,
+            "view_restricted_purchase",
+        )
+
+        can_return_restricted = has_sensitive_permission(
+            request.user,
+            "create_restricted_purchase",
+        )
 
         grns = (
             GoodsReceivedNote.objects.select_related(
@@ -1288,6 +1466,7 @@ class SupplierReturnViewSet(Base):
             .prefetch_related(
                 "items__product",
                 "items__variant",
+                "purchase_order__items",
             )
             .filter(
                 is_confirmed=True,
@@ -1298,95 +1477,170 @@ class SupplierReturnViewSet(Base):
             )
         )
 
-        if branch_id:
-            grns = grns.filter(
-                branch_id=branch_id,
-            )
+        branch_id = request.query_params.get("branch")
+
+        if branch_id not in (
+            None,
+            "",
+            "all",
+        ):
+            grns = grns.filter(branch_id=branch_id)
 
         grn_options = []
 
         for grn in grns:
-            items = []
+            returnable_items = []
 
-            for item in grn.items.all():
-                already_returned = (
-                    SupplierReturnItem.objects.filter(
-                        grn_item=item,
-                        supplier_return__status__in=[
-                            "PENDING_APPROVAL",
-                            "APPROVED",
-                            "CREDIT_ISSUED",
-                        ],
-                    ).aggregate(total=Sum("quantity"))["total"]
+            po_items = {
+                (
+                    item.product_id,
+                    item.variant_id,
+                ): item
+                for item in grn.purchase_order.items.all()
+            }
+
+            for grn_item in grn.items.all():
+                previous_returns = SupplierReturnItem.objects.filter(
+                    grn_item=grn_item,
+                    supplier_return__status__in=[
+                        "PENDING_APPROVAL",
+                        "APPROVED",
+                        "CREDIT_ISSUED",
+                    ],
+                ).aggregate(
+                    regular=Sum("regular_quantity"),
+                    restricted=Sum("restricted_quantity"),
+                )
+
+                accepted_regular = int(
+                    getattr(
+                        grn_item,
+                        "regular_accepted_quantity",
+                        0,
+                    )
                     or 0
                 )
 
-                returnable = max(
-                    0,
-                    item.accepted_quantity - already_returned,
+                accepted_restricted = int(
+                    getattr(
+                        grn_item,
+                        "restricted_accepted_quantity",
+                        0,
+                    )
+                    or 0
                 )
 
-                if returnable <= 0:
+                # Backward compatibility for GRNs created before
+                # classified accepted quantities were introduced.
+                if (
+                    accepted_regular == 0
+                    and accepted_restricted == 0
+                    and int(grn_item.accepted_quantity or 0) > 0
+                ):
+                    accepted_regular = int(grn_item.accepted_quantity or 0)
+
+                returned_regular = int(previous_returns["regular"] or 0)
+
+                returned_restricted = int(previous_returns["restricted"] or 0)
+
+                available_regular = max(
+                    0,
+                    accepted_regular - returned_regular,
+                )
+
+                available_restricted = max(
+                    0,
+                    accepted_restricted - returned_restricted,
+                )
+
+                visible_total = available_regular
+
+                if can_view_restricted:
+                    visible_total += available_restricted
+
+                if visible_total <= 0:
                     continue
 
-                po_item = grn.purchase_order.items.filter(
-                    product_id=item.product_id,
-                    variant_id=item.variant_id,
-                ).first()
+                po_item = po_items.get(
+                    (
+                        grn_item.product_id,
+                        grn_item.variant_id,
+                    )
+                )
 
-                items.append(
-                    {
-                        "id": item.id,
-                        "product_id": item.product_id,
-                        "variant_id": item.variant_id,
-                        "product_name": item.product.product_name,
-                        "sku": (
-                            getattr(
-                                item.variant,
-                                "sku",
-                                "",
-                            )
-                            if item.variant
-                            else getattr(
-                                item.product,
-                                "sku",
-                                "",
-                            )
-                        ),
-                        "accepted_quantity": returnable,
-                        "unit_price": getattr(
+                item_data = {
+                    "id": grn_item.id,
+                    "grn_item_id": grn_item.id,
+                    "product_id": (grn_item.product_id),
+                    "variant_id": (grn_item.variant_id),
+                    "product_name": (grn_item.product.product_name),
+                    "sku": (
+                        getattr(
+                            grn_item.variant,
+                            "sku",
+                            "",
+                        )
+                        if grn_item.variant
+                        else getattr(
+                            grn_item.product,
+                            "sku",
+                            "",
+                        )
+                    ),
+                    "accepted_regular_quantity": (accepted_regular),
+                    "returned_regular_quantity": (returned_regular),
+                    "available_regular_quantity": (available_regular),
+                    # Compatibility total for older frontend code.
+                    "accepted_quantity": (visible_total),
+                    "unit_price": (
+                        getattr(
                             po_item,
                             "unit_price",
                             0,
-                        ),
-                    }
-                )
+                        )
+                        if po_item
+                        else 0
+                    ),
+                }
 
-            if not items:
+                if can_view_restricted:
+                    item_data.update(
+                        {
+                            "accepted_restricted_quantity": (accepted_restricted),
+                            "returned_restricted_quantity": (returned_restricted),
+                            "available_restricted_quantity": (available_restricted),
+                        }
+                    )
+
+                returnable_items.append(item_data)
+
+            if not returnable_items:
                 continue
 
             grn_options.append(
                 {
                     "id": grn.id,
-                    "grn_number": grn.grn_number,
-                    "supplier_id": grn.supplier_id,
-                    "supplier_name": grn.supplier.supplier_name,
-                    "branch_id": grn.branch_id,
-                    "branch_name": grn.branch.branch_name,
-                    "received_date": grn.received_date,
-                    "po_number": grn.purchase_order.po_number,
+                    "grn_number": (grn.grn_number),
+                    "supplier_id": (grn.supplier_id),
+                    "supplier_name": (grn.supplier.supplier_name),
+                    "branch_id": (grn.branch_id),
+                    "branch_name": (grn.branch.branch_name),
+                    "received_date": (grn.received_date),
+                    "po_number": (grn.purchase_order.po_number),
                     "receipt_status": (
                         "FULL_RECEIPT"
                         if (grn.purchase_order.status == "RECEIVED")
                         else "PARTIAL_RECEIPT"
                     ),
-                    "items": items,
+                    "items": (returnable_items),
                 }
             )
 
         return Response(
             {
                 "grns": grn_options,
+                "can_view_restricted": (can_view_restricted),
+                "can_return_restricted": (can_return_restricted),
                 "reasons": [
                     {
                         "value": value,
@@ -1404,17 +1658,123 @@ class SupplierReturnViewSet(Base):
             }
         )
 
-    def _movement_number(
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="update-status",
+    )
+    def update_status(
         self,
-        supplier_return,
-        item,
+        request,
+        pk=None,
     ):
-        return f"SM-SR-" f"{supplier_return.id}-" f"{item.id}"
+        supplier_return = self.get_object()
+
+        next_status = (
+            str(
+                request.data.get(
+                    "status",
+                    "",
+                )
+            )
+            .strip()
+            .upper()
+        )
+
+        valid_statuses = dict(SupplierReturn.STATUS_CHOICES)
+
+        if next_status not in valid_statuses:
+            return Response(
+                {"status": ["Select a valid supplier return status."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        transitions = {
+            "DRAFT": {
+                "DRAFT",
+                "PENDING_APPROVAL",
+                "CANCELLED",
+            },
+            "PENDING_APPROVAL": {
+                "PENDING_APPROVAL",
+                "REJECTED",
+                "CANCELLED",
+            },
+            "APPROVED": {
+                "APPROVED",
+            },
+            "CREDIT_ISSUED": {
+                "CREDIT_ISSUED",
+            },
+            "REJECTED": {
+                "REJECTED",
+            },
+            "CANCELLED": {
+                "CANCELLED",
+            },
+        }
+
+        allowed_statuses = transitions.get(
+            supplier_return.status,
+            {
+                supplier_return.status,
+            },
+        )
+
+        if next_status == "APPROVED":
+            return Response(
+                {"status": ["Use the approve action to approve " "a supplier return."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if next_status not in allowed_statuses:
+            current_label = valid_statuses.get(
+                supplier_return.status,
+                supplier_return.status,
+            )
+            next_label = valid_statuses.get(
+                next_status,
+                next_status,
+            )
+
+            return Response(
+                {
+                    "status": [
+                        (
+                            f"Status cannot be changed from "
+                            f"{current_label} to {next_label}."
+                        )
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if next_status == supplier_return.status:
+            return Response(self.get_serializer(supplier_return).data)
+
+        supplier_return.status = next_status
+        supplier_return.updated_by = request.user
+
+        update_fields = [
+            "status",
+            "updated_by",
+            "updated_at",
+        ]
+
+        if next_status == "PENDING_APPROVAL":
+            supplier_return.submitted_at = timezone.now()
+            update_fields.append("submitted_at")
+
+        supplier_return.save(update_fields=update_fields)
+
+        return Response(self.get_serializer(supplier_return).data)
 
     @transaction.atomic
     @action(
         detail=True,
         methods=["post"],
+        url_path="approve",
     )
     def approve(
         self,
@@ -1427,155 +1787,241 @@ class SupplierReturnViewSet(Base):
             "APPROVED",
             "CREDIT_ISSUED",
         ]:
-            return Response(
-                self.get_serializer(
-                    supplier_return,
-                ).data
-            )
+            return Response(self.get_serializer(supplier_return).data)
 
         if supplier_return.status != "PENDING_APPROVAL":
             return Response(
-                {"detail": "Only pending returns can be approved."},
+                {"detail": ("Only pending supplier returns " "can be approved.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        for item in supplier_return.items.select_related(
-            "product",
-            "variant",
-        ).all():
-            stock = (
-                ProductStock.objects.select_for_update()
-                .filter(
+        restricted_total = sum(
+            int(item.restricted_quantity or 0) for item in supplier_return.items.all()
+        )
+
+        if restricted_total > 0 and not has_sensitive_permission(
+            request.user,
+            "create_restricted_purchase",
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "You are not authorized to approve "
+                        "a restricted-stock return."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return_items = list(
+            supplier_return.items.select_related(
+                "product",
+                "variant",
+                "grn_item",
+            )
+        )
+
+        if not return_items:
+            return Response(
+                {
+                    "detail": (
+                        "This supplier return does not contain " "any return items."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 1. Deduct returned stock from the correct classification.
+        for item in return_items:
+            regular_quantity = int(item.regular_quantity or 0)
+            restricted_quantity = int(item.restricted_quantity or 0)
+
+            if regular_quantity > 0:
+                adjust_stock(
                     product=item.product,
                     variant=item.variant,
                     branch=supplier_return.branch,
-                )
-                .first()
-            )
-
-            if not stock:
-                return Response(
-                    {"detail": f"No stock record exists for {item.product}."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            if stock.current_stock < item.quantity:
-                return Response(
-                    {"detail": f"Insufficient stock for {item.product}."},
-                    status=status.HTTP_400_BAD_REQUEST,
+                    quantity=-regular_quantity,
+                    movement_type="SUPPLIER_RETURN",
+                    stock_classification="REGULAR",
+                    performed_by=request.user,
+                    reference_type="SUPPLIER_RETURN",
+                    reference_id=supplier_return.id,
+                    remarks=(
+                        "Regular stock returned under "
+                        f"{supplier_return.return_number}."
+                    ),
                 )
 
-            previous_stock = stock.current_stock
+            if restricted_quantity > 0:
+                adjust_stock(
+                    product=item.product,
+                    variant=item.variant,
+                    branch=supplier_return.branch,
+                    quantity=-restricted_quantity,
+                    movement_type="SUPPLIER_RETURN",
+                    stock_classification="RESTRICTED",
+                    performed_by=request.user,
+                    reference_type="SUPPLIER_RETURN",
+                    reference_id=supplier_return.id,
+                    remarks=(
+                        "Restricted stock returned under "
+                        f"{supplier_return.return_number}."
+                    ),
+                )
 
-            stock.current_stock -= item.quantity
+        # 2. Create or update the vendor-credit header.
+        credit_number = f"VC-{supplier_return.return_number}"
 
-            stock.save(
-                update_fields=[
-                    "current_stock",
-                    "updated_at",
-                ]
-            )
-
-            StockMovement.objects.get_or_create(
-                movement_number=self._movement_number(
-                    supplier_return,
-                    item,
-                ),
-                defaults={
-                    "product": item.product,
-                    "variant": item.variant,
-                    "branch": supplier_return.branch,
-                    "movement_type": "SUPPLIER_RETURN",
-                    "quantity": -item.quantity,
-                    "previous_stock": previous_stock,
-                    "new_stock": stock.current_stock,
-                    "reference_type": "SupplierReturn",
-                    "reference_id": str(supplier_return.id),
-                    "remarks": supplier_return.details or supplier_return.notes or "",
-                    "performed_by": request.user,
-                },
-            )
-
-        credit = VendorCredit.objects.create(
-            credit_number=f"VC-{supplier_return.return_number}",
-            supplier=supplier_return.supplier,
-            supplier_return=supplier_return,
-            branch=supplier_return.branch,
-            credit_date=timezone.localdate(),
-            reason=supplier_return.get_reason_display(),
-            total_amount=supplier_return.total_amount,
-            remaining_amount=supplier_return.total_amount,
-            status="OPEN",
-            notes=(
-                "Supplier return resolution: "
-                f"{supplier_return.get_resolution_display()}"
-            ),
-            approved_by=request.user,
-            approval_date=timezone.localdate(),
+        vendor_credit = (
+            VendorCredit.objects.select_for_update()
+            .filter(supplier_return=supplier_return)
+            .first()
         )
 
+        if not vendor_credit:
+            vendor_credit = VendorCredit.objects.create(
+                credit_number=credit_number,
+                supplier=supplier_return.supplier,
+                supplier_return=supplier_return,
+                purchase_order=(supplier_return.grn.purchase_order),
+                branch=supplier_return.branch,
+                credit_date=timezone.localdate(),
+                reason="RETURN",
+                subtotal=Decimal("0.00"),
+                tax_amount=Decimal("0.00"),
+                total_amount=Decimal("0.00"),
+                applied_amount=Decimal("0.00"),
+                remaining_amount=Decimal("0.00"),
+                status="OPEN",
+                notes=(
+                    "Vendor credit created from supplier "
+                    f"return {supplier_return.return_number}."
+                ),
+                internal_memo=(
+                    "Automatically generated when the supplier " "return was approved."
+                ),
+                created_by=request.user,
+                updated_by=request.user,
+            )
+        else:
+            vendor_credit.items.all().delete()
+
+        # 3. Create vendor-credit line items from supplier-return items.
+        subtotal = Decimal("0.00")
+        tax_amount = Decimal("0.00")
+        total_amount = Decimal("0.00")
+
+        for return_item in return_items:
+            regular_quantity = int(return_item.regular_quantity or 0)
+            restricted_quantity = int(return_item.restricted_quantity or 0)
+            quantity = regular_quantity + restricted_quantity
+
+            if quantity <= 0:
+                continue
+
+            unit_price = Decimal(str(return_item.unit_price or 0))
+
+            line_subtotal = Decimal(str(quantity)) * unit_price
+
+            # Supplier-return lines currently do not store a
+            # separate VAT percentage, so the generated credit
+            # line uses zero tax unless you add a mapped VAT field.
+            line_tax_percentage = Decimal("0.00")
+            line_tax_amount = Decimal("0.00")
+            line_total = line_subtotal + line_tax_amount
+
+            description_parts = [
+                getattr(
+                    return_item.product,
+                    "product_name",
+                    None,
+                )
+                or str(return_item.product)
+            ]
+
+            if return_item.variant:
+                description_parts.append(str(return_item.variant))
+
+            classification_parts = []
+
+            if regular_quantity:
+                classification_parts.append(f"Regular: {regular_quantity}")
+
+            if restricted_quantity:
+                classification_parts.append(f"Restricted: {restricted_quantity}")
+
+            if classification_parts:
+                description_parts.append(f"({', '.join(classification_parts)})")
+
+            VendorCreditItem.objects.create(
+                vendor_credit=vendor_credit,
+                description=" ".join(description_parts),
+                gl_account="Purchase Returns",
+                quantity=quantity,
+                unit_price=unit_price,
+                tax_percentage=line_tax_percentage,
+                tax_amount=line_tax_amount,
+                line_total=line_total,
+            )
+
+            subtotal += line_subtotal
+            tax_amount += line_tax_amount
+            total_amount += line_total
+
+        if total_amount <= Decimal("0.00"):
+            raise serializers.ValidationError(
+                {"items": ("The supplier return total must be " "greater than zero.")}
+            )
+
+        # 4. Update calculated vendor-credit totals.
+        vendor_credit.subtotal = subtotal
+        vendor_credit.tax_amount = tax_amount
+        vendor_credit.total_amount = total_amount
+        vendor_credit.applied_amount = Decimal("0.00")
+        vendor_credit.remaining_amount = total_amount
+        vendor_credit.status = "OPEN"
+        vendor_credit.updated_by = request.user
+        vendor_credit.save(
+            update_fields=[
+                "subtotal",
+                "tax_amount",
+                "total_amount",
+                "applied_amount",
+                "remaining_amount",
+                "status",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+
+        # 5. Applications are intentionally not created here.
+        #
+        # A VendorCreditApplication should only be created when the
+        # user explicitly applies this credit to a specific supplier
+        # bill. Automatically selecting a bill could apply the credit
+        # to the wrong liability.
+        #
+        # The applications section will remain empty until a bill
+        # application is recorded.
+
         supplier_return.status = "CREDIT_ISSUED"
-
         supplier_return.approved_by = request.user
-
         supplier_return.approved_at = timezone.now()
-
-        supplier_return.vendor_credit = credit
-
+        supplier_return.vendor_credit = vendor_credit
+        supplier_return.updated_by = request.user
         supplier_return.save(
             update_fields=[
                 "status",
                 "approved_by",
                 "approved_at",
                 "vendor_credit",
+                "updated_by",
                 "updated_at",
             ]
         )
 
-        return Response(
-            self.get_serializer(
-                supplier_return,
-            ).data
-        )
-
-    @transaction.atomic
-    @action(
-        detail=True,
-        methods=["post"],
-    )
-    def reject(
-        self,
-        request,
-        pk=None,
-    ):
-        supplier_return = self.get_object()
-
-        if supplier_return.status != "PENDING_APPROVAL":
-            return Response(
-                {"detail": "Only pending returns can be rejected."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        supplier_return.status = "REJECTED"
-
-        supplier_return.notes = request.data.get(
-            "notes",
-            supplier_return.notes,
-        )
-
-        supplier_return.save(
-            update_fields=[
-                "status",
-                "notes",
-                "updated_at",
-            ]
-        )
-
-        return Response(
-            self.get_serializer(
-                supplier_return,
-            ).data
-        )
+        return Response(self.get_serializer(supplier_return).data)
 
 
 ALLOWED_VENDOR_CREDIT_ATTACHMENT_EXTENSIONS = {
@@ -2266,7 +2712,9 @@ class PurchaseExpenseViewSet(Base):
         bank_accounts = BankAccount.objects.filter(is_active=True).order_by(
             "account_name"
         )
-        cash_registers = CashRegister.objects.filter(is_active=True).order_by("name")
+        cash_registers = CashRegister.objects.exclude(
+            status__in=["CLOSED", "INACTIVE"],
+        ).order_by("-register_date", "-id")
         if branch_id:
             if hasattr(BankAccount, "branch"):
                 bank_accounts = bank_accounts.filter(branch_id=branch_id)
@@ -2295,7 +2743,15 @@ class PurchaseExpenseViewSet(Base):
                     for a in bank_accounts
                 ],
                 "cash_registers": [
-                    {"id": c.id, "name": getattr(c, "name", str(c))}
+                    {
+                        "id": c.id,
+                        "name": (
+                            f"Cash Register #{c.id} - "
+                            f"{c.register_date} ({c.status})"
+                        ),
+                        "branch": c.branch_id,
+                        "status": c.status,
+                    }
                     for c in cash_registers
                 ],
             }

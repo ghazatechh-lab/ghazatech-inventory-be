@@ -2,6 +2,7 @@ from django.core.validators import MinValueValidator
 from django.db import models
 
 from apps.common.models import BranchAwareModel, SoftDeleteModel, TimeStampedModel
+from django.db.models import ExpressionWrapper, F, IntegerField, Q, Sum
 
 
 class Brand(TimeStampedModel):
@@ -180,6 +181,7 @@ class ProductStock(TimeStampedModel):
         on_delete=models.CASCADE,
         related_name="stocks",
     )
+
     variant = models.ForeignKey(
         ProductVariant,
         null=True,
@@ -187,14 +189,35 @@ class ProductStock(TimeStampedModel):
         on_delete=models.CASCADE,
         related_name="branch_stocks",
     )
+
     branch = models.ForeignKey(
         "branches.Branch",
         on_delete=models.CASCADE,
         related_name="product_stocks",
     )
+
+    # Replace this with a ForeignKey if a Warehouse model exists.
+    warehouse = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+    )
+
+    # Classified physical stock.
+    regular_quantity = models.PositiveIntegerField(default=0)
+    restricted_quantity = models.PositiveIntegerField(default=0)
+
+    # Classified reservations.
+    reserved_regular_quantity = models.PositiveIntegerField(default=0)
+    reserved_restricted_quantity = models.PositiveIntegerField(default=0)
+
+    # Legacy compatibility fields.
     current_stock = models.IntegerField(default=0)
     reserved_stock = models.IntegerField(default=0)
-    damaged_stock = models.IntegerField(default=0)
+
+    # Retained for backward compatibility.
+    damaged_stock = models.PositiveIntegerField(default=0)
+
     reorder_level = models.PositiveIntegerField(default=0)
     last_stock_update = models.DateTimeField(auto_now=True)
 
@@ -202,39 +225,188 @@ class ProductStock(TimeStampedModel):
         ordering = [
             "product__product_name",
             "branch__branch_code",
+            "warehouse",
         ]
+
         constraints = [
             models.UniqueConstraint(
-                fields=["product", "branch"],
-                condition=models.Q(variant__isnull=True),
-                name="unique_base_product_stock_per_branch",
+                fields=[
+                    "product",
+                    "branch",
+                    "warehouse",
+                ],
+                condition=Q(variant__isnull=True),
+                name="unique_base_stock_per_branch_warehouse",
             ),
             models.UniqueConstraint(
-                fields=["variant", "branch"],
-                condition=models.Q(variant__isnull=False),
-                name="unique_variant_stock_per_branch",
+                fields=[
+                    "variant",
+                    "branch",
+                    "warehouse",
+                ],
+                condition=Q(variant__isnull=False),
+                name="unique_variant_stock_per_branch_warehouse",
+            ),
+            models.CheckConstraint(
+                condition=Q(regular_quantity__gte=0),
+                name="product_stock_regular_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=Q(restricted_quantity__gte=0),
+                name="product_stock_restricted_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    reserved_regular_quantity__lte=F("regular_quantity"),
+                ),
+                name="reserved_regular_not_above_regular",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    reserved_restricted_quantity__lte=F(
+                        "restricted_quantity",
+                    ),
+                ),
+                name="reserved_restricted_not_above_restricted",
             ),
         ]
+
         indexes = [
-            models.Index(fields=["product", "branch"]),
-            models.Index(fields=["variant", "branch"]),
-            models.Index(fields=["branch", "current_stock"]),
+            models.Index(
+                fields=[
+                    "product",
+                    "branch",
+                    "warehouse",
+                ]
+            ),
+            models.Index(
+                fields=[
+                    "variant",
+                    "branch",
+                    "warehouse",
+                ]
+            ),
+            models.Index(
+                fields=[
+                    "branch",
+                    "regular_quantity",
+                ]
+            ),
+            models.Index(
+                fields=[
+                    "branch",
+                    "restricted_quantity",
+                ]
+            ),
         ]
 
     @property
+    def total_quantity(self):
+        """Total physical stock; calculated rather than stored."""
+        return int(self.regular_quantity or 0) + int(self.restricted_quantity or 0)
+
+    @property
+    def available_regular_quantity(self):
+        return max(
+            0,
+            int(self.regular_quantity or 0) - int(self.reserved_regular_quantity or 0),
+        )
+
+    @property
+    def available_restricted_quantity(self):
+        return max(
+            0,
+            int(self.restricted_quantity or 0)
+            - int(self.reserved_restricted_quantity or 0),
+        )
+
+    @property
+    def total_available_quantity(self):
+        return self.available_regular_quantity + self.available_restricted_quantity
+
+    @property
     def available_stock(self):
-        return self.current_stock - self.reserved_stock - self.damaged_stock
+        """
+        Legacy compatibility property.
+
+        This is a Python property and cannot be used directly in
+        QuerySet.values(), filter(), annotate(), or order_by().
+        """
+        return self.total_available_quantity
+
+    def sync_legacy_balances(self):
+        self.current_stock = self.total_quantity
+        self.reserved_stock = int(self.reserved_regular_quantity or 0) + int(
+            self.reserved_restricted_quantity or 0
+        )
+
+    def clean(self):
+        super().clean()
+
+        if self.variant_id and self.variant.product_id != self.product_id:
+            raise ValidationError(
+                {
+                    "variant": (
+                        "The selected variant does not belong "
+                        "to the selected product."
+                    )
+                }
+            )
+
+        if self.reserved_regular_quantity > self.regular_quantity:
+            raise ValidationError(
+                {
+                    "reserved_regular_quantity": (
+                        "Reserved regular quantity cannot exceed " "regular stock."
+                    )
+                }
+            )
+
+        if self.reserved_restricted_quantity > self.restricted_quantity:
+            raise ValidationError(
+                {
+                    "reserved_restricted_quantity": (
+                        "Reserved restricted quantity cannot exceed "
+                        "restricted stock."
+                    )
+                }
+            )
+
+    def save(self, *args, **kwargs):
+        self.sync_legacy_balances()
+
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            update_fields = set(update_fields)
+            update_fields.update(
+                {
+                    "current_stock",
+                    "reserved_stock",
+                }
+            )
+            kwargs["update_fields"] = list(update_fields)
+
+        super().save(*args, **kwargs)
 
     def __str__(self):
         item = str(self.variant) if self.variant_id else self.product.product_name
-        return f"{item} @ {self.branch}"
+
+        warehouse = self.warehouse or "Main Warehouse"
+
+        return f"{item} @ {self.branch} / {warehouse}"
 
 
 class StockMovement(TimeStampedModel):
     MOVES = [
         ("OPENING", "Opening Stock"),
         ("PURCHASE", "Purchase"),
+        ("PURCHASE_REGULAR", "Purchase - Regular"),
+        ("PURCHASE_RESTRICTED", "Purchase - Restricted"),
         ("SALE", "Sale"),
+        ("SALE_REGULAR", "Sale - Regular"),
+        ("SALE_RESTRICTED", "Sale - Restricted"),
+        ("RECLASSIFICATION_OUT", "Reclassification Out"),
+        ("RECLASSIFICATION_IN", "Reclassification In"),
         ("CUSTOMER_RETURN", "Customer Return"),
         ("SUPPLIER_RETURN", "Supplier Return"),
         ("TRANSFER_OUT", "Transfer Out"),
@@ -276,6 +448,12 @@ class StockMovement(TimeStampedModel):
     )
     previous_stock = models.IntegerField()
     new_stock = models.IntegerField()
+    stock_classification = models.CharField(
+        max_length=20,
+        choices=[("REGULAR", "Regular"), ("RESTRICTED", "Restricted")],
+        default="REGULAR",
+    )
+    warehouse = models.CharField(max_length=120, blank=True, default="")
     reference_type = models.CharField(
         max_length=80,
         blank=True,
@@ -373,3 +551,64 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
 
     def __str__(self):
         return self.adjustment_number
+
+
+class StockReclassification(TimeStampedModel, BranchAwareModel):
+    CLASSIFICATIONS = [("REGULAR", "Regular"), ("RESTRICTED", "Restricted")]
+    STATUSES = [
+        ("DRAFT", "Draft"),
+        ("PENDING_APPROVAL", "Pending Approval"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("CANCELLED", "Cancelled"),
+    ]
+    reference_number = models.CharField(max_length=50, unique=True)
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="stock_reclassifications"
+    )
+    variant = models.ForeignKey(
+        ProductVariant,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="stock_reclassifications",
+    )
+    warehouse = models.CharField(max_length=120, blank=True, default="")
+    source_classification = models.CharField(max_length=20, choices=CLASSIFICATIONS)
+    destination_classification = models.CharField(
+        max_length=20, choices=CLASSIFICATIONS
+    )
+    quantity = models.PositiveIntegerField()
+    reason = models.TextField()
+    supporting_document = models.FileField(
+        upload_to="stock-reclassification/", null=True, blank=True
+    )
+    requested_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="requested_stock_reclassifications",
+    )
+    approved_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_stock_reclassifications",
+    )
+    approval_date = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=30, choices=STATUSES, default="DRAFT")
+
+    class Meta:
+        ordering = ["-created_at"]
+        permissions = [
+            ("view_restricted_stock", "Can view restricted stock"),
+            ("manage_restricted_stock", "Can manage restricted stock"),
+            ("approve_stock_reclassification", "Can approve stock reclassification"),
+        ]
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if self.source_classification == self.destination_classification:
+            raise ValidationError("Source and destination classifications must differ.")

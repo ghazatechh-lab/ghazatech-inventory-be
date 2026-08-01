@@ -1,5 +1,6 @@
+import calendar
 import csv
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from io import BytesIO
 
@@ -109,6 +110,84 @@ class EmployeeViewSet(BaseViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save(employee=employee, uploaded_by=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="profile")
+    def profile(self, request, pk=None):
+        employee = self.get_object()
+        attendance = employee.attendance_records.select_related("branch").order_by(
+            "-date"
+        )
+        leaves = employee.leave_requests.select_related(
+            "leave_type", "actioned_by"
+        ).order_by("-created_at")
+        payroll = employee.payroll_entries.select_related(
+            "branch", "payroll_run"
+        ).order_by("-period", "-id")
+        balances = employee.leave_balances.select_related("leave_type").order_by(
+            "leave_type__name"
+        )
+
+        attendance_summary = {
+            "present": attendance.filter(status="PRESENT").count(),
+            "absent": attendance.filter(status="ABSENT").count(),
+            "late": attendance.filter(status="LATE").count(),
+            "leave": attendance.filter(status="LEAVE").count(),
+            "half_day": attendance.filter(status="HALF_DAY").count(),
+            "total_records": attendance.count(),
+        }
+
+        current_year = timezone.localdate().year
+        approved_this_year = leaves.filter(
+            status="APPROVED",
+            from_date__year=current_year,
+        )
+        used_this_year = approved_this_year.aggregate(total=Sum("days"))["total"] or 0
+        unpaid_days_taken = (
+            approved_this_year.filter(
+                leave_type__is_paid=False,
+            ).aggregate(
+                total=Sum("days")
+            )["total"]
+            or 0
+        )
+
+        annual_balance = balances.filter(
+            leave_type__name__icontains="annual",
+        ).first()
+        sick_balance = balances.filter(
+            leave_type__name__icontains="sick",
+        ).first()
+
+        leave_summary = {
+            "annual_leave_left": getattr(annual_balance, "remaining_days", 0) or 0,
+            "sick_leave_left": getattr(sick_balance, "remaining_days", 0) or 0,
+            "used_this_year": used_this_year,
+            "unpaid_days_taken": unpaid_days_taken,
+            "pending_requests": leaves.filter(status="PENDING").count(),
+            "approved_requests": leaves.filter(status="APPROVED").count(),
+        }
+
+        return Response(
+            {
+                "employee": EmployeeSerializer(
+                    employee, context={"request": request}
+                ).data,
+                "attendance_summary": attendance_summary,
+                "leave_summary": leave_summary,
+                "attendance": AttendanceSerializer(attendance[:50], many=True).data,
+                "leaves": LeaveRequestSerializer(leaves[:50], many=True).data,
+                "leave_balances": LeaveBalanceSerializer(balances, many=True).data,
+                "payroll": PayrollEntrySerializer(payroll[:36], many=True).data,
+                "salary_history": SalaryRevisionSerializer(
+                    employee.salary_revisions.all(),
+                    many=True,
+                    context={"request": request},
+                ).data,
+                "documents": EmployeeDocumentSerializer(
+                    employee.documents.all(), many=True, context={"request": request}
+                ).data,
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="salary-history")
     def salary_history(self, request, pk=None):
@@ -367,16 +446,37 @@ class LeaveRequestViewSet(BaseViewSet):
             employee=leave.employee,
             leave_type=leave.leave_type,
             year=leave.from_date.year,
-            defaults={"entitled_days": leave.leave_type.annual_limit},
+            defaults={"entitled_days": leave.leave_type.annual_limit or 0},
         )
-        if leave.days > balance.remaining_days:
+
+        # Unpaid leave is not restricted by the paid annual entitlement.
+        # For paid leave, HR/Admin may explicitly override the balance when
+        # business approval has already been obtained.
+        override_balance = str(request.data.get("override_balance", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if (
+            leave.leave_type.is_paid
+            and leave.days > balance.remaining_days
+            and not override_balance
+        ):
             return Response(
-                {"detail": f"Only {balance.remaining_days} day(s) available."},
+                {
+                    "detail": f"Only {balance.remaining_days} paid day(s) are available.",
+                    "code": "INSUFFICIENT_LEAVE_BALANCE",
+                    "remaining_days": balance.remaining_days,
+                    "requested_days": leave.days,
+                    "can_override": True,
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        balance.used_days += leave.days
-        balance.save(update_fields=["used_days", "updated_at"])
+        if leave.leave_type.is_paid:
+            balance.used_days += leave.days
+            balance.save(update_fields=["used_days", "updated_at"])
 
         leave.status = "APPROVED"
         leave.action_remarks = request.data.get("remarks", "")
@@ -425,6 +525,31 @@ class SalaryRevisionViewSet(BaseViewSet):
 
 
 class PayrollRunViewSet(BaseViewSet):
+    @staticmethod
+    def _approved_unpaid_leave_days(employee, period):
+        if not period:
+            return Decimal("0")
+        try:
+            year, month = [int(part) for part in str(period).split("-")]
+            month_start = date(year, month, 1)
+            month_end = date(year, month, calendar.monthrange(year, month)[1])
+        except (TypeError, ValueError):
+            return Decimal("0")
+
+        total = Decimal("0")
+        leaves = LeaveRequest.objects.filter(
+            employee=employee,
+            status="APPROVED",
+            leave_type__is_paid=False,
+            from_date__lte=month_end,
+            to_date__gte=month_start,
+        )
+        for leave in leaves:
+            start = max(leave.from_date, month_start)
+            end = min(leave.to_date, month_end)
+            total += Decimal((end - start).days + 1)
+        return total
+
     queryset = PayrollRun.objects.select_related(
         "branch", "generated_by"
     ).prefetch_related("entries__employee", "entries__branch")
@@ -460,6 +585,27 @@ class PayrollRunViewSet(BaseViewSet):
                     "basic_salary": item.basic_salary,
                     "allowances": item.allowances,
                     "gross_salary": item.total_salary,
+                    "total_period_days": (
+                        calendar.monthrange(
+                            int(period.split("-")[0]), int(period.split("-")[1])
+                        )[1]
+                        if period
+                        else 30
+                    ),
+                    "unpaid_leave_days": self._approved_unpaid_leave_days(item, period),
+                    "suggested_payable_days": max(
+                        Decimal("0"),
+                        Decimal(
+                            str(
+                                calendar.monthrange(
+                                    int(period.split("-")[0]), int(period.split("-")[1])
+                                )[1]
+                                if period
+                                else 30
+                            )
+                        )
+                        - self._approved_unpaid_leave_days(item, period),
+                    ),
                     "already_paid": item.id in used_ids,
                 }
                 for item in employees
@@ -472,6 +618,7 @@ class PayrollRunViewSet(BaseViewSet):
         period = request.data.get("period")
         branch_id = request.data.get("branch")
         employee_ids = request.data.get("employee_ids", [])
+        payable_days_map = request.data.get("payable_days", {}) or {}
 
         employees = Employee.objects.filter(
             id__in=employee_ids,
@@ -505,8 +652,38 @@ class PayrollRunViewSet(BaseViewSet):
         deduction_total = Decimal("0")
         net_total = Decimal("0")
 
+        year, month = [int(part) for part in str(period).split("-")]
+        period_days = Decimal(calendar.monthrange(year, month)[1])
+
         for employee in employees:
-            gross = employee.total_salary
+            unpaid_days = self._approved_unpaid_leave_days(employee, period)
+            requested_payable = payable_days_map.get(
+                str(employee.id), payable_days_map.get(employee.id)
+            )
+            payable_days = (
+                Decimal(str(requested_payable))
+                if requested_payable not in (None, "")
+                else max(Decimal("0"), period_days - unpaid_days)
+            )
+            if payable_days < 0 or payable_days > period_days:
+                raise serializers.ValidationError(
+                    {
+                        "payable_days": (
+                            f"Payable days for {employee.full_name} must be between "
+                            f"0 and {period_days}."
+                        )
+                    }
+                )
+
+            method = "PRORATED" if payable_days < period_days else "FULL"
+            factor = payable_days / period_days if period_days else Decimal("0")
+            basic = (Decimal(employee.basic_salary or 0) * factor).quantize(
+                Decimal("0.01")
+            )
+            allowances = (Decimal(employee.allowances or 0) * factor).quantize(
+                Decimal("0.01")
+            )
+            gross = basic + allowances
             deductions = Decimal("0")
             net = gross - deductions
 
@@ -515,11 +692,15 @@ class PayrollRunViewSet(BaseViewSet):
                 employee=employee,
                 branch=employee.branch,
                 period=period,
-                basic_salary=employee.basic_salary or 0,
-                allowances=employee.allowances or 0,
+                basic_salary=basic,
+                allowances=allowances,
                 gross_salary=gross,
                 deductions=deductions,
                 net_salary=net,
+                total_period_days=period_days,
+                payable_days=payable_days,
+                unpaid_leave_days=unpaid_days,
+                salary_calculation_method=method,
                 status="PENDING",
             )
             gross_total += gross

@@ -106,12 +106,28 @@ class RackSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
-    available_qty = serializers.IntegerField(
+
+    # These values are accepted only while creating/editing a product. They
+    # initialize the branch ProductStock row; they are not duplicate balances
+    # stored on ProductVariant.
+    initial_regular_stock = serializers.IntegerField(
+        write_only=True,
         required=False,
-        allow_null=True,
         min_value=0,
-        default=0,
     )
+    initial_restricted_stock = serializers.IntegerField(
+        write_only=True,
+        required=False,
+        min_value=0,
+    )
+
+    # Backward-compatible field used by older screens. It represents total
+    # available stock for the requested branch.
+    available_qty = serializers.IntegerField(read_only=True)
+    regular_quantity = serializers.SerializerMethodField()
+    restricted_quantity = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+
     purchase_price = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -126,7 +142,12 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "id",
             "attributes",
             "display_name",
+            "initial_regular_stock",
+            "initial_restricted_stock",
             "available_qty",
+            "regular_quantity",
+            "restricted_quantity",
+            "total_quantity",
             "purchase_price",
             "retail_price",
             "wholesale_price",
@@ -138,6 +159,10 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "display_name",
+            "available_qty",
+            "regular_quantity",
+            "restricted_quantity",
+            "total_quantity",
             "is_base",
             "created_at",
             "updated_at",
@@ -146,38 +171,64 @@ class ProductVariantSerializer(serializers.ModelSerializer):
     def get_display_name(self, obj):
         return variant_label(obj)
 
+    def _stock(self, obj):
+        product = obj.product
+        branch_id = get_requested_branch_id(self) or product.branch_id
+        if not branch_id:
+            return None
+        stock_variant = obj if product.has_variants else None
+        return ProductStock.objects.filter(
+            product=product,
+            variant=stock_variant,
+            branch_id=branch_id,
+        ).first()
+
+    def _can_view_restricted(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(
+            user
+            and user.is_authenticated
+            and (
+                user.is_superuser
+                or getattr(getattr(user, "role", None), "code", "") == "ADMIN"
+                or user.has_perm("inventory.view_restricted_stock")
+            )
+        )
+
+    def get_regular_quantity(self, obj):
+        stock = self._stock(obj)
+        return int(stock.regular_quantity or 0) if stock else 0
+
+    def get_restricted_quantity(self, obj):
+        if not self._can_view_restricted():
+            return None
+        stock = self._stock(obj)
+        return int(stock.restricted_quantity or 0) if stock else 0
+
+    def get_total_quantity(self, obj):
+        stock = self._stock(obj)
+        if not stock:
+            return 0
+        if self._can_view_restricted():
+            return int(stock.total_quantity)
+        return int(stock.regular_quantity or 0)
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        product = instance.product
-        branch_id = get_requested_branch_id(self) or product.branch_id
-
-        if branch_id:
-            stock_variant = instance if product.has_variants else None
-
-            stock = ProductStock.objects.filter(
-                product=product,
-                variant=stock_variant,
-                branch_id=branch_id,
-            ).first()
-
-            if stock:
-                data["available_qty"] = stock.available_stock
-            else:
-                # When a branch is explicitly selected, only stock rows in
-                # that branch are valid. Do not fall back to the variant's
-                # legacy/global quantity because it can belong to another
-                # branch and makes the product list quantity inaccurate.
-                data["available_qty"] = 0
-
+        stock = self._stock(instance)
+        data["available_qty"] = (
+            int(stock.total_quantity)
+            if stock and self._can_view_restricted()
+            else int(stock.regular_quantity or 0) if stock else 0
+        )
+        if not self._can_view_restricted():
+            data.pop("restricted_quantity", None)
         return data
-
-    def validate_available_qty(self, value):
-        return 0 if value in (None, "") else value
 
     def validate_attributes(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("Attributes must be key-value pairs.")
-
         return {
             str(key).strip(): str(item_value).strip()
             for key, item_value in value.items()
@@ -402,6 +453,24 @@ class ProductSerializer(serializers.ModelSerializer):
                         }
                     )
 
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        is_admin = bool(
+            user
+            and user.is_authenticated
+            and (
+                user.is_superuser
+                or getattr(getattr(user, "role", None), "code", "") == "ADMIN"
+            )
+        )
+        if not is_admin:
+            for variant in variants:
+                if int(variant.get("initial_restricted_stock", 0) or 0) > 0:
+                    raise serializers.ValidationError(
+                        "Only an administrator can enter initial restricted stock."
+                    )
+                variant.pop("initial_restricted_stock", None)
+
         return variants
 
     @staticmethod
@@ -429,11 +498,12 @@ class ProductSerializer(serializers.ModelSerializer):
 
         return validated_data
 
-    @staticmethod
     def _sync_variants(
+        self,
         product,
         variants_data,
     ):
+        self._stock_targets = {}
         existing = {variant.id: variant for variant in product.variants.all()}
 
         retained_ids = []
@@ -451,7 +521,11 @@ class ProductSerializer(serializers.ModelSerializer):
 
             base.attributes = {}
 
-            base.available_qty = base_data.get("available_qty") or 0
+            initial_regular = base_data.pop("initial_regular_stock", None)
+            initial_restricted = base_data.pop("initial_restricted_stock", None)
+            base.available_qty = int(initial_regular or 0) + int(
+                initial_restricted or 0
+            )
 
             base.purchase_price = base_data.get("purchase_price") or None
 
@@ -464,6 +538,10 @@ class ProductSerializer(serializers.ModelSerializer):
             base.is_active = True
 
             base.save()
+            self._stock_targets[base.id] = {
+                "regular": initial_regular,
+                "restricted": initial_restricted,
+            }
 
             product.variants.exclude(id=base.id).delete()
 
@@ -481,7 +559,11 @@ class ProductSerializer(serializers.ModelSerializer):
 
             variant_data["is_base"] = False
 
-            variant_data["available_qty"] = variant_data.get("available_qty") or 0
+            initial_regular = variant_data.pop("initial_regular_stock", None)
+            initial_restricted = variant_data.pop("initial_restricted_stock", None)
+            variant_data["available_qty"] = int(initial_regular or 0) + int(
+                initial_restricted or 0
+            )
 
             variant_data["purchase_price"] = variant_data.get("purchase_price") or None
 
@@ -514,6 +596,10 @@ class ProductSerializer(serializers.ModelSerializer):
                     **variant_data,
                 )
 
+            self._stock_targets[variant.id] = {
+                "regular": initial_regular,
+                "restricted": initial_restricted,
+            }
             retained_ids.append(variant.id)
 
         product.variants.exclude(id__in=retained_ids).delete()
@@ -543,7 +629,15 @@ class ProductSerializer(serializers.ModelSerializer):
         for variant in active_variants:
             stock_variant = variant if product.has_variants else None
 
-            desired_quantity = int(variant.available_qty or 0)
+            targets = getattr(self, "_stock_targets", {}).get(
+                variant.id,
+                {
+                    "regular": int(variant.available_qty or 0),
+                    "restricted": 0,
+                },
+            )
+            desired_regular = targets.get("regular")
+            desired_restricted = targets.get("restricted")
 
             stock, _ = ProductStock.objects.get_or_create(
                 product=product,
@@ -551,44 +645,69 @@ class ProductSerializer(serializers.ModelSerializer):
                 variant=stock_variant,
                 defaults={
                     "current_stock": 0,
-                    "reorder_level": (product.reorder_level),
+                    "regular_quantity": 0,
+                    "restricted_quantity": 0,
+                    "reserved_stock": 0,
+                    "reserved_regular_quantity": 0,
+                    "reserved_restricted_quantity": 0,
+                    "reorder_level": product.reorder_level,
                 },
             )
 
-            current_quantity = int(stock.current_stock or 0)
+            if desired_regular is None:
+                desired_regular = int(stock.regular_quantity or 0)
+            else:
+                desired_regular = int(desired_regular or 0)
 
-            difference = desired_quantity - current_quantity
+            if desired_restricted is None:
+                desired_restricted = int(stock.restricted_quantity or 0)
+            else:
+                desired_restricted = int(desired_restricted or 0)
 
-            if difference == 0:
-                if stock.reorder_level != product.reorder_level:
-                    stock.reorder_level = product.reorder_level
-
-                    stock.save(
-                        update_fields=[
-                            "reorder_level",
-                            "updated_at",
-                        ]
-                    )
-
-                continue
-
-            adjust_stock(
-                product=product,
-                variant=stock_variant,
-                branch=product.branch,
-                quantity=difference,
-                movement_type=(
-                    "OPENING" if reference_type == "PRODUCT_CREATE" else "ADJUSTMENT"
-                ),
-                performed_by=user,
-                reference_type=reference_type,
-                reference_id=product.id,
-                remarks=(
-                    "Opening stock entered from product form."
-                    if reference_type == "PRODUCT_CREATE"
-                    else ("Stock quantity updated from " "product edit form.")
-                ),
+            regular_difference = desired_regular - int(stock.regular_quantity or 0)
+            restricted_difference = desired_restricted - int(
+                stock.restricted_quantity or 0
             )
+
+            if regular_difference:
+                adjust_stock(
+                    product=product,
+                    variant=stock_variant,
+                    branch=product.branch,
+                    quantity=regular_difference,
+                    movement_type=(
+                        "OPENING"
+                        if reference_type == "PRODUCT_CREATE"
+                        else "ADJUSTMENT"
+                    ),
+                    stock_classification="REGULAR",
+                    performed_by=user,
+                    reference_type=reference_type,
+                    reference_id=product.id,
+                    remarks="Initial regular stock from product form.",
+                )
+
+            if restricted_difference:
+                adjust_stock(
+                    product=product,
+                    variant=stock_variant,
+                    branch=product.branch,
+                    quantity=restricted_difference,
+                    movement_type=(
+                        "PURCHASE_RESTRICTED"
+                        if reference_type == "PRODUCT_CREATE"
+                        else "ADJUSTMENT"
+                    ),
+                    stock_classification="RESTRICTED",
+                    performed_by=user,
+                    reference_type=reference_type,
+                    reference_id=product.id,
+                    remarks="Initial restricted stock from product form.",
+                )
+
+            if stock.reorder_level != product.reorder_level:
+                stock.reorder_level = product.reorder_level
+                stock.save(update_fields=["reorder_level", "updated_at"])
 
     @transaction.atomic
     def create(
@@ -651,9 +770,12 @@ class ProductSerializer(serializers.ModelSerializer):
 
 
 class ProductStockSerializer(serializers.ModelSerializer):
-    available_stock = serializers.IntegerField(
-        read_only=True,
-    )
+    available_stock = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    available_regular_quantity = serializers.SerializerMethodField()
+    available_restricted_quantity = serializers.SerializerMethodField()
+    total_available_quantity = serializers.SerializerMethodField()
+
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -676,8 +798,69 @@ class ProductStockSerializer(serializers.ModelSerializer):
         model = ProductStock
         fields = "__all__"
 
+    def _annotated_or_property(self, obj, annotated_name, property_name):
+        value = getattr(obj, annotated_name, None)
+        if value is None:
+            value = getattr(obj, property_name)
+        return max(0, int(value or 0))
+
+    def get_total_quantity(self, obj):
+        return self._annotated_or_property(
+            obj,
+            "total_quantity_db",
+            "total_quantity",
+        )
+
+    def get_available_regular_quantity(self, obj):
+        return self._annotated_or_property(
+            obj,
+            "available_regular_db",
+            "available_regular_quantity",
+        )
+
+    def get_available_restricted_quantity(self, obj):
+        return self._annotated_or_property(
+            obj,
+            "available_restricted_db",
+            "available_restricted_quantity",
+        )
+
+    def get_total_available_quantity(self, obj):
+        return self._annotated_or_property(
+            obj,
+            "total_available_db",
+            "total_available_quantity",
+        )
+
+    def get_available_stock(self, obj):
+        # Keep the legacy API key while calculating from classified balances.
+        return self.get_total_available_quantity(obj)
+
     def get_variant_label(self, obj):
         return variant_label(obj.variant)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from apps.common.sensitive_permissions import can_view_restricted
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        if not can_view_restricted(user):
+            for field in (
+                "restricted_quantity",
+                "reserved_restricted_quantity",
+                "available_restricted_quantity",
+                "total_quantity",
+                "total_available_quantity",
+            ):
+                data.pop(field, None)
+
+            regular_available = self.get_available_regular_quantity(instance)
+            data["available_quantity"] = regular_available
+            data["available_stock"] = regular_available
+
+        return data
 
 
 class StockMovementSerializer(serializers.ModelSerializer):

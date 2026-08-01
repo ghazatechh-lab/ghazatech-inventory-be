@@ -46,6 +46,10 @@ class PurchaseOrder(TimeStampedModel, BranchAwareModel):
 
     class Meta:
         ordering = ["-order_date", "-id"]
+        permissions = [
+            ("create_restricted_purchase", "Can create restricted purchases"),
+            ("view_restricted_purchase", "Can view restricted purchases"),
+        ]
 
 
 class PurchaseOrderItem(models.Model):
@@ -58,9 +62,22 @@ class PurchaseOrderItem(models.Model):
     )
     description = models.TextField(blank=True)
     quantity = models.PositiveIntegerField()
+    regular_quantity = models.PositiveIntegerField(default=0)
+    restricted_quantity = models.PositiveIntegerField(default=0)
     received_quantity = models.PositiveIntegerField(default=0)
+    received_regular_quantity = models.PositiveIntegerField(default=0)
+    received_restricted_quantity = models.PositiveIntegerField(default=0)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    TAX_TREATMENTS = [
+        ("STANDARD_VAT", "Standard VAT"),
+        ("ZERO_RATED", "Zero Rated"),
+        ("EXEMPT", "Exempt"),
+        ("NON_TAXABLE", "Non Taxable"),
+    ]
+    tax_treatment = models.CharField(
+        max_length=30, choices=TAX_TREATMENTS, default="STANDARD_VAT"
+    )
     vat_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=5)
     vat_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     line_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -131,6 +148,11 @@ class GoodsReceivedItem(models.Model):
     received_quantity = models.PositiveIntegerField()
     damaged_quantity = models.PositiveIntegerField(default=0)
     accepted_quantity = models.PositiveIntegerField(default=0)
+    regular_received_quantity = models.PositiveIntegerField(default=0)
+    restricted_received_quantity = models.PositiveIntegerField(default=0)
+    regular_accepted_quantity = models.PositiveIntegerField(default=0)
+    restricted_accepted_quantity = models.PositiveIntegerField(default=0)
+    rejected_quantity = models.PositiveIntegerField(default=0)
     quality_status = models.CharField(
         max_length=30,
         choices=QUALITY_CHOICES,
@@ -614,9 +636,9 @@ class SupplierReturnItem(models.Model):
         null=True,
         blank=True,
     )
-
-    quantity = models.PositiveIntegerField()
-
+    regular_quantity = models.PositiveIntegerField(default=0)
+    restricted_quantity = models.PositiveIntegerField(default=0)
+    quantity = models.PositiveIntegerField(default=0)
     unit_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -992,18 +1014,6 @@ class VendorCreditAttachment(TimeStampedModel):
 
 def purchase_expense_attachment_path(instance, filename):
     return f"purchase-expenses/{instance.expense_id}/attachments/{filename}"
-
-
-class PurchaseExpenseCategory(TimeStampedModel):
-    name = models.CharField(max_length=120, unique=True)
-    code = models.SlugField(max_length=60, unique=True)
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ["name"]
-
-    def __str__(self):
-        return self.name
 
 
 class PurchaseExpense(TimeStampedModel, BranchAwareModel):

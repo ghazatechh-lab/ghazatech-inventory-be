@@ -1,7 +1,7 @@
 from collections import defaultdict
 
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import ExpressionWrapper, F, IntegerField, Q, Sum
 from django.utils import timezone
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
@@ -124,23 +124,53 @@ class ProductViewSet(ModelViewSet):
 
 
 class StockViewSet(ReadOnlyModelViewSet):
-    queryset = (
-        ProductStock.objects.select_related(
-            "product",
-            "product__brand",
-            "product__category",
-            "variant",
-            "branch",
-        )
-        .prefetch_related("product__variants")
-        .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
-    )
     serializer_class = ProductStockSerializer
     filterset_fields = [
         "branch",
         "product",
         "variant",
     ]
+
+    def get_queryset(self):
+        """
+        Return stock rows with database-calculated classified totals.
+
+        The *_db aliases can be used by serializers, filtering, ordering,
+        reports, and values() queries. The model properties remain available
+        for code working with individual ProductStock objects.
+        """
+        return (
+            ProductStock.objects.select_related(
+                "product",
+                "product__brand",
+                "product__category",
+                "variant",
+                "branch",
+            )
+            .prefetch_related("product__variants")
+            .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+            .annotate(
+                total_quantity_db=ExpressionWrapper(
+                    F("regular_quantity") + F("restricted_quantity"),
+                    output_field=IntegerField(),
+                ),
+                available_regular_db=ExpressionWrapper(
+                    F("regular_quantity") - F("reserved_regular_quantity"),
+                    output_field=IntegerField(),
+                ),
+                available_restricted_db=ExpressionWrapper(
+                    F("restricted_quantity") - F("reserved_restricted_quantity"),
+                    output_field=IntegerField(),
+                ),
+                total_available_db=ExpressionWrapper(
+                    F("regular_quantity")
+                    + F("restricted_quantity")
+                    - F("reserved_regular_quantity")
+                    - F("reserved_restricted_quantity"),
+                    output_field=IntegerField(),
+                ),
+            )
+        )
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
@@ -203,6 +233,12 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "total_reserved": 0,
                     "total_damaged": 0,
                     "total_available": 0,
+                    "total_regular": 0,
+                    "total_restricted": 0,
+                    "total_reserved_regular": 0,
+                    "total_reserved_restricted": 0,
+                    "total_available_regular": 0,
+                    "total_available_restricted": 0,
                 }
 
             available = stock.available_stock
@@ -214,12 +250,65 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "branch_name": stock.branch.branch_name,
                     "current_stock": stock.current_stock,
                     "reserved_stock": stock.reserved_stock,
+                    "regular_quantity": stock.regular_quantity,
+                    "restricted_quantity": stock.restricted_quantity,
+                    "reserved_regular_quantity": stock.reserved_regular_quantity,
+                    "reserved_restricted_quantity": stock.reserved_restricted_quantity,
+                    "total_quantity": getattr(
+                        stock,
+                        "total_quantity_db",
+                        stock.total_quantity,
+                    ),
+                    "available_regular_quantity": max(
+                        0,
+                        getattr(
+                            stock,
+                            "available_regular_db",
+                            stock.available_regular_quantity,
+                        ),
+                    ),
+                    "available_restricted_quantity": max(
+                        0,
+                        getattr(
+                            stock,
+                            "available_restricted_db",
+                            stock.available_restricted_quantity,
+                        ),
+                    ),
+                    "total_available_quantity": max(
+                        0,
+                        getattr(
+                            stock,
+                            "total_available_db",
+                            stock.total_available_quantity,
+                        ),
+                    ),
                     "damaged_stock": stock.damaged_stock,
                     "available_stock": available,
                 }
             )
             group["total_current"] += stock.current_stock
             group["total_reserved"] += stock.reserved_stock
+            group["total_regular"] += stock.regular_quantity
+            group["total_restricted"] += stock.restricted_quantity
+            group["total_reserved_regular"] += stock.reserved_regular_quantity
+            group["total_reserved_restricted"] += stock.reserved_restricted_quantity
+            group["total_available_regular"] += max(
+                0,
+                getattr(
+                    stock,
+                    "available_regular_db",
+                    stock.available_regular_quantity,
+                ),
+            )
+            group["total_available_restricted"] += max(
+                0,
+                getattr(
+                    stock,
+                    "available_restricted_db",
+                    stock.available_restricted_quantity,
+                ),
+            )
             group["total_damaged"] += stock.damaged_stock
             group["total_available"] += available
             group["reorder_level"] = max(group["reorder_level"], stock.reorder_level)
@@ -397,13 +486,37 @@ class StockAdjustmentViewSet(ModelViewSet):
 
 @api_view(["GET"])
 def low_stock_products(request):
-    queryset = ProductStock.objects.select_related(
-        "product",
-        "variant",
-        "branch",
-        "product__brand",
-        "product__category",
-    ).filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    queryset = (
+        ProductStock.objects.select_related(
+            "product",
+            "variant",
+            "branch",
+            "product__brand",
+            "product__category",
+        )
+        .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+        .annotate(
+            total_quantity_db=ExpressionWrapper(
+                F("regular_quantity") + F("restricted_quantity"),
+                output_field=IntegerField(),
+            ),
+            available_regular_db=ExpressionWrapper(
+                F("regular_quantity") - F("reserved_regular_quantity"),
+                output_field=IntegerField(),
+            ),
+            available_restricted_db=ExpressionWrapper(
+                F("restricted_quantity") - F("reserved_restricted_quantity"),
+                output_field=IntegerField(),
+            ),
+            total_available_db=ExpressionWrapper(
+                F("regular_quantity")
+                + F("restricted_quantity")
+                - F("reserved_regular_quantity")
+                - F("reserved_restricted_quantity"),
+                output_field=IntegerField(),
+            ),
+        )
+    )
 
     branch_id = request.query_params.get("branch")
 

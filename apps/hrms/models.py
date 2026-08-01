@@ -740,6 +740,18 @@ class PayrollEntry(TimeStampedModel):
     )
     paid_at = models.DateTimeField(null=True, blank=True)
 
+    # Payroll proration fields.  These allow HR to pay only the days that are
+    # payable in a month, for example when an employee has approved unpaid
+    # leave. Existing payroll records default to a full 30-day month.
+    total_period_days = models.DecimalField(max_digits=6, decimal_places=2, default=30)
+    payable_days = models.DecimalField(max_digits=6, decimal_places=2, default=30)
+    unpaid_leave_days = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    salary_calculation_method = models.CharField(
+        max_length=20,
+        choices=[("FULL", "Full Salary"), ("PRORATED", "Prorated by Payable Days")],
+        default="FULL",
+    )
+
     class Meta:
         ordering = ["employee__first_name"]
         constraints = [
