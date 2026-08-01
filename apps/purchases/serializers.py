@@ -2347,12 +2347,14 @@ class VendorCreditApplicationSerializer(
         ]
 
 
-class VendorCreditSerializer(
-    serializers.ModelSerializer,
-):
-    credit_number = serializers.CharField(read_only=True)
+class VendorCreditSerializer(serializers.ModelSerializer):
+    credit_number = serializers.CharField(
+        read_only=True,
+    )
+
     items = VendorCreditItemSerializer(
         many=True,
+        required=True,
     )
 
     applications = VendorCreditApplicationSerializer(
@@ -2389,10 +2391,23 @@ class VendorCreditSerializer(
         allow_null=True,
     )
 
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
+        read_only=True,
+        allow_null=True,
+    )
+
     reason_display = serializers.CharField(
         source="get_reason_display",
         read_only=True,
     )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    approved_by_name = serializers.SerializerMethodField()
 
     item_count = serializers.IntegerField(
         source="items.count",
@@ -2404,22 +2419,111 @@ class VendorCreditSerializer(
         fields = "__all__"
 
         read_only_fields = [
+            "credit_number",
+            "subtotal",
+            "tax_amount",
+            "total_amount",
+            "applied_amount",
+            "remaining_amount",
+            "approved_by",
+            "approval_date",
             "posted_at",
             "voided_at",
             "created_by",
             "updated_by",
+            "created_at",
+            "updated_at",
         ]
 
-    def _generate_number(self):
-        prefix = timezone.now().strftime(
-            "VC-%Y%m",
+    def get_approved_by_name(self, obj):
+        user = obj.approved_by
+
+        if not user:
+            return ""
+
+        if hasattr(user, "get_full_name"):
+            full_name = (user.get_full_name() or "").strip()
+
+            if full_name:
+                return full_name
+
+        return (
+            getattr(
+                user,
+                "display_name",
+                None,
+            )
+            or getattr(
+                user,
+                "name",
+                None,
+            )
+            or getattr(
+                user,
+                "email",
+                None,
+            )
+            or getattr(
+                user,
+                "username",
+                None,
+            )
+            or str(user)
         )
 
-        count = VendorCredit.objects.filter(
-            credit_number__startswith=prefix,
-        ).count()
+    def _generate_number(self):
+        prefix = timezone.localdate().strftime(
+            "VC-%Y%m-",
+        )
 
-        return f"{prefix}-{count + 1:04d}"
+        last_number = (
+            VendorCredit.objects.select_for_update()
+            .filter(
+                credit_number__startswith=prefix,
+            )
+            .order_by(
+                "-credit_number",
+            )
+            .values_list(
+                "credit_number",
+                flat=True,
+            )
+            .first()
+        )
+
+        sequence = 1
+
+        if last_number:
+            try:
+                sequence = (
+                    int(
+                        last_number.rsplit(
+                            "-",
+                            1,
+                        )[-1]
+                    )
+                    + 1
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                sequence = (
+                    VendorCredit.objects.filter(
+                        credit_number__startswith=prefix,
+                    ).count()
+                    + 1
+                )
+
+        candidate = f"{prefix}{sequence:04d}"
+
+        while VendorCredit.objects.filter(
+            credit_number=candidate,
+        ).exists():
+            sequence += 1
+            candidate = f"{prefix}{sequence:04d}"
+
+        return candidate
 
     def _calculate_item(
         self,
@@ -2431,6 +2535,7 @@ class VendorCreditSerializer(
                     "quantity",
                     0,
                 )
+                or 0
             )
         )
 
@@ -2440,6 +2545,7 @@ class VendorCreditSerializer(
                     "unit_price",
                     0,
                 )
+                or 0
             )
         )
 
@@ -2449,8 +2555,24 @@ class VendorCreditSerializer(
                     "tax_percentage",
                     0,
                 )
+                or 0
             )
         )
+
+        if quantity <= 0:
+            raise serializers.ValidationError(
+                {"items": ("Item quantity must be " "greater than zero.")}
+            )
+
+        if unit_price < 0:
+            raise serializers.ValidationError(
+                {"items": ("Item unit price cannot " "be negative.")}
+            )
+
+        if tax_percentage < 0:
+            raise serializers.ValidationError(
+                {"items": ("Item tax percentage cannot " "be negative.")}
+            )
 
         subtotal = quantity * unit_price
 
@@ -2459,7 +2581,7 @@ class VendorCreditSerializer(
         return {
             "subtotal": subtotal,
             "tax_amount": tax_amount,
-            "line_total": subtotal + tax_amount,
+            "line_total": (subtotal + tax_amount),
         }
 
     def validate(self, attrs):
@@ -2508,27 +2630,42 @@ class VendorCreditSerializer(
             ),
         )
 
+        errors = {}
+
         if not supplier:
-            raise serializers.ValidationError({"supplier": "Vendor is required."})
+            errors["supplier"] = "Vendor is required."
 
-        if supplier_return and supplier_return.supplier_id != supplier.id:
-            raise serializers.ValidationError(
-                {"supplier_return": "Return must belong to the selected vendor."}
+        if supplier_return and supplier and supplier_return.supplier_id != supplier.id:
+            errors["supplier_return"] = "Return must belong to " "the selected vendor."
+
+        if purchase_order and supplier and purchase_order.supplier_id != supplier.id:
+            errors["purchase_order"] = (
+                "Purchase order must belong to " "the selected vendor."
             )
 
-        if purchase_order and purchase_order.supplier_id != supplier.id:
-            raise serializers.ValidationError(
-                {"purchase_order": "Purchase order must belong to the selected vendor."}
-            )
-
-        if supplier_bill and supplier_bill.supplier_id != supplier.id:
-            raise serializers.ValidationError(
-                {"supplier_bill": "Bill must belong to the selected vendor."}
-            )
+        if supplier_bill and supplier and supplier_bill.supplier_id != supplier.id:
+            errors["supplier_bill"] = "Bill must belong to " "the selected vendor."
 
         if supplier_return and branch and supplier_return.branch_id != branch.id:
-            raise serializers.ValidationError(
-                {"branch": "Branch must match the linked supplier return."}
+            errors["branch"] = "Branch must match the linked " "supplier return."
+
+        if purchase_order and branch and purchase_order.branch_id != branch.id:
+            errors["branch"] = "Branch must match the linked " "purchase order."
+
+        if supplier_bill and branch and supplier_bill.branch_id != branch.id:
+            errors["branch"] = "Branch must match the linked " "supplier bill."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        # Approval must go through VendorCreditViewSet.post() or
+        # update-status. Prevent the edit form from directly posting it.
+        if not self.instance:
+            attrs["status"] = "DRAFT"
+        elif self.instance.status != "DRAFT":
+            attrs.pop(
+                "status",
+                None,
             )
 
         return attrs
@@ -2539,35 +2676,61 @@ class VendorCreditSerializer(
         applications,
         total_credit,
     ):
-        applied_total = Decimal("0")
+        applied_total = Decimal("0.00")
         seen = set()
 
         for application in applications:
-            bill = application["bill"]
+            bill = application.get("bill")
 
-            amount = Decimal(str(application["amount"]))
+            if not bill:
+                raise serializers.ValidationError(
+                    {
+                        "applications": (
+                            "Select a supplier bill " "for every application."
+                        )
+                    }
+                )
+
+            amount = Decimal(
+                str(
+                    application.get(
+                        "amount",
+                        0,
+                    )
+                    or 0
+                )
+            )
 
             if bill.id in seen:
                 raise serializers.ValidationError(
-                    {"applications": "A bill cannot be selected more than once."}
+                    {"applications": ("A bill cannot be selected " "more than once.")}
                 )
 
             seen.add(bill.id)
 
-            if bill.supplier_id != supplier.id:
+            if supplier and bill.supplier_id != supplier.id:
                 raise serializers.ValidationError(
-                    {"applications": "Every bill must belong to the selected vendor."}
+                    {
+                        "applications": (
+                            "Every bill must belong to " "the selected vendor."
+                        )
+                    }
                 )
 
             if amount < 0:
                 raise serializers.ValidationError(
-                    {"applications": "Applied amount cannot be negative."}
+                    {"applications": ("Applied amount cannot " "be negative.")}
                 )
 
-            if amount > bill.balance_due:
+            current_balance = Decimal(str(bill.balance_due or 0))
+
+            if amount > current_balance:
                 raise serializers.ValidationError(
                     {
-                        "applications": f"Application exceeds the open balance of {bill.bill_number}."
+                        "applications": (
+                            f"Application exceeds the open "
+                            f"balance of {bill.bill_number}."
+                        )
                     }
                 )
 
@@ -2575,7 +2738,7 @@ class VendorCreditSerializer(
 
         if applied_total > total_credit:
             raise serializers.ValidationError(
-                {"applications": "Applied amount cannot exceed the total credit."}
+                {"applications": ("Applied amount cannot exceed " "the total credit.")}
             )
 
         return applied_total
@@ -2587,17 +2750,32 @@ class VendorCreditSerializer(
     ):
         vendor_credit.items.all().delete()
 
-        for item in items:
-            item.pop("id", None)
+        for source_item in items:
+            item = dict(source_item)
 
-            values = self._calculate_item(
-                item,
+            item.pop(
+                "id",
+                None,
             )
+            item.pop(
+                "vendor_credit",
+                None,
+            )
+            item.pop(
+                "tax_amount",
+                None,
+            )
+            item.pop(
+                "line_total",
+                None,
+            )
+
+            values = self._calculate_item(item)
 
             VendorCreditItem.objects.create(
                 vendor_credit=vendor_credit,
-                tax_amount=values["tax_amount"],
-                line_total=values["line_total"],
+                tax_amount=(values["tax_amount"]),
+                line_total=(values["line_total"]),
                 **item,
             )
 
@@ -2606,21 +2784,65 @@ class VendorCreditSerializer(
         vendor_credit,
         applications,
     ):
+        """
+        Store planned applications only.
+
+        Supplier bill balances must be changed only by VendorCreditViewSet.post().
+        The previous implementation changed balances here and post() changed
+        them again, causing double application.
+        """
         vendor_credit.applications.all().delete()
 
-        for application in applications:
+        for source_application in applications:
+            application = dict(source_application)
+
             application.pop(
                 "id",
                 None,
             )
+            application.pop(
+                "vendor_credit",
+                None,
+            )
 
-            if application["amount"] <= 0:
+            amount = Decimal(
+                str(
+                    application.get(
+                        "amount",
+                        0,
+                    )
+                    or 0
+                )
+            )
+
+            if amount <= Decimal("0.00"):
                 continue
 
             VendorCreditApplication.objects.create(
                 vendor_credit=vendor_credit,
                 **application,
             )
+
+    def _calculate_totals(
+        self,
+        items,
+    ):
+        subtotal = Decimal("0.00")
+        tax_amount = Decimal("0.00")
+        total_amount = Decimal("0.00")
+
+        for item in items:
+            values = self._calculate_item(item)
+
+            subtotal += values["subtotal"]
+            tax_amount += values["tax_amount"]
+            total_amount += values["line_total"]
+
+        return (
+            subtotal,
+            tax_amount,
+            total_amount,
+        )
 
     @transaction.atomic
     def create(
@@ -2639,51 +2861,69 @@ class VendorCreditSerializer(
 
         if not items:
             raise serializers.ValidationError(
-                {"items": "Add at least one vendor credit line."}
+                {"items": ("Add at least one vendor " "credit line.")}
             )
 
-        subtotal = Decimal("0")
-        tax_amount = Decimal("0")
-        total_amount = Decimal("0")
+        (
+            subtotal,
+            tax_amount,
+            total_amount,
+        ) = self._calculate_totals(items)
 
-        for item in items:
-            values = self._calculate_item(
-                item,
-            )
-
-            subtotal += values["subtotal"]
-
-            tax_amount += values["tax_amount"]
-
-            total_amount += values["line_total"]
-
-        applied_amount = self._validate_applications(
-            validated_data["supplier"],
+        self._validate_applications(
+            validated_data.get("supplier"),
             applications,
             total_amount,
         )
 
-        remaining_amount = max(
-            Decimal("0"),
-            total_amount - applied_amount,
+        validated_data.pop(
+            "credit_number",
+            None,
+        )
+        validated_data.pop(
+            "subtotal",
+            None,
+        )
+        validated_data.pop(
+            "tax_amount",
+            None,
+        )
+        validated_data.pop(
+            "total_amount",
+            None,
+        )
+        validated_data.pop(
+            "applied_amount",
+            None,
+        )
+        validated_data.pop(
+            "remaining_amount",
+            None,
+        )
+        validated_data.pop(
+            "approved_by",
+            None,
+        )
+        validated_data.pop(
+            "approval_date",
+            None,
+        )
+        validated_data.pop(
+            "posted_at",
+            None,
         )
 
-        if not validated_data.get(
-            "credit_number",
-        ):
-            validated_data["credit_number"] = self._generate_number()
-
         validated_data.update(
+            credit_number=(self._generate_number()),
             subtotal=subtotal,
             tax_amount=tax_amount,
             total_amount=total_amount,
-            applied_amount=applied_amount,
-            remaining_amount=remaining_amount,
+            applied_amount=Decimal("0.00"),
+            remaining_amount=(total_amount),
+            status="DRAFT",
         )
 
-        vendor_credit = VendorCredit.objects.create(
-            **validated_data,
-        )
+        vendor_credit = VendorCredit.objects.create(**validated_data)
 
         self._save_items(
             vendor_credit,
@@ -2703,12 +2943,9 @@ class VendorCreditSerializer(
         instance,
         validated_data,
     ):
-        if instance.status in [
-            "FULLY_APPLIED",
-            "VOID",
-        ]:
+        if instance.status != "DRAFT":
             raise serializers.ValidationError(
-                "Fully applied or void credits cannot be edited."
+                {"status": ("Only draft vendor credits " "can be edited.")}
             )
 
         items = validated_data.pop(
@@ -2721,37 +2958,67 @@ class VendorCreditSerializer(
             None,
         )
 
+        validated_data.pop(
+            "credit_number",
+            None,
+        )
+        validated_data.pop(
+            "subtotal",
+            None,
+        )
+        validated_data.pop(
+            "tax_amount",
+            None,
+        )
+        validated_data.pop(
+            "total_amount",
+            None,
+        )
+        validated_data.pop(
+            "applied_amount",
+            None,
+        )
+        validated_data.pop(
+            "remaining_amount",
+            None,
+        )
+        validated_data.pop(
+            "approved_by",
+            None,
+        )
+        validated_data.pop(
+            "approval_date",
+            None,
+        )
+        validated_data.pop(
+            "posted_at",
+            None,
+        )
+
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": "Add at least one vendor credit line."}
+                    {"items": ("Add at least one vendor " "credit line.")}
                 )
 
-            subtotal = Decimal("0")
-            tax_amount = Decimal("0")
-            total_amount = Decimal("0")
-
-            for item in items:
-                values = self._calculate_item(
-                    item,
-                )
-
-                subtotal += values["subtotal"]
-
-                tax_amount += values["tax_amount"]
-
-                total_amount += values["line_total"]
+            (
+                subtotal,
+                tax_amount,
+                total_amount,
+            ) = self._calculate_totals(items)
 
             validated_data.update(
                 subtotal=subtotal,
                 tax_amount=tax_amount,
                 total_amount=total_amount,
+                remaining_amount=(total_amount),
+                applied_amount=Decimal("0.00"),
             )
         else:
-            total_amount = instance.total_amount or Decimal("0")
+            total_amount = Decimal(str(instance.total_amount or 0))
 
         if applications is not None:
-            applied_amount = self._validate_applications(
+            self._validate_applications(
                 validated_data.get(
                     "supplier",
                     instance.supplier,
@@ -2760,12 +3027,7 @@ class VendorCreditSerializer(
                 total_amount,
             )
 
-            validated_data["applied_amount"] = applied_amount
-
-            validated_data["remaining_amount"] = max(
-                Decimal("0"),
-                total_amount - applied_amount,
-            )
+        validated_data["status"] = "DRAFT"
 
         instance = super().update(
             instance,

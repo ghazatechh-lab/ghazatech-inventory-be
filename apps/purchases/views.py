@@ -1771,32 +1771,31 @@ class SupplierReturnViewSet(Base):
         return Response(self.get_serializer(supplier_return).data)
 
     @transaction.atomic
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="approve",
-    )
-    def approve(
-        self,
-        request,
-        pk=None,
-    ):
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
         supplier_return = self.get_object()
 
-        if supplier_return.status in [
-            "APPROVED",
-            "CREDIT_ISSUED",
-        ]:
+        if supplier_return.status in {"APPROVED", "CREDIT_ISSUED"}:
             return Response(self.get_serializer(supplier_return).data)
 
         if supplier_return.status != "PENDING_APPROVAL":
             return Response(
-                {"detail": ("Only pending supplier returns " "can be approved.")},
+                {"detail": "Only pending supplier returns can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return_items = list(
+            supplier_return.items.select_related("product", "variant", "grn_item")
+        )
+
+        if not return_items:
+            return Response(
+                {"detail": "This supplier return has no line items."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         restricted_total = sum(
-            int(item.restricted_quantity or 0) for item in supplier_return.items.all()
+            int(item.restricted_quantity or 0) for item in return_items
         )
 
         if restricted_total > 0 and not has_sensitive_permission(
@@ -1813,25 +1812,6 @@ class SupplierReturnViewSet(Base):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        return_items = list(
-            supplier_return.items.select_related(
-                "product",
-                "variant",
-                "grn_item",
-            )
-        )
-
-        if not return_items:
-            return Response(
-                {
-                    "detail": (
-                        "This supplier return does not contain " "any return items."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 1. Deduct returned stock from the correct classification.
         for item in return_items:
             regular_quantity = int(item.regular_quantity or 0)
             restricted_quantity = int(item.restricted_quantity or 0)
@@ -1848,7 +1828,7 @@ class SupplierReturnViewSet(Base):
                     reference_type="SUPPLIER_RETURN",
                     reference_id=supplier_return.id,
                     remarks=(
-                        "Regular stock returned under "
+                        f"Regular stock returned under "
                         f"{supplier_return.return_number}."
                     ),
                 )
@@ -1865,13 +1845,10 @@ class SupplierReturnViewSet(Base):
                     reference_type="SUPPLIER_RETURN",
                     reference_id=supplier_return.id,
                     remarks=(
-                        "Restricted stock returned under "
+                        f"Restricted stock returned under "
                         f"{supplier_return.return_number}."
                     ),
                 )
-
-        # 2. Create or update the vendor-credit header.
-        credit_number = f"VC-{supplier_return.return_number}"
 
         vendor_credit = (
             VendorCredit.objects.select_for_update()
@@ -1879,108 +1856,96 @@ class SupplierReturnViewSet(Base):
             .first()
         )
 
+        subtotal = sum(
+            (
+                Decimal(str(item.quantity or 0)) * Decimal(str(item.unit_price or 0))
+                for item in return_items
+            ),
+            Decimal("0.00"),
+        )
+
         if not vendor_credit:
             vendor_credit = VendorCredit.objects.create(
-                credit_number=credit_number,
+                credit_number=f"VC-{supplier_return.return_number}",
                 supplier=supplier_return.supplier,
                 supplier_return=supplier_return,
-                purchase_order=(supplier_return.grn.purchase_order),
+                purchase_order=supplier_return.grn.purchase_order,
                 branch=supplier_return.branch,
                 credit_date=timezone.localdate(),
                 reason="RETURN",
-                subtotal=Decimal("0.00"),
+                subtotal=subtotal,
                 tax_amount=Decimal("0.00"),
-                total_amount=Decimal("0.00"),
+                total_amount=subtotal,
                 applied_amount=Decimal("0.00"),
-                remaining_amount=Decimal("0.00"),
+                remaining_amount=subtotal,
                 status="OPEN",
+                reference_number=supplier_return.return_number,
                 notes=(
-                    "Vendor credit created from supplier "
-                    f"return {supplier_return.return_number}."
-                ),
-                internal_memo=(
-                    "Automatically generated when the supplier " "return was approved."
+                    "Created automatically from supplier return "
+                    f"{supplier_return.return_number}."
                 ),
                 created_by=request.user,
                 updated_by=request.user,
             )
-        else:
-            vendor_credit.items.all().delete()
 
-        # 3. Create vendor-credit line items from supplier-return items.
-        subtotal = Decimal("0.00")
-        tax_amount = Decimal("0.00")
-        total_amount = Decimal("0.00")
+        vendor_credit.items.all().delete()
+
+        credit_subtotal = Decimal("0.00")
+        credit_tax = Decimal("0.00")
+        credit_total = Decimal("0.00")
 
         for return_item in return_items:
-            regular_quantity = int(return_item.regular_quantity or 0)
-            restricted_quantity = int(return_item.restricted_quantity or 0)
-            quantity = regular_quantity + restricted_quantity
-
-            if quantity <= 0:
-                continue
-
+            quantity = Decimal(str(return_item.quantity or 0))
             unit_price = Decimal(str(return_item.unit_price or 0))
+            tax_percentage = Decimal("0.00")
+            line_subtotal = quantity * unit_price
+            tax_amount = line_subtotal * tax_percentage / Decimal("100")
+            line_total = line_subtotal + tax_amount
 
-            line_subtotal = Decimal(str(quantity)) * unit_price
-
-            # Supplier-return lines currently do not store a
-            # separate VAT percentage, so the generated credit
-            # line uses zero tax unless you add a mapped VAT field.
-            line_tax_percentage = Decimal("0.00")
-            line_tax_amount = Decimal("0.00")
-            line_total = line_subtotal + line_tax_amount
-
-            description_parts = [
-                getattr(
-                    return_item.product,
-                    "product_name",
-                    None,
-                )
-                or str(return_item.product)
-            ]
-
-            if return_item.variant:
-                description_parts.append(str(return_item.variant))
-
-            classification_parts = []
-
-            if regular_quantity:
-                classification_parts.append(f"Regular: {regular_quantity}")
-
-            if restricted_quantity:
-                classification_parts.append(f"Restricted: {restricted_quantity}")
-
-            if classification_parts:
-                description_parts.append(f"({', '.join(classification_parts)})")
+            product_name = getattr(
+                return_item.product,
+                "product_name",
+                str(return_item.product),
+            )
+            sku = (
+                getattr(return_item.variant, "sku", "")
+                if return_item.variant
+                else getattr(return_item.product, "sku", "")
+            )
+            description = f"{product_name} ({sku})" if sku else product_name
 
             VendorCreditItem.objects.create(
                 vendor_credit=vendor_credit,
-                description=" ".join(description_parts),
+                description=description,
                 gl_account="Purchase Returns",
                 quantity=quantity,
                 unit_price=unit_price,
-                tax_percentage=line_tax_percentage,
-                tax_amount=line_tax_amount,
+                tax_percentage=tax_percentage,
+                tax_amount=tax_amount,
                 line_total=line_total,
             )
 
-            subtotal += line_subtotal
-            tax_amount += line_tax_amount
-            total_amount += line_total
+            credit_subtotal += line_subtotal
+            credit_tax += tax_amount
+            credit_total += line_total
 
-        if total_amount <= Decimal("0.00"):
-            raise serializers.ValidationError(
-                {"items": ("The supplier return total must be " "greater than zero.")}
-            )
+        applied_amount = vendor_credit.applications.aggregate(total=Sum("amount"))[
+            "total"
+        ] or Decimal("0.00")
 
-        # 4. Update calculated vendor-credit totals.
-        vendor_credit.subtotal = subtotal
-        vendor_credit.tax_amount = tax_amount
-        vendor_credit.total_amount = total_amount
-        vendor_credit.applied_amount = Decimal("0.00")
-        vendor_credit.remaining_amount = total_amount
-        vendor_credit.status = "OPEN"
+        vendor_credit.subtotal = credit_subtotal
+        vendor_credit.tax_amount = credit_tax
+        vendor_credit.total_amount = credit_total
+        vendor_credit.applied_amount = applied_amount
+        vendor_credit.remaining_amount = max(
+            Decimal("0.00"),
+            credit_total - applied_amount,
+        )
+        vendor_credit.status = (
+            "FULLY_APPLIED"
+            if vendor_credit.remaining_amount == Decimal("0.00")
+            else ("PARTIALLY_APPLIED" if applied_amount > Decimal("0.00") else "OPEN")
+        )
         vendor_credit.updated_by = request.user
         vendor_credit.save(
             update_fields=[
@@ -1994,16 +1959,6 @@ class SupplierReturnViewSet(Base):
                 "updated_at",
             ]
         )
-
-        # 5. Applications are intentionally not created here.
-        #
-        # A VendorCreditApplication should only be created when the
-        # user explicitly applies this credit to a specific supplier
-        # bill. Automatically selecting a bill could apply the credit
-        # to the wrong liability.
-        #
-        # The applications section will remain empty until a bill
-        # application is recorded.
 
         supplier_return.status = "CREDIT_ISSUED"
         supplier_return.approved_by = request.user
@@ -2044,6 +1999,7 @@ class VendorCreditViewSet(Base):
         "branch",
         "approved_by",
     ).prefetch_related(
+        "items",
         "applications__bill",
         "attachments",
     )
@@ -2152,7 +2108,15 @@ class VendorCreditViewSet(Base):
             raise_exception=True,
         )
 
-        vendor_credit = serializer.save()
+        save_kwargs = {}
+
+        if request.user.is_authenticated:
+            save_kwargs.update(
+                created_by=request.user,
+                updated_by=request.user,
+            )
+
+        vendor_credit = serializer.save(**save_kwargs)
 
         self._save_attachments(
             vendor_credit,
@@ -2192,7 +2156,12 @@ class VendorCreditViewSet(Base):
             raise_exception=True,
         )
 
-        vendor_credit = serializer.save()
+        save_kwargs = {}
+
+        if request.user.is_authenticated:
+            save_kwargs["updated_by"] = request.user
+
+        vendor_credit = serializer.save(**save_kwargs)
 
         self._save_attachments(
             vendor_credit,
@@ -2210,207 +2179,97 @@ class VendorCreditViewSet(Base):
         methods=["get"],
         url_path="form-options",
     )
-    def form_options(
-        self,
-        request,
-    ):
+    def form_options(self, request):
         branch_id = request.query_params.get("branch")
-
         supplier_id = request.query_params.get("supplier")
-
-        suppliers = Supplier.objects.filter(
-            is_deleted=False,
-            is_active=True,
-        ).order_by(
-            "supplier_name",
-        )
 
         supplier_returns = (
             SupplierReturn.objects.select_related(
                 "supplier",
                 "branch",
+                "grn",
                 "grn__purchase_order",
             )
             .prefetch_related(
                 "items__product",
                 "items__variant",
             )
-            .filter(
-                status__in=[
-                    "APPROVED",
-                    "CREDIT_ISSUED",
-                ]
-            )
-            .order_by(
-                "-return_date",
-                "-id",
-            )
+            .filter(status__in=["APPROVED", "CREDIT_ISSUED"])
+            .order_by("-return_date", "-id")
         )
 
-        purchase_orders = PurchaseOrder.objects.select_related(
-            "supplier",
-            "branch",
-        ).order_by(
-            "-order_date",
-            "-id",
+        purchase_orders = (
+            PurchaseOrder.objects.select_related("supplier", "branch")
+            .exclude(status="CANCELLED")
+            .order_by("-order_date", "-id")
         )
 
-        supplier_bills = SupplierBill.objects.select_related(
-            "supplier",
-            "branch",
-        ).order_by(
-            "-bill_date",
-            "-id",
-        )
-
-        open_bills = (
+        supplier_bills = (
             SupplierBill.objects.select_related(
                 "supplier",
                 "branch",
+                "purchase_order",
             )
-            .filter(
-                balance_due__gt=0,
-            )
-            .exclude(
-                status__in=[
-                    "PAID",
-                    "CANCELLED",
-                ]
-            )
-            .order_by(
-                "due_date",
-                "bill_number",
-            )
+            .filter(balance_due__gt=0)
+            .exclude(status__in=["DRAFT", "CANCELLED", "PAID"])
+            .order_by("due_date", "-id")
         )
 
-        gl_accounts = [
-            {
-                "id": "INVENTORY_ASSET",
-                "account_name": "Inventory Asset",
-                "account_code": "INVENTORY_ASSET",
-            },
-            {
-                "id": "PURCHASE_EXPENSE",
-                "account_name": "Purchase Expense",
-                "account_code": "PURCHASE_EXPENSE",
-            },
-            {
-                "id": "FREIGHT_EXPENSE",
-                "account_name": "Freight Expense",
-                "account_code": "FREIGHT_EXPENSE",
-            },
-            {
-                "id": "ACCOUNTS_PAYABLE",
-                "account_name": "Accounts Payable",
-                "account_code": "ACCOUNTS_PAYABLE",
-            },
-            {
-                "id": "OTHER_EXPENSE",
-                "account_name": "Other Expense",
-                "account_code": "OTHER_EXPENSE",
-            },
-        ]
+        if branch_id not in (None, "", "all"):
+            supplier_returns = supplier_returns.filter(branch_id=branch_id)
+            purchase_orders = purchase_orders.filter(branch_id=branch_id)
+            supplier_bills = supplier_bills.filter(branch_id=branch_id)
 
-        approvers = User.objects.filter(
-            is_active=True,
-        ).order_by(
-            "first_name",
-            "username",
-        )
-
-        if branch_id:
-            supplier_returns = supplier_returns.filter(
-                branch_id=branch_id,
-            )
-
-            purchase_orders = purchase_orders.filter(
-                branch_id=branch_id,
-            )
-
-            supplier_bills = supplier_bills.filter(
-                branch_id=branch_id,
-            )
-
-            open_bills = open_bills.filter(
-                branch_id=branch_id,
-            )
-
-        if supplier_id:
-            supplier_returns = supplier_returns.filter(
-                supplier_id=supplier_id,
-            )
-
-            purchase_orders = purchase_orders.filter(
-                supplier_id=supplier_id,
-            )
-
-            supplier_bills = supplier_bills.filter(
-                supplier_id=supplier_id,
-            )
-
-            open_bills = open_bills.filter(
-                supplier_id=supplier_id,
-            )
-
-        inventory_account = next(
-            (account for account in gl_accounts if account["id"] == "INVENTORY_ASSET"),
-            None,
-        )
+        if supplier_id not in (None, "", "all"):
+            supplier_returns = supplier_returns.filter(supplier_id=supplier_id)
+            purchase_orders = purchase_orders.filter(supplier_id=supplier_id)
+            supplier_bills = supplier_bills.filter(supplier_id=supplier_id)
 
         return Response(
             {
-                "suppliers": [
-                    {
-                        "id": supplier.id,
-                        "supplier_code": supplier.supplier_code,
-                        "supplier_name": supplier.supplier_name,
-                    }
-                    for supplier in suppliers
-                ],
                 "supplier_returns": [
                     {
-                        "id": supplier_return.id,
-                        "return_number": supplier_return.return_number,
-                        "supplier_id": supplier_return.supplier_id,
-                        "supplier_name": supplier_return.supplier.supplier_name,
-                        "branch_id": supplier_return.branch_id,
-                        "purchase_order_id": supplier_return.grn.purchase_order_id,
-                        "details": supplier_return.details,
-                        "notes": supplier_return.notes,
-                        "total_amount": supplier_return.total_amount,
+                        "id": item.id,
+                        "return_number": item.return_number,
+                        "supplier_id": item.supplier_id,
+                        "supplier_name": item.supplier.supplier_name,
+                        "branch_id": item.branch_id,
+                        "branch_name": item.branch.branch_name,
+                        "purchase_order_id": (item.grn.purchase_order_id),
+                        "po_number": item.grn.purchase_order.po_number,
+                        "total_amount": item.total_amount,
                         "items": [
                             {
-                                "id": item.id,
-                                "product_name": item.product.product_name,
+                                "id": line.id,
+                                "product_id": line.product_id,
+                                "variant_id": line.variant_id,
+                                "product_name": line.product.product_name,
                                 "sku": (
-                                    getattr(
-                                        item.variant,
-                                        "sku",
-                                        "",
-                                    )
-                                    if item.variant
-                                    else getattr(
-                                        item.product,
-                                        "sku",
-                                        "",
-                                    )
+                                    getattr(line.variant, "sku", "")
+                                    if line.variant
+                                    else getattr(line.product, "sku", "")
                                 ),
-                                "quantity": item.quantity,
-                                "unit_price": item.unit_price,
+                                "quantity": line.quantity,
+                                "regular_quantity": line.regular_quantity,
+                                "restricted_quantity": (line.restricted_quantity),
+                                "unit_price": line.unit_price,
+                                "line_total": line.line_total,
                             }
-                            for item in supplier_return.items.all()
+                            for line in item.items.all()
                         ],
                     }
-                    for supplier_return in supplier_returns
+                    for item in supplier_returns
                 ],
                 "purchase_orders": [
                     {
-                        "id": order.id,
-                        "po_number": order.po_number,
-                        "supplier_id": order.supplier_id,
-                        "supplier_name": order.supplier.supplier_name,
+                        "id": po.id,
+                        "po_number": po.po_number,
+                        "supplier_id": po.supplier_id,
+                        "branch_id": po.branch_id,
+                        "total_amount": po.total_amount,
+                        "status": po.status,
                     }
-                    for order in purchase_orders
+                    for po in purchase_orders
                 ],
                 "supplier_bills": [
                     {
@@ -2418,33 +2277,21 @@ class VendorCreditViewSet(Base):
                         "bill_number": bill.bill_number,
                         "supplier_id": bill.supplier_id,
                         "supplier_name": bill.supplier.supplier_name,
+                        "branch_id": bill.branch_id,
+                        "purchase_order_id": bill.purchase_order_id,
+                        "po_number": (
+                            bill.purchase_order.po_number if bill.purchase_order else ""
+                        ),
+                        "bill_date": bill.bill_date,
+                        "due_date": bill.due_date,
+                        "total_amount": bill.total_amount,
+                        "paid_amount": bill.paid_amount,
+                        "open_balance": bill.balance_due,
                         "balance_due": bill.balance_due,
+                        "status": bill.status,
                     }
                     for bill in supplier_bills
                 ],
-                "open_bills": [
-                    {
-                        "id": bill.id,
-                        "bill_number": bill.bill_number,
-                        "supplier_id": bill.supplier_id,
-                        "due_date": bill.due_date,
-                        "balance_due": bill.balance_due,
-                    }
-                    for bill in open_bills
-                ],
-                "gl_accounts": gl_accounts,
-                "approvers": [
-                    {
-                        "id": user.id,
-                        "display_name": user_name(
-                            user,
-                        ),
-                    }
-                    for user in approvers
-                ],
-                "default_inventory_account_id": (
-                    inventory_account["id"] if inventory_account else None
-                ),
             }
         )
 
@@ -2489,6 +2336,214 @@ class VendorCreditViewSet(Base):
     @action(
         detail=True,
         methods=["post"],
+        url_path="update-status",
+    )
+    def update_status(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Approve or void a vendor credit without recursively calling another
+        ViewSet action. This avoids a second get_object()/queryset resolution
+        cycle that can trigger RecursionError in custom Base query filtering.
+        """
+        vendor_credit = self.get_object()
+
+        requested_status = (
+            str(
+                request.data.get(
+                    "status",
+                    "",
+                )
+            )
+            .strip()
+            .upper()
+        )
+
+        current_status = str(vendor_credit.status or "").strip().upper()
+
+        valid_statuses = dict(VendorCredit.STATUS_CHOICES)
+
+        if requested_status not in valid_statuses:
+            return Response(
+                {"status": ["Select a valid vendor credit status."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if requested_status == current_status:
+            return Response(
+                self.get_serializer(vendor_credit).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if requested_status == "VOID":
+            if Decimal(str(vendor_credit.applied_amount or 0)) > Decimal("0.00"):
+                return Response(
+                    {
+                        "detail": (
+                            "Applied credits cannot be voided "
+                            "until their applications are reversed."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            vendor_credit.status = "VOID"
+            vendor_credit.voided_at = timezone.now()
+            vendor_credit.void_reason = str(
+                request.data.get(
+                    "reason",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            update_fields = [
+                "status",
+                "voided_at",
+                "void_reason",
+                "updated_at",
+            ]
+
+            if request.user.is_authenticated:
+                vendor_credit.updated_by = request.user
+                update_fields.append("updated_by")
+
+            vendor_credit.save(update_fields=update_fields)
+
+            vendor_credit.refresh_from_db()
+
+            return Response(
+                self.get_serializer(vendor_credit).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if requested_status != "OPEN":
+            return Response(
+                {
+                    "status": [
+                        (
+                            "Applied statuses are calculated "
+                            "from credit applications and "
+                            "cannot be selected manually."
+                        )
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if current_status not in {
+            "DRAFT",
+            "PENDING",
+        }:
+            return Response(
+                {
+                    "status": [
+                        "Only draft or pending vendor " "credits can be approved."
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        total_amount = Decimal(str(vendor_credit.total_amount or 0))
+
+        applied_total = Decimal("0.00")
+
+        applications = list(vendor_credit.applications.select_related("bill").all())
+
+        for application in applications:
+            bill = SupplierBill.objects.select_for_update().get(id=application.bill_id)
+
+            requested_amount = Decimal(str(application.amount or 0))
+
+            open_balance = Decimal(str(bill.balance_due or 0))
+
+            amount = min(
+                requested_amount,
+                open_balance,
+            )
+
+            if amount <= Decimal("0.00"):
+                continue
+
+            bill.balance_due = max(
+                Decimal("0.00"),
+                open_balance - amount,
+            )
+
+            bill.paid_amount = max(
+                Decimal("0.00"),
+                Decimal(str(bill.total_amount or 0)) - bill.balance_due,
+            )
+
+            if bill.balance_due == Decimal("0.00"):
+                bill.status = "PAID"
+            elif bill.paid_amount > Decimal("0.00"):
+                bill.status = "PARTIALLY_PAID"
+            else:
+                bill.status = "UNPAID"
+
+            bill.save(
+                update_fields=[
+                    "balance_due",
+                    "paid_amount",
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+            applied_total += amount
+
+        vendor_credit.applied_amount = applied_total
+
+        vendor_credit.remaining_amount = max(
+            Decimal("0.00"),
+            total_amount - applied_total,
+        )
+
+        if vendor_credit.remaining_amount == Decimal("0.00"):
+            vendor_credit.status = "FULLY_APPLIED"
+        elif applied_total > Decimal("0.00"):
+            vendor_credit.status = "PARTIALLY_APPLIED"
+        else:
+            vendor_credit.status = "OPEN"
+
+        vendor_credit.posted_at = timezone.now()
+        vendor_credit.approved_by = request.user
+        vendor_credit.approval_date = timezone.localdate()
+
+        update_fields = [
+            "applied_amount",
+            "remaining_amount",
+            "status",
+            "posted_at",
+            "approved_by",
+            "approval_date",
+            "updated_at",
+        ]
+
+        if request.user.is_authenticated:
+            vendor_credit.updated_by = request.user
+            update_fields.append("updated_by")
+
+        vendor_credit.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        vendor_credit.refresh_from_db()
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Vendor credit approved successfully."),
+                "data": self.get_serializer(vendor_credit).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
     )
     def post(
         self,
@@ -2522,13 +2577,21 @@ class VendorCreditViewSet(Base):
                 bill.balance_due - amount,
             )
 
+            bill.paid_amount = max(
+                Decimal("0"),
+                Decimal(str(bill.total_amount or 0)) - bill.balance_due,
+            )
+
             if bill.balance_due == 0:
                 bill.status = "PAID"
-            elif bill.paid_amount > 0 or amount > 0:
+            elif bill.paid_amount > 0:
                 bill.status = "PARTIALLY_PAID"
+            else:
+                bill.status = "UNPAID"
 
             bill.save(
                 update_fields=[
+                    "paid_amount",
                     "balance_due",
                     "status",
                     "updated_at",
@@ -2553,6 +2616,9 @@ class VendorCreditViewSet(Base):
 
         vendor_credit.posted_at = timezone.now()
 
+        if request.user.is_authenticated:
+            vendor_credit.updated_by = request.user
+
         if not vendor_credit.approved_by:
             vendor_credit.approved_by = request.user
 
@@ -2567,6 +2633,7 @@ class VendorCreditViewSet(Base):
                 "posted_at",
                 "approved_by",
                 "approval_date",
+                "updated_by",
                 "updated_at",
             ]
         )
@@ -2628,11 +2695,29 @@ MAX_EXPENSE_FILE_SIZE = 10 * 1024 * 1024
 
 class PurchaseExpenseViewSet(Base):
     queryset = PurchaseExpense.objects.select_related(
-        "branch", "bank_account", "cash_register", "approved_by", "rejected_by"
+        "branch",
+        "bank_account",
+        "cash_register",
+        "approved_by",
+        "rejected_by",
+        "created_by",
+        "updated_by",
     ).prefetch_related("attachments")
+
     serializer_class = PurchaseExpenseSerializer
-    parser_classes = [MultiPartParser, FormParser, JSONParser]
-    filterset_fields = ["branch", "category", "payment_method", "status"]
+    parser_classes = [
+        MultiPartParser,
+        FormParser,
+        JSONParser,
+    ]
+
+    filterset_fields = [
+        "branch",
+        "category",
+        "payment_method",
+        "status",
+    ]
+
     search_fields = [
         "expense_number",
         "description",
@@ -2641,6 +2726,7 @@ class PurchaseExpenseViewSet(Base):
         "notes",
         "branch__branch_name",
     ]
+
     ordering_fields = [
         "expense_number",
         "description",
@@ -2652,195 +2738,532 @@ class PurchaseExpenseViewSet(Base):
         "created_at",
         "branch__branch_name",
     ]
-    ordering = ["-expense_date", "-id"]
+
+    ordering = [
+        "-expense_date",
+        "-id",
+    ]
 
     def _payload(self, request):
-        if "payload" in request.data:
-            try:
-                return json.loads(request.data["payload"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                raise serializers.ValidationError(
-                    {"payload": "Invalid expense payload."}
-                )
-        return request.data
+        """
+        Accept normal JSON and multipart requests containing a JSON payload.
+        """
+        if "payload" not in request.data:
+            return request.data
 
-    def _save_attachments(self, expense, request):
+        try:
+            return json.loads(request.data["payload"])
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise serializers.ValidationError(
+                {"payload": ("Invalid expense payload.")}
+            ) from exc
+
+    def _save_attachments(
+        self,
+        expense,
+        request,
+    ):
         for file in request.FILES.getlist("attachments"):
-            ext = Path(file.name).suffix.lower()
-            if ext not in ALLOWED_EXPENSE_EXTENSIONS:
+            extension = Path(file.name).suffix.lower()
+
+            if extension not in ALLOWED_EXPENSE_EXTENSIONS:
                 raise serializers.ValidationError(
-                    {"attachments": f"{file.name}: unsupported file type."}
+                    {"attachments": (f"{file.name}: unsupported file type.")}
                 )
+
             if file.size > MAX_EXPENSE_FILE_SIZE:
                 raise serializers.ValidationError(
-                    {"attachments": f"{file.name}: file exceeds 10 MB."}
+                    {"attachments": (f"{file.name}: file exceeds 10 MB.")}
                 )
+
             PurchaseExpenseAttachment.objects.create(
                 expense=expense,
                 file=file,
                 original_name=file.name,
                 file_size=file.size,
-                content_type=file.content_type or "",
-                uploaded_by=request.user if request.user.is_authenticated else None,
+                content_type=(file.content_type or ""),
+                uploaded_by=(request.user if request.user.is_authenticated else None),
             )
 
     @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=self._payload(request))
+    def create(
+        self,
+        request,
+        *args,
+        **kwargs,
+    ):
+        serializer = self.get_serializer(
+            data=self._payload(request),
+        )
         serializer.is_valid(raise_exception=True)
-        expense = serializer.save()
-        self._save_attachments(expense, request)
+
+        save_kwargs = {}
+
+        if request.user.is_authenticated:
+            save_kwargs.update(
+                created_by=request.user,
+                updated_by=request.user,
+            )
+
+        expense = serializer.save(**save_kwargs)
+
+        self._save_attachments(
+            expense,
+            request,
+        )
+
         return Response(
-            self.get_serializer(expense).data, status=status.HTTP_201_CREATED
+            self.get_serializer(expense).data,
+            status=status.HTTP_201_CREATED,
         )
 
     @transaction.atomic
-    def update(self, request, *args, **kwargs):
+    def update(
+        self,
+        request,
+        *args,
+        **kwargs,
+    ):
+        partial = kwargs.pop(
+            "partial",
+            False,
+        )
         instance = self.get_object()
+
         serializer = self.get_serializer(
-            instance, data=self._payload(request), partial=kwargs.pop("partial", False)
+            instance,
+            data=self._payload(request),
+            partial=partial,
         )
         serializer.is_valid(raise_exception=True)
-        expense = serializer.save()
-        self._save_attachments(expense, request)
+
+        save_kwargs = {}
+
+        if request.user.is_authenticated:
+            save_kwargs["updated_by"] = request.user
+
+        expense = serializer.save(**save_kwargs)
+
+        self._save_attachments(
+            expense,
+            request,
+        )
+
         return Response(self.get_serializer(expense).data)
 
-    @action(detail=False, methods=["get"], url_path="form-options")
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="form-options",
+    )
     def form_options(self, request):
         branch_id = request.query_params.get("branch")
+
         branches = Branch.objects.filter(is_active=True).order_by("branch_name")
+
         bank_accounts = BankAccount.objects.filter(is_active=True).order_by(
             "account_name"
         )
+
         cash_registers = CashRegister.objects.exclude(
-            status__in=["CLOSED", "INACTIVE"],
-        ).order_by("-register_date", "-id")
-        if branch_id:
-            if hasattr(BankAccount, "branch"):
+            status__in=[
+                "CLOSED",
+                "INACTIVE",
+            ],
+        ).order_by(
+            "-register_date",
+            "-id",
+        )
+
+        if branch_id not in (
+            None,
+            "",
+            "all",
+        ):
+            if hasattr(
+                BankAccount,
+                "branch_id",
+            ) or hasattr(
+                BankAccount,
+                "branch",
+            ):
                 bank_accounts = bank_accounts.filter(branch_id=branch_id)
-            if hasattr(CashRegister, "branch"):
+
+            if hasattr(
+                CashRegister,
+                "branch_id",
+            ) or hasattr(
+                CashRegister,
+                "branch",
+            ):
                 cash_registers = cash_registers.filter(branch_id=branch_id)
+
+        category_field = PurchaseExpense._meta.get_field("category")
+
         return Response(
             {
                 "categories": [
-                    {"value": c.code, "label": c.name, "id": c.id}
-                    for c in PurchaseExpenseCategory.objects.filter(is_active=True)
-                ]
-                or [
-                    {"value": v, "label": l}
-                    for v, l in PurchaseExpense.CATEGORY_CHOICES
+                    {
+                        "value": value,
+                        "label": label,
+                    }
+                    for value, label in category_field.choices
                 ],
                 "branches": [
                     {
-                        "id": b.id,
-                        "branch_name": b.branch_name,
-                        "branch_code": b.branch_code,
+                        "id": branch.id,
+                        "branch_name": (branch.branch_name),
+                        "branch_code": (branch.branch_code),
                     }
-                    for b in branches
+                    for branch in branches
                 ],
                 "bank_accounts": [
-                    {"id": a.id, "account_name": getattr(a, "account_name", str(a))}
-                    for a in bank_accounts
+                    {
+                        "id": account.id,
+                        "account_name": (
+                            getattr(
+                                account,
+                                "account_name",
+                                str(account),
+                            )
+                        ),
+                    }
+                    for account in bank_accounts
                 ],
                 "cash_registers": [
                     {
-                        "id": c.id,
+                        "id": register.id,
                         "name": (
-                            f"Cash Register #{c.id} - "
-                            f"{c.register_date} ({c.status})"
+                            f"Cash Register "
+                            f"#{register.id} - "
+                            f"{register.register_date} "
+                            f"({register.status})"
                         ),
-                        "branch": c.branch_id,
-                        "status": c.status,
+                        "branch": (
+                            getattr(
+                                register,
+                                "branch_id",
+                                None,
+                            )
+                        ),
+                        "status": (register.status),
                     }
-                    for c in cash_registers
+                    for register in cash_registers
+                ],
+                "statuses": [
+                    {
+                        "value": value,
+                        "label": label,
+                    }
+                    for value, label in PurchaseExpense.STATUS_CHOICES
+                ],
+                "payment_methods": [
+                    {
+                        "value": value,
+                        "label": label,
+                    }
+                    for value, label in PurchaseExpense.PAYMENT_METHOD_CHOICES
                 ],
             }
         )
 
-    @action(detail=False, methods=["get", "post"], url_path="categories")
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="categories",
+    )
     def categories(self, request):
-        if request.method == "POST":
-            name = str(request.data.get("name", "")).strip()
-            if not name:
-                raise serializers.ValidationError(
-                    {"name": "Category name is required."}
-                )
-            from django.utils.text import slugify
+        category_field = PurchaseExpense._meta.get_field("category")
 
-            base = slugify(name).upper().replace("-", "_")[:50] or "CATEGORY"
-            code = base
-            suffix = 2
-            while PurchaseExpenseCategory.objects.filter(code=code).exists():
-                code = f"{base}_{suffix}"
-                suffix += 1
-            category = PurchaseExpenseCategory.objects.create(name=name, code=code)
-            return Response(
-                PurchaseExpenseCategorySerializer(category).data,
-                status=status.HTTP_201_CREATED,
-            )
-        categories = PurchaseExpenseCategory.objects.filter(is_active=True)
-        return Response(PurchaseExpenseCategorySerializer(categories, many=True).data)
-
-    @action(detail=False, methods=["get"])
-    def summary(self, request):
-        qs = self.filter_queryset(self.get_queryset())
-        today = timezone.localdate()
-        month = qs.filter(
-            expense_date__year=today.year, expense_date__month=today.month
+        return Response(
+            [
+                {
+                    "value": value,
+                    "label": label,
+                }
+                for value, label in category_field.choices
+            ]
         )
-        pending = qs.filter(status="PENDING")
-        paid = month.filter(status="PAID")
-        top = (
-            month.values("category")
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="summary",
+    )
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        today = timezone.localdate()
+
+        this_month = queryset.filter(
+            expense_date__year=today.year,
+            expense_date__month=today.month,
+        )
+
+        pending = queryset.filter(status="PENDING")
+
+        paid = this_month.filter(status="PAID")
+
+        top_category = (
+            this_month.values("category")
             .annotate(total=Sum("amount"))
             .order_by("-total")
             .first()
         )
-        labels = dict(PurchaseExpense.CATEGORY_CHOICES)
+
+        category_labels = dict(PurchaseExpense._meta.get_field("category").choices)
+
         return Response(
             {
-                "this_month_total": month.aggregate(value=Sum("amount"))["value"] or 0,
-                "this_month_count": month.count(),
-                "pending_total": pending.aggregate(value=Sum("amount"))["value"] or 0,
-                "pending_count": pending.count(),
-                "paid_this_month": paid.aggregate(value=Sum("amount"))["value"] or 0,
-                "paid_count": paid.count(),
-                "top_category": (
-                    labels.get(top["category"], top["category"]) if top else ""
+                "this_month_total": (
+                    this_month.aggregate(value=Sum("amount"))["value"] or 0
                 ),
-                "top_category_total": top["total"] if top else 0,
+                "this_month_count": (this_month.count()),
+                "pending_total": (pending.aggregate(value=Sum("amount"))["value"] or 0),
+                "pending_count": (pending.count()),
+                "paid_this_month": (paid.aggregate(value=Sum("amount"))["value"] or 0),
+                "paid_count": (paid.count()),
+                "top_category": (
+                    category_labels.get(
+                        top_category["category"],
+                        top_category["category"],
+                    )
+                    if top_category
+                    else ""
+                ),
+                "top_category_total": (top_category["total"] if top_category else 0),
             }
         )
 
-    @action(detail=True, methods=["post"])
-    def approve(self, request, pk=None):
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="update-status",
+    )
+    def update_status(
+        self,
+        request,
+        pk=None,
+    ):
         expense = self.get_object()
-        if expense.status != "PENDING":
+
+        next_status = (
+            str(
+                request.data.get(
+                    "status",
+                    "",
+                )
+            )
+            .strip()
+            .upper()
+        )
+
+        reason = str(
+            request.data.get(
+                "reason",
+                "",
+            )
+            or ""
+        ).strip()
+
+        valid_statuses = dict(PurchaseExpense.STATUS_CHOICES)
+
+        if next_status not in valid_statuses:
             return Response(
-                {"detail": "Only pending expenses can be approved."},
+                {"status": ["Select a valid expense status."]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        transitions = {
+            "PENDING": {
+                "APPROVED",
+                "PAID",
+                "REJECTED",
+                "CANCELLED",
+            },
+            "APPROVED": {
+                "PAID",
+                "REJECTED",
+                "CANCELLED",
+            },
+            "PAID": set(),
+            "REJECTED": {
+                "PENDING",
+                "CANCELLED",
+            },
+            "CANCELLED": {
+                "PENDING",
+            },
+        }
+
+        if next_status == expense.status:
+            return Response(self.get_serializer(expense).data)
+
+        if next_status not in transitions.get(
+            expense.status,
+            set(),
+        ):
+            return Response(
+                {
+                    "status": [
+                        (
+                            f"Status cannot be changed "
+                            f"from {expense.status} "
+                            f"to {next_status}."
+                        )
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if next_status == "REJECTED" and not reason:
+            return Response(
+                {"reason": ["Rejection reason is required."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        expense.status = next_status
+
+        update_fields = [
+            "status",
+            "updated_at",
+        ]
+
+        if request.user.is_authenticated:
+            expense.updated_by = request.user
+            update_fields.append("updated_by")
+
+        if next_status == "APPROVED":
+            expense.approved_by = request.user
+            expense.approved_at = timezone.now()
+            update_fields.extend(
+                [
+                    "approved_by",
+                    "approved_at",
+                ]
+            )
+
+        elif next_status == "PAID":
+            if not expense.approved_by:
+                expense.approved_by = request.user
+                expense.approved_at = timezone.now()
+                update_fields.extend(
+                    [
+                        "approved_by",
+                        "approved_at",
+                    ]
+                )
+
+        elif next_status == "REJECTED":
+            expense.rejected_by = request.user
+            expense.rejected_at = timezone.now()
+            expense.rejection_reason = reason
+            update_fields.extend(
+                [
+                    "rejected_by",
+                    "rejected_at",
+                    "rejection_reason",
+                ]
+            )
+
+        elif next_status == "PENDING":
+            expense.rejected_by = None
+            expense.rejected_at = None
+            expense.rejection_reason = ""
+            update_fields.extend(
+                [
+                    "rejected_by",
+                    "rejected_at",
+                    "rejection_reason",
+                ]
+            )
+
+        expense.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        return Response(self.get_serializer(expense).data)
+
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="approve",
+    )
+    def approve(
+        self,
+        request,
+        pk=None,
+    ):
+        expense = self.get_object()
+
+        if expense.status != "PENDING":
+            return Response(
+                {"detail": ("Only pending expenses " "can be approved.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         expense.status = "APPROVED"
         expense.approved_by = request.user
         expense.approved_at = timezone.now()
+
+        if request.user.is_authenticated:
+            expense.updated_by = request.user
+
         expense.save(
-            update_fields=["status", "approved_by", "approved_at", "updated_at"]
+            update_fields=[
+                "status",
+                "approved_by",
+                "approved_at",
+                "updated_by",
+                "updated_at",
+            ]
         )
+
         return Response(self.get_serializer(expense).data)
 
-    @action(detail=True, methods=["post"], url_path="mark-paid")
-    def mark_paid(self, request, pk=None):
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="mark-paid",
+    )
+    def mark_paid(
+        self,
+        request,
+        pk=None,
+    ):
         expense = self.get_object()
-        if expense.status not in ["PENDING", "APPROVED"]:
+
+        if expense.status not in {
+            "PENDING",
+            "APPROVED",
+        }:
             return Response(
-                {"detail": "Expense cannot be marked paid."},
+                {"detail": ("Expense cannot be marked paid.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         expense.status = "PAID"
+
         if not expense.approved_by:
             expense.approved_by = request.user
             expense.approved_at = timezone.now()
+
+        if request.user.is_authenticated:
+            expense.updated_by = request.user
+
         expense.save(
-            update_fields=["status", "approved_by", "approved_at", "updated_at"]
+            update_fields=[
+                "status",
+                "approved_by",
+                "approved_at",
+                "updated_by",
+                "updated_at",
+            ]
         )
+
         return Response(self.get_serializer(expense).data)
