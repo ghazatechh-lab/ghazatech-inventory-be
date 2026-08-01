@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -22,7 +23,10 @@ class StockTransferViewSet(ModelViewSet):
             "dispatched_by",
             "received_by",
         )
-        .prefetch_related("items__product")
+        .prefetch_related(
+            "items__product",
+            "items__variant",
+        )
         .all()
     )
 
@@ -106,7 +110,10 @@ class StockTransferViewSet(ModelViewSet):
 
         transfer.status = "APPROVED"
         transfer.approved_by = request.user
-        transfer.save(update_fields=["status", "approved_by", "updated_at"])
+        transfer.approved_at = timezone.now()
+        transfer.save(
+            update_fields=["status", "approved_by", "approved_at", "updated_at"]
+        )
 
         return ok(
             TransferSerializer(transfer, context={"request": request}).data,
@@ -132,8 +139,16 @@ class StockTransferViewSet(ModelViewSet):
     @action(detail=True, methods=["post"], url_path="cancel")
     def cancel_transfer(self, request, pk=None):
         transfer = self.get_object()
+        current_status = str(transfer.status or "").upper()
+        if current_status in {"IN_TRANSIT", "DISPATCHED", "RECEIVED"}:
+            raise serializers.ValidationError(
+                {
+                    "status": "Dispatched or received transfers cannot be cancelled without a stock reversal."
+                }
+            )
         transfer.status = "CANCELLED"
-        transfer.save(update_fields=["status", "updated_at"])
+        transfer.cancelled_at = timezone.now()
+        transfer.save(update_fields=["status", "cancelled_at", "updated_at"])
 
         return ok(
             TransferSerializer(transfer, context={"request": request}).data,

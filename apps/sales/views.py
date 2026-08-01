@@ -12,6 +12,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
+from apps.common.sensitive_permissions import can_view_restricted
 
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
@@ -23,56 +24,221 @@ from apps.accounts.models import User
 from .serializers import *
 
 
-def _sales_product_options(branch_id):
-    if not branch_id:
+def _resolve_sales_branch(branch_value):
+    """
+    Accept a branch primary key, branch code, or Branch instance.
+    """
+    if not branch_value:
+        return None
+
+    if isinstance(branch_value, Branch):
+        return branch_value
+
+    branch_text = str(branch_value).strip()
+
+    branch = Branch.objects.filter(
+        pk=branch_text,
+        is_active=True,
+    ).first()
+
+    if branch:
+        return branch
+
+    return Branch.objects.filter(
+        branch_code__iexact=branch_text,
+        is_active=True,
+    ).first()
+
+
+def _sales_product_options(branch_id, user=None):
+    """
+    Return one sales option per ProductStock row, including exact Regular and
+    Restricted availability for the selected branch.
+
+    Restricted quantity is returned only to Admin or users who have permission
+    to view restricted stock.
+    """
+    branch = _resolve_sales_branch(branch_id)
+
+    if not branch:
         return []
+
+    restricted_allowed = can_view_restricted(user)
+
     stocks = (
-        ProductStock.objects.select_related("product", "variant", "branch")
-        .filter(branch_id=branch_id, product__is_active=True)
-        .order_by("product__product_name", "variant_id")
+        ProductStock.objects.select_related(
+            "product",
+            "variant",
+            "branch",
+        )
+        .filter(
+            branch=branch,
+            product__is_active=True,
+        )
+        .order_by(
+            "product__product_name",
+            "variant_id",
+        )
     )
+
     rows = []
+
     for stock in stocks:
         product = stock.product
+
         if getattr(product, "is_deleted", False):
             continue
-        available = stock.current_stock - stock.reserved_stock - stock.damaged_stock
-        if available <= 0:
+
+        regular_available = max(
+            0,
+            int(
+                getattr(
+                    stock,
+                    "available_regular_quantity",
+                    0,
+                )
+                or 0
+            ),
+        )
+
+        restricted_available = (
+            max(
+                0,
+                int(
+                    getattr(
+                        stock,
+                        "available_restricted_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            if restricted_allowed
+            else 0
+        )
+
+        total_available = regular_available + restricted_available
+
+        if total_available <= 0:
             continue
+
         variant = stock.variant
         price_variant = variant
+
         if price_variant is None:
             price_variant = product.variants.filter(
-                is_base=True, is_active=True
+                is_base=True,
+                is_active=True,
             ).first()
+
         if price_variant is None:
             price_variant = (
-                product.variants.filter(is_active=True).order_by("id").first()
+                product.variants.filter(
+                    is_active=True,
+                )
+                .order_by("id")
+                .first()
             )
 
-        price = getattr(price_variant, "retail_price", None)
+        price = getattr(
+            price_variant,
+            "retail_price",
+            None,
+        )
+
         if price in (None, 0):
-            price = getattr(product, "selling_price", 0) or 0
+            price = (
+                getattr(
+                    product,
+                    "selling_price",
+                    0,
+                )
+                or 0
+            )
 
         rows.append(
             {
+                "option_key": (f"{product.id}:{stock.variant_id or ''}"),
                 "stock_id": stock.id,
+                "branch_id": branch.id,
+                "branch_code": branch.branch_code,
                 "id": product.id,
                 "product_id": product.id,
                 "variant_id": stock.variant_id,
                 "product_name": product.product_name,
                 "name": product.product_name,
-                "sku": getattr(product, "sku", ""),
-                "barcode": getattr(product, "barcode", ""),
-                "description": getattr(product, "description", ""),
+                "sku": getattr(
+                    product,
+                    "sku",
+                    "",
+                ),
+                "barcode": getattr(
+                    product,
+                    "barcode",
+                    "",
+                ),
+                "description": getattr(
+                    product,
+                    "description",
+                    "",
+                ),
                 "selling_price": price,
                 "retail_price": price,
                 "unit_price": price,
                 "price": price,
-                "available_stock": available,
-                "variant_name": str(variant) if variant else "",
+                "regular_quantity": int(
+                    getattr(
+                        stock,
+                        "regular_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                "restricted_quantity": (
+                    int(
+                        getattr(
+                            stock,
+                            "restricted_quantity",
+                            0,
+                        )
+                        or 0
+                    )
+                    if restricted_allowed
+                    else 0
+                ),
+                "available_regular_quantity": (regular_available),
+                "available_restricted_quantity": (restricted_available),
+                "available_stock": (total_available),
+                "restricted_allowed": (restricted_allowed),
+                "variant_name": (str(variant) if variant else ""),
+                "vat_percentage": getattr(
+                    product,
+                    "vat_percentage",
+                    5,
+                )
+                or 5,
+                "vat_rate": getattr(
+                    product,
+                    "vat_percentage",
+                    5,
+                )
+                or 5,
+                "tax_treatment": getattr(
+                    product,
+                    "tax_treatment",
+                    "STANDARD_VAT",
+                )
+                or "STANDARD_VAT",
+                "vat_inclusive": bool(
+                    getattr(
+                        product,
+                        "vat_inclusive",
+                        False,
+                    )
+                ),
             }
         )
+
     return rows
 
 
@@ -188,7 +354,10 @@ class QuotationViewSet(Base):
                     )
                 ],
                 "salespeople": _salespeople_options(),
-                "products": _sales_product_options(branch_id),
+                "products": _sales_product_options(
+                    branch_id,
+                    request.user,
+                ),
             }
         )
 
@@ -630,13 +799,35 @@ class SalesOrderViewSet(Base):
                 ],
                 "stock": [
                     {
+                        "stock_id": stock.id,
                         "product_id": stock.product_id,
                         "variant_id": stock.variant_id,
                         "branch_id": stock.branch_id,
+                        "available_regular_quantity": max(
+                            0,
+                            int(stock.available_regular_quantity or 0),
+                        ),
+                        "available_restricted_quantity": (
+                            max(
+                                0,
+                                int(stock.available_restricted_quantity or 0),
+                            )
+                            if can_view_restricted(request.user)
+                            else 0
+                        ),
                         "available_stock": (
-                            stock.current_stock
-                            - stock.reserved_stock
-                            - stock.damaged_stock
+                            max(
+                                0,
+                                int(stock.available_regular_quantity or 0),
+                            )
+                            + (
+                                max(
+                                    0,
+                                    int(stock.available_restricted_quantity or 0),
+                                )
+                                if can_view_restricted(request.user)
+                                else 0
+                            )
                         ),
                     }
                     for stock in stocks
@@ -1038,7 +1229,10 @@ class SalesInvoiceViewSet(Base):
                     for customer in customers
                 ],
                 "salespeople": salespeople,
-                "products": _sales_product_options(branch_id),
+                "products": _sales_product_options(
+                    branch_id,
+                    request.user,
+                ),
                 "sales_orders": [
                     {
                         "id": order.id,
@@ -1378,7 +1572,10 @@ class POSSaleViewSet(Base):
                     }
                     for user in cashiers
                 ],
-                "products": _sales_product_options(branch_id),
+                "products": _sales_product_options(
+                    branch_id,
+                    request.user,
+                ),
                 "stock": [
                     {
                         "product_id": stock.product_id,
@@ -1973,53 +2170,84 @@ class SalesPaymentViewSet(Base):
             .order_by("-invoice_date", "-id")
         )
         bank_accounts = BankAccount.objects.filter(is_active=True)
-        cash_registers = CashRegister.objects.filter(is_active=True)
 
-        if branch_id:
-            invoices = invoices.filter(branch_id=branch_id)
+        # CashRegister has a `status` field, not `is_active`.
+        cash_registers = CashRegister.objects.filter(status__iexact="OPEN").order_by(
+            "-register_date",
+            "-id",
+        )
 
-            bank_fields = {field.name for field in BankAccount._meta.get_fields()}
-            register_fields = {field.name for field in CashRegister._meta.get_fields()}
+        branch = _resolve_sales_branch(branch_id)
 
-            if "branch" in bank_fields:
-                bank_accounts = bank_accounts.filter(branch_id=branch_id)
-            if "branch" in register_fields:
-                cash_registers = cash_registers.filter(branch_id=branch_id)
+        if branch:
+            invoices = invoices.filter(branch=branch)
+            bank_accounts = bank_accounts.filter(branch=branch)
+            cash_registers = cash_registers.filter(branch=branch)
+
+        invoice_options = []
+
+        for invoice in invoices:
+            balance_due = Decimal(str(invoice.balance_due or 0))
+
+            if balance_due <= Decimal("0.00"):
+                continue
+
+            invoice_options.append(
+                {
+                    "id": invoice.id,
+                    "invoice_number": (invoice.invoice_number),
+                    "customer_id": (invoice.customer_id),
+                    "customer_name": (
+                        invoice.customer.customer_name if invoice.customer else ""
+                    ),
+                    "branch_id": (invoice.branch_id),
+                    "branch_code": (
+                        invoice.branch.branch_code if invoice.branch else ""
+                    ),
+                    "currency": (invoice.currency or "AED"),
+                    "invoice_total": (invoice.total_amount or 0),
+                    "paid_amount": (invoice.paid_amount or 0),
+                    "balance_due": balance_due,
+                    "payment_status": (invoice.payment_status),
+                    "label": (
+                        f"{invoice.invoice_number} · "
+                        f"{invoice.customer.customer_name if invoice.customer else 'Walk-in Customer'} · "
+                        f"AED {balance_due:.2f}"
+                    ),
+                }
+            )
 
         return Response(
             {
-                "invoices": [
-                    {
-                        "id": invoice.id,
-                        "invoice_number": invoice.invoice_number,
-                        "customer_name": (
-                            invoice.customer.customer_name if invoice.customer else ""
-                        ),
-                    }
-                    for invoice in invoices
-                ],
-                "bank_accounts": [
-                    {
-                        "id": account.id,
-                        "account_name": getattr(
-                            account,
-                            "account_name",
-                            str(account),
-                        ),
-                    }
-                    for account in bank_accounts
-                ],
-                "cash_registers": [
-                    {
-                        "id": register.id,
-                        "name": getattr(
-                            register,
-                            "name",
-                            str(register),
-                        ),
-                    }
-                    for register in cash_registers
-                ],
+                "success": True,
+                "message": ("Payment form options loaded."),
+                "data": {
+                    "invoices": invoice_options,
+                    "bank_accounts": [
+                        {
+                            "id": account.id,
+                            "account_name": (account.account_name),
+                            "bank_name": (account.bank_name),
+                            "account_number": (account.account_number),
+                            "current_balance": (account.current_balance),
+                            "label": (
+                                f"{account.account_name} · " f"{account.bank_name}"
+                            ),
+                        }
+                        for account in bank_accounts
+                    ],
+                    "cash_registers": [
+                        {
+                            "id": register.id,
+                            "name": (f"Cash Register · " f"{register.register_date}"),
+                            "register_date": (register.register_date),
+                            "status": (register.status),
+                            "opening_balance": (register.opening_balance),
+                            "label": (f"Cash Register · " f"{register.register_date}"),
+                        }
+                        for register in cash_registers
+                    ],
+                },
             }
         )
 

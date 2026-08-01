@@ -16,7 +16,8 @@ class BranchAware(models.Model):
         ("STANDARD_VAT", "Standard VAT"),
         ("ZERO_RATED", "Zero Rated"),
         ("EXEMPT", "Exempt"),
-        ("NON_TAXABLE", "Non Taxable"),
+        ("OUT_OF_SCOPE", "Out of Scope"),
+        ("REVERSE_CHARGE", "Reverse Charge"),
     ]
     tax_treatment = models.CharField(
         max_length=30, choices=TAX_TREATMENTS, default="STANDARD_VAT"
@@ -467,7 +468,8 @@ class SalesLineBase(models.Model):
         ("STANDARD_VAT", "Standard VAT"),
         ("ZERO_RATED", "Zero Rated"),
         ("EXEMPT", "Exempt"),
-        ("NON_TAXABLE", "Non Taxable"),
+        ("OUT_OF_SCOPE", "Out of Scope"),
+        ("REVERSE_CHARGE", "Reverse Charge"),
     ]
     STOCK_CLASSIFICATIONS = [
         ("REGULAR", "Regular"),

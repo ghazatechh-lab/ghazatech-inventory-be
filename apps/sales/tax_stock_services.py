@@ -5,7 +5,13 @@ from apps.audit_logs.services import create_immutable_audit
 from apps.common.sensitive_permissions import has_sensitive_permission
 from apps.inventory.classified_stock import adjust_classified_stock
 
-TAX_TREATMENTS = {"STANDARD_VAT", "ZERO_RATED", "EXEMPT", "NON_TAXABLE"}
+TAX_TREATMENTS = {
+    "STANDARD_VAT",
+    "ZERO_RATED",
+    "EXEMPT",
+    "OUT_OF_SCOPE",
+    "REVERSE_CHARGE",
+}
 
 
 def calculate_sales_line(

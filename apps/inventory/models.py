@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.core.validators import MinValueValidator
 from django.db import models
 
@@ -221,6 +223,26 @@ class ProductStock(TimeStampedModel):
     reorder_level = models.PositiveIntegerField(default=0)
     last_stock_update = models.DateTimeField(auto_now=True)
 
+    # VAT-aware inventory valuation. Recoverable VAT is excluded from carrying
+    # value; non-recoverable VAT is capitalized into inventory cost.
+    average_unit_cost_excluding_vat = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    recoverable_vat_per_unit = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    capitalized_vat_per_unit = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    average_unit_cost = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    last_purchase_cost_excluding_vat = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    last_purchase_cost = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    last_tax_treatment = models.CharField(max_length=30, default="OUT_OF_SCOPE")
+    last_vat_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    valuation_updated_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = [
             "product__product_name",
@@ -388,6 +410,40 @@ class ProductStock(TimeStampedModel):
 
         super().save(*args, **kwargs)
 
+    @property
+    def inventory_value_excluding_vat(self):
+        return Decimal(self.total_quantity) * Decimal(
+            self.average_unit_cost_excluding_vat or 0
+        )
+
+    @property
+    def recoverable_vat_value(self):
+        return Decimal(self.total_quantity) * Decimal(
+            self.recoverable_vat_per_unit or 0
+        )
+
+    @property
+    def capitalized_vat_value(self):
+        return Decimal(self.total_quantity) * Decimal(
+            self.capitalized_vat_per_unit or 0
+        )
+
+    @property
+    def total_inventory_value(self):
+        return Decimal(self.total_quantity) * Decimal(self.average_unit_cost or 0)
+
+    @property
+    def regular_stock_value(self):
+        return Decimal(self.regular_quantity or 0) * Decimal(
+            self.average_unit_cost or 0
+        )
+
+    @property
+    def restricted_stock_value(self):
+        return Decimal(self.restricted_quantity or 0) * Decimal(
+            self.average_unit_cost or 0
+        )
+
     def __str__(self):
         item = str(self.variant) if self.variant_id else self.product.product_name
 
@@ -470,6 +526,33 @@ class StockMovement(TimeStampedModel):
         on_delete=models.SET_NULL,
         related_name="stock_movements",
     )
+    quantity_before = models.IntegerField(default=0)
+    quantity_after = models.IntegerField(default=0)
+    unit_cost_excluding_vat = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    vat_treatment = models.CharField(max_length=30, default="OUT_OF_SCOPE")
+    vat_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    recoverable_vat_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0
+    )
+    non_recoverable_vat_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0
+    )
+    capitalized_unit_cost = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    net_value_change = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    gross_value_change = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    running_stock_value = models.DecimalField(
+        max_digits=16, decimal_places=2, default=0
+    )
+    source_document_type = models.CharField(max_length=80, blank=True)
+    source_document_number = models.CharField(max_length=100, blank=True)
+    tax_invoice_number = models.CharField(max_length=100, blank=True)
+    tax_invoice_date = models.DateField(null=True, blank=True)
+    is_vat_relevant = models.BooleanField(default=False)
+    valuation_method = models.CharField(max_length=20, default="WEIGHTED_AVERAGE")
 
     class Meta:
         ordering = ["-created_at"]
@@ -534,6 +617,42 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         choices=STATUS,
         default="DRAFT",
     )
+    adjustment_reason = models.CharField(max_length=40, default="OTHER")
+    stock_classification = models.CharField(
+        max_length=20,
+        choices=[("REGULAR", "Regular"), ("RESTRICTED", "Restricted")],
+        default="REGULAR",
+    )
+    quantity_difference = models.IntegerField(default=0)
+    unit_cost_excluding_vat = models.DecimalField(
+        max_digits=14, decimal_places=4, default=0
+    )
+    vat_treatment = models.CharField(max_length=30, default="OUT_OF_SCOPE")
+    vat_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    recoverable_vat_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0
+    )
+    non_recoverable_vat_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0
+    )
+    capitalized_adjustment_value = models.DecimalField(
+        max_digits=16, decimal_places=2, default=0
+    )
+    value_before = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    value_after = models.DecimalField(max_digits=16, decimal_places=2, default=0)
+    accounting_reference = models.CharField(max_length=100, blank=True)
+    approval_notes = models.TextField(blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="rejected_adjustments",
+    )
+    rejection_reason = models.TextField(blank=True)
 
     class Meta:
         ordering = ["-created_at"]

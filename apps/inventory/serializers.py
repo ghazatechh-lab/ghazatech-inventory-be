@@ -775,6 +775,24 @@ class ProductStockSerializer(serializers.ModelSerializer):
     available_regular_quantity = serializers.SerializerMethodField()
     available_restricted_quantity = serializers.SerializerMethodField()
     total_available_quantity = serializers.SerializerMethodField()
+    inventory_value_excluding_vat = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
+    recoverable_vat_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
+    capitalized_vat_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
+    total_inventory_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
+    regular_stock_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
+    restricted_stock_value = serializers.DecimalField(
+        max_digits=18, decimal_places=2, read_only=True
+    )
 
     product_name = serializers.CharField(
         source="product.product_name",
@@ -886,6 +904,7 @@ class StockMovementSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     performed_by_name = serializers.SerializerMethodField()
+    vat_treatment_display = serializers.SerializerMethodField()
 
     class Meta:
         model = StockMovement
@@ -893,6 +912,9 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
     def get_variant_label(self, obj):
         return variant_label(obj.variant)
+
+    def get_vat_treatment_display(self, obj):
+        return str(obj.vat_treatment or "OUT_OF_SCOPE").replace("_", " ").title()
 
     def get_performed_by_name(self, obj):
         if not obj.performed_by:
@@ -939,54 +961,158 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         source="created_at",
         read_only=True,
     )
+    vat_treatment_display = serializers.SerializerMethodField()
+    adjustment_reason_display = serializers.SerializerMethodField()
 
     class Meta:
         model = StockAdjustment
-        fields = "__all__"
-        read_only_fields = [
+        fields = [
+            "id",
             "adjustment_number",
+            "branch",
+            "branch_name",
+            "branch_code",
+            "product",
+            "product_name",
+            "sku",
+            "variant",
+            "variant_label",
+            "adjusted_at",
+            "vat_treatment_display",
+            "adjustment_reason_display",
+            "stock_classification",
             "adjustment_type",
             "quantity",
-            "current_quantity",
+            "signed_quantity",
+            "reason",
+            "remarks",
             "status",
             "approved_by",
+            "approved_by_name",
+            "current_quantity",
+            "actual_quantity_counted",
+            "quantity_difference",
+            "unit_cost_excluding_vat",
+            "vat_treatment",
+            "vat_percentage",
+            "recoverable_vat_amount",
+            "non_recoverable_vat_amount",
+            "capitalized_adjustment_value",
+            "value_before",
+            "value_after",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "updated_by",
+        ]
+        read_only_fields = [
+            "adjustment_number",
+            "branch_name",
+            "branch_code",
+            "product_name",
+            "sku",
+            "variant_label",
+            "adjusted_at",
+            "vat_treatment_display",
+            "adjustment_reason_display",
+            "signed_quantity",
+            "status",
+            "approved_by",
+            "approved_by_name",
+            "current_quantity",
+            "actual_quantity_counted",
+            "quantity_difference",
+            "unit_cost_excluding_vat",
+            "vat_treatment",
+            "vat_percentage",
+            "recoverable_vat_amount",
+            "non_recoverable_vat_amount",
+            "capitalized_adjustment_value",
+            "value_before",
+            "value_after",
             "created_at",
             "updated_at",
             "created_by",
             "updated_by",
         ]
 
-    def get_variant_label(self, obj):
-        return variant_label(obj.variant)
-
-    def get_approved_by_name(self, obj):
-        user = obj.approved_by or obj.created_by
-        if not user:
-            return None
-        return (
-            getattr(user, "full_name", None)
-            or getattr(user, "email", None)
-            or getattr(user, "username", None)
-            or str(user)
-        )
-
     def validate(self, attrs):
         product = attrs.get("product")
         variant = attrs.get("variant")
-        actual_quantity = attrs.get("actual_quantity_counted")
-        if actual_quantity is None:
-            raise serializers.ValidationError(
-                {"actual_quantity_counted": "Actual quantity counted is required."}
-            )
+        adjustment_type = str(attrs.get("adjustment_type") or "").strip().upper()
+        quantity = attrs.get("quantity")
+        classification = (
+            str(attrs.get("stock_classification") or "REGULAR").strip().upper()
+        )
 
         if variant and product and variant.product_id != product.id:
             raise serializers.ValidationError(
-                {"variant": ("Selected variant does not " "belong to the product.")}
+                {"variant": ("Selected variant does not belong to the product.")}
             )
 
         if product and product.has_variants and not variant:
             raise serializers.ValidationError(
-                {"variant": ("Select an attribute combination " "for this product.")}
+                {"variant": ("Select an attribute combination for this product.")}
             )
 
+        if adjustment_type not in {"ADD", "DEDUCT"}:
+            raise serializers.ValidationError(
+                {"adjustment_type": ("Select Increase or Decrease.")}
+            )
+
+        if quantity is None or int(quantity) <= 0:
+            raise serializers.ValidationError(
+                {"quantity": ("Quantity must be greater than zero.")}
+            )
+
+        if classification not in {
+            "REGULAR",
+            "RESTRICTED",
+        }:
+            raise serializers.ValidationError(
+                {"stock_classification": ("Select Regular or Restricted stock.")}
+            )
+
+        attrs["adjustment_type"] = adjustment_type
+        attrs["stock_classification"] = classification
         return attrs
+
+    def get_variant_label(self, obj):
+        return variant_label(obj.variant) if obj.variant_id else ""
+
+    def get_approved_by_name(self, obj):
+        user = getattr(obj, "approved_by", None)
+        if not user:
+            return ""
+
+        full_name = ""
+        if hasattr(user, "get_full_name"):
+            full_name = user.get_full_name() or ""
+
+        return full_name or getattr(user, "username", "") or getattr(user, "email", "")
+
+    def get_vat_treatment_display(self, obj):
+        display_method = getattr(
+            obj,
+            "get_vat_treatment_display",
+            None,
+        )
+
+        if callable(display_method):
+            return display_method()
+
+        return str(getattr(obj, "vat_treatment", "") or "").replace("_", " ").title()
+
+    def get_adjustment_reason_display(self, obj):
+        display_method = getattr(
+            obj,
+            "get_adjustment_reason_display",
+            None,
+        )
+
+        if callable(display_method):
+            return display_method()
+
+        return (
+            str(getattr(obj, "adjustment_reason", "") or "").replace("_", " ").title()
+        )

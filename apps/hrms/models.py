@@ -609,10 +609,25 @@ class PayrollRun(TimeStampedModel):
         ("FAILED", "Failed"),
         ("CANCELLED", "Cancelled"),
     ]
+
+    SALARY_TYPE_CHOICES = [
+        ("REGULAR", "Regular Salary"),
+        ("ADVANCE", "Advance Salary"),
+    ]
+
     period = models.CharField(
-        max_length=20,
+        max_length=7,
         null=True,
         blank=True,
+    )
+    payroll_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+    salary_type = models.CharField(
+        max_length=20,
+        choices=SALARY_TYPE_CHOICES,
+        default="REGULAR",
     )
     branch = models.ForeignKey(
         "branches.Branch",
@@ -620,6 +635,13 @@ class PayrollRun(TimeStampedModel):
         blank=True,
         on_delete=models.PROTECT,
         related_name="payroll_runs",
+    )
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="paid_payroll_runs",
     )
     status = models.CharField(
         max_length=20,
@@ -635,7 +657,10 @@ class PayrollRun(TimeStampedModel):
         on_delete=models.SET_NULL,
         related_name="generated_payroll_runs",
     )
-    generated_at = models.DateTimeField(null=True, blank=True)
+    generated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
     total_gross = models.DecimalField(
         max_digits=16,
         decimal_places=2,
@@ -650,6 +675,11 @@ class PayrollRun(TimeStampedModel):
         blank=True,
         default=0,
     )
+    total_advance_deduction = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        default=0,
+    )
     total_net = models.DecimalField(
         max_digits=16,
         decimal_places=2,
@@ -659,7 +689,14 @@ class PayrollRun(TimeStampedModel):
     )
 
     class Meta:
-        ordering = ["-period", "-id"]
+        ordering = [
+            "-payroll_date",
+            "-period",
+            "-id",
+        ]
+
+    def __str__(self):
+        return (f"{self.get_salary_type_display()} " f"{self.period or ''}").strip()
 
 
 class PayrollEntry(TimeStampedModel):
@@ -670,6 +707,18 @@ class PayrollEntry(TimeStampedModel):
         ("FAILED", "Failed"),
         ("CANCELLED", "Cancelled"),
     ]
+
+    SALARY_TYPE_CHOICES = [
+        ("REGULAR", "Regular Salary"),
+        ("ADVANCE", "Advance Salary"),
+    ]
+
+    CALCULATION_METHOD_CHOICES = [
+        ("FULL", "Full Salary"),
+        ("PRORATED", "Prorated Salary"),
+        ("ADVANCE", "Advance Salary"),
+    ]
+
     payroll_run = models.ForeignKey(
         PayrollRun,
         null=True,
@@ -692,9 +741,25 @@ class PayrollEntry(TimeStampedModel):
         related_name="payroll_entries",
     )
     period = models.CharField(
-        max_length=20,
+        max_length=7,
         null=True,
         blank=True,
+    )
+    payroll_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+    salary_type = models.CharField(
+        max_length=20,
+        choices=SALARY_TYPE_CHOICES,
+        default="REGULAR",
+    )
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="paid_payroll_entries",
     )
     basic_salary = models.DecimalField(
         max_digits=14,
@@ -724,11 +789,26 @@ class PayrollEntry(TimeStampedModel):
         blank=True,
         default=0,
     )
+    advance_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+    advance_deduction = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
     net_salary = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         null=True,
         blank=True,
+        default=0,
+    )
+    balance_payable = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
         default=0,
     )
     status = models.CharField(
@@ -738,24 +818,52 @@ class PayrollEntry(TimeStampedModel):
         blank=True,
         default="PENDING",
     )
-    paid_at = models.DateTimeField(null=True, blank=True)
-
-    # Payroll proration fields.  These allow HR to pay only the days that are
-    # payable in a month, for example when an employee has approved unpaid
-    # leave. Existing payroll records default to a full 30-day month.
-    total_period_days = models.DecimalField(max_digits=6, decimal_places=2, default=30)
-    payable_days = models.DecimalField(max_digits=6, decimal_places=2, default=30)
-    unpaid_leave_days = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    paid_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    total_period_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=30,
+    )
+    payable_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=30,
+    )
+    unpaid_leave_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+    )
     salary_calculation_method = models.CharField(
         max_length=20,
-        choices=[("FULL", "Full Salary"), ("PRORATED", "Prorated by Payable Days")],
+        choices=CALCULATION_METHOD_CHOICES,
         default="FULL",
     )
 
     class Meta:
-        ordering = ["employee__first_name"]
+        ordering = [
+            "-payroll_date",
+            "employee__first_name",
+        ]
         constraints = [
             models.UniqueConstraint(
-                fields=["employee", "period"], name="unique_employee_payroll_period"
-            )
+                fields=[
+                    "employee",
+                    "period",
+                ],
+                condition=models.Q(
+                    salary_type="REGULAR",
+                ),
+                name=("unique_regular_employee_" "payroll_period"),
+            ),
         ]
+
+    def __str__(self):
+        return (
+            f"{self.employee} - "
+            f"{self.get_salary_type_display()} - "
+            f"{self.period}"
+        )

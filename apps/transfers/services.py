@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
@@ -75,6 +77,10 @@ def dispatch(t, u):
             reference_type="Transfer",
             reference_id=t.id,
             remarks=f"Transfer {t.transfer_number} to {t.to_branch.branch_code}",
+            stock_classification=item.stock_classification,
+            unit_cost=item.transfer_unit_cost,
+            vat_treatment="OUT_OF_SCOPE",
+            source_document_number=t.transfer_number,
         )
         if not item.variant_id and variant:
             item.variant = variant
@@ -84,7 +90,16 @@ def dispatch(t, u):
     t.status = "IN_TRANSIT"
     t.dispatched_by = u
     t.dispatch_date = timezone.localdate()
-    t.save(update_fields=["status", "dispatched_by", "dispatch_date", "updated_at"])
+    t.dispatched_at = timezone.now()
+    t.save(
+        update_fields=[
+            "status",
+            "dispatched_by",
+            "dispatch_date",
+            "dispatched_at",
+            "updated_at",
+        ]
+    )
     return t
 
 
@@ -110,12 +125,40 @@ def receive(t, u):
             reference_type="Transfer",
             reference_id=t.id,
             remarks=f"Transfer {t.transfer_number} from {t.from_branch.branch_code}",
+            stock_classification=item.stock_classification,
+            unit_cost=item.transfer_unit_cost,
+            vat_treatment="OUT_OF_SCOPE",
+            source_document_number=t.transfer_number,
         )
         item.received_quantity = quantity
-        item.save(update_fields=["received_quantity"])
+        item.destination_value = Decimal(quantity) * Decimal(
+            item.transfer_unit_cost or 0
+        )
+        item.value_difference = item.destination_value - Decimal(item.source_value or 0)
+        item.save(
+            update_fields=["received_quantity", "destination_value", "value_difference"]
+        )
 
     t.status = "RECEIVED"
     t.received_by = u
     t.received_date = timezone.localdate()
-    t.save(update_fields=["status", "received_by", "received_date", "updated_at"])
+    t.received_at = timezone.now()
+    destination_value = sum(
+        (Decimal(item.destination_value or 0) for item in t.items.all()), Decimal("0")
+    )
+    t.destination_stock_value = destination_value
+    t.value_difference = destination_value - Decimal(t.source_stock_value or 0)
+    t.reconciliation_status = "MATCHED" if t.value_difference == 0 else "VARIANCE"
+    t.save(
+        update_fields=[
+            "status",
+            "received_by",
+            "received_date",
+            "received_at",
+            "destination_stock_value",
+            "value_difference",
+            "reconciliation_status",
+            "updated_at",
+        ]
+    )
     return t

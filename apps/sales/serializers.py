@@ -5,6 +5,12 @@ from django.utils import timezone
 from rest_framework import serializers
 from .models import *
 from apps.inventory.models import ProductStock, StockMovement
+from apps.common.sensitive_permissions import has_sensitive_permission
+from apps.sales.tax_stock_services import (
+    calculate_sales_line,
+    deduct_sales_item,
+    validate_tax_and_classification,
+)
 
 
 def calc(item, q="quantity"):
@@ -15,6 +21,120 @@ def calc(item, q="quantity"):
     return base, base * vat / Decimal("100"), base + (base * vat / Decimal("100"))
 
 
+class SalesTaxLineSerializerMixin:
+    """
+    Shared VAT and stock-classification validation for quotation, invoice,
+    POS and credit-note lines.
+
+    `tax_inclusive` is accepted only as a temporary calculation input. It is
+    removed before the model row is created because inclusiveness belongs to
+    the parent sales document.
+    """
+
+    tax_inclusive = serializers.BooleanField(
+        write_only=True,
+        required=False,
+        default=False,
+    )
+
+    def _request_user(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        user = self._request_user()
+        treatment = str(attrs.get("tax_treatment") or "STANDARD_VAT").strip().upper()
+        classification = (
+            str(attrs.get("stock_classification") or "REGULAR").strip().upper()
+        )
+        reason = str(attrs.get("tax_reason") or "").strip()
+
+        try:
+            validate_tax_and_classification(
+                user,
+                treatment,
+                classification,
+                reason,
+            )
+        except PermissionError as exc:
+            raise serializers.ValidationError({"tax_treatment": str(exc)}) from exc
+        except ValueError as exc:
+            raise serializers.ValidationError({"tax_treatment": str(exc)}) from exc
+
+        tax_rate = Decimal(
+            str(
+                attrs.get(
+                    "tax_rate",
+                    attrs.get("vat_percentage", 5),
+                )
+                or 0
+            )
+        )
+
+        if treatment != "STANDARD_VAT":
+            tax_rate = Decimal("0.00")
+
+        attrs["tax_treatment"] = treatment
+        attrs["stock_classification"] = classification
+        attrs["tax_reason"] = reason
+        attrs["tax_rate"] = tax_rate
+        attrs["vat_percentage"] = tax_rate
+
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        user = self._request_user()
+
+        can_view_sensitive_tax = has_sensitive_permission(
+            user,
+            "view_non_standard_tax_sale",
+        )
+        can_view_restricted = has_sensitive_permission(
+            user,
+            "view_restricted_stock",
+        )
+
+        if not can_view_sensitive_tax:
+            data.pop("tax_reason", None)
+
+        if not can_view_restricted:
+            data.pop("stock_classification", None)
+
+        return data
+
+
+def calculate_serialized_sales_line(
+    item,
+    *,
+    quantity_key="quantity",
+):
+    values = calculate_sales_line(
+        quantity=item.get(quantity_key, 0),
+        unit_price=item.get("unit_price", 0),
+        discount=item.get("discount_amount", 0),
+        tax_treatment=item.get(
+            "tax_treatment",
+            "STANDARD_VAT",
+        ),
+        tax_rate=item.get(
+            "tax_rate",
+            item.get("vat_percentage", 5),
+        ),
+        tax_inclusive=bool(item.get("tax_inclusive", False)),
+    )
+
+    return {
+        "subtotal": values["taxable_amount"],
+        "vat_amount": values["tax_amount"],
+        "taxable_amount": values["taxable_amount"],
+        "tax_amount": values["tax_amount"],
+        "line_total": values["line_total"],
+    }
+
+
 class LineSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.product_name", read_only=True)
 
@@ -22,7 +142,7 @@ class LineSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class QuotationItemSerializer(serializers.ModelSerializer):
+class QuotationItemSerializer(SalesTaxLineSerializerMixin, serializers.ModelSerializer):
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -42,6 +162,8 @@ class QuotationItemSerializer(serializers.ModelSerializer):
         exclude = ["quotation"]
 
         read_only_fields = [
+            "taxable_amount",
+            "tax_amount",
             "line_total",
         ]
 
@@ -116,20 +238,10 @@ class QuotationSerializer(serializers.ModelSerializer):
         return f"{prefix}-{count + 1:04d}"
 
     def _calculate_line(self, item):
-        quantity = Decimal(str(item.get("quantity", 0) or 0))
-
-        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
-
-        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
-
-        subtotal = quantity * unit_price
-        vat_amount = subtotal * vat_percentage / Decimal("100")
-
-        return {
-            "subtotal": subtotal,
-            "vat_amount": vat_amount,
-            "line_total": subtotal + vat_amount,
-        }
+        return calculate_serialized_sales_line(
+            item,
+            quantity_key="quantity",
+        )
 
     def validate(self, attrs):
         quote_date = attrs.get(
@@ -208,9 +320,12 @@ class QuotationSerializer(serializers.ModelSerializer):
             item.pop("id", None)
 
             calculated = self._calculate_line(item)
+            item.pop("tax_inclusive", None)
 
             QuotationItem.objects.create(
                 quotation=quotation,
+                taxable_amount=calculated["taxable_amount"],
+                tax_amount=calculated["tax_amount"],
                 line_total=calculated["line_total"],
                 **item,
             )
@@ -382,7 +497,14 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
         if not stock:
             return 0
 
-        return stock.current_stock - stock.reserved_stock - stock.damaged_stock
+        classification = (
+            str(item.get("stock_classification") or "REGULAR").strip().upper()
+        )
+
+        if classification == "RESTRICTED":
+            return Decimal(str(stock.available_restricted_quantity))
+
+        return Decimal(str(stock.available_regular_quantity))
 
 
 class SalesOrderSerializer(serializers.ModelSerializer):
@@ -454,20 +576,10 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         return f"{prefix}-{count + 1:04d}"
 
     def _calculate_line(self, item):
-        quantity = Decimal(str(item.get("quantity", 0) or 0))
-
-        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
-
-        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
-
-        subtotal = quantity * unit_price
-        vat_amount = subtotal * vat_percentage / Decimal("100")
-
-        return {
-            "subtotal": subtotal,
-            "vat_amount": vat_amount,
-            "line_total": subtotal + vat_amount,
-        }
+        return calculate_serialized_sales_line(
+            item,
+            quantity_key="quantity",
+        )
 
     def _available_stock(self, branch, item):
         stock = ProductStock.objects.filter(
@@ -704,7 +816,9 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         return instance
 
 
-class SalesInvoiceItemSerializer(serializers.ModelSerializer):
+class SalesInvoiceItemSerializer(
+    SalesTaxLineSerializerMixin, serializers.ModelSerializer
+):
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -782,6 +896,11 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         read_only_fields = [
             "invoice_number",
+            "subtotal",
+            "vat_amount",
+            "total_amount",
+            "balance_due",
+            "payment_status",
             "issued_at",
             "paid_at",
             "voided_at",
@@ -832,20 +951,10 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         return f"{prefix}-{count + 1:04d}"
 
     def _calculate_line(self, item):
-        quantity = Decimal(str(item.get("quantity", 0) or 0))
-
-        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
-
-        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
-
-        subtotal = quantity * unit_price
-        vat_amount = subtotal * vat_percentage / Decimal("100")
-
-        return {
-            "subtotal": subtotal,
-            "vat_amount": vat_amount,
-            "line_total": subtotal + vat_amount,
-        }
+        return calculate_serialized_sales_line(
+            item,
+            quantity_key="quantity",
+        )
 
     def validate(self, attrs):
         branch = attrs.get(
@@ -1032,11 +1141,13 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             else "PARTIALLY_PAID" if paid_amount > 0 else "UNPAID"
         )
 
+        money_precision = Decimal("0.01")
+
         return (
-            subtotal,
-            vat_amount,
-            total,
-            balance,
+            subtotal.quantize(money_precision),
+            vat_amount.quantize(money_precision),
+            total.quantize(money_precision),
+            balance.quantize(money_precision),
             payment_status,
         )
 
@@ -1046,9 +1157,12 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         for item in items:
             item.pop("id", None)
             values = self._calculate_line(item)
+            item.pop("tax_inclusive", None)
 
             SalesInvoiceItem.objects.create(
                 invoice=invoice,
+                taxable_amount=values["taxable_amount"],
+                tax_amount=values["tax_amount"],
                 line_total=values["line_total"],
                 **item,
             )
@@ -1133,7 +1247,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         return instance
 
 
-class POSSaleItemSerializer(LineSerializer):
+class POSSaleItemSerializer(SalesTaxLineSerializerMixin, LineSerializer):
     class Meta:
         model = POSSaleItem
         exclude = ["sale"]
@@ -1197,20 +1311,10 @@ class POSSaleSerializer(serializers.ModelSerializer):
         return f"{prefix}-{count + 1:04d}"
 
     def _calculate_line(self, item):
-        quantity = Decimal(str(item.get("quantity", 0) or 0))
-
-        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
-
-        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
-
-        subtotal = quantity * unit_price
-        vat_amount = subtotal * vat_percentage / Decimal("100")
-
-        return {
-            "subtotal": subtotal,
-            "vat_amount": vat_amount,
-            "line_total": subtotal + vat_amount,
-        }
+        return calculate_serialized_sales_line(
+            item,
+            quantity_key="quantity",
+        )
 
     def _available_stock(self, branch, item):
         stock = ProductStock.objects.filter(
@@ -1344,47 +1448,30 @@ class POSSaleSerializer(serializers.ModelSerializer):
         for item in items:
             item.pop("id", None)
             values = self._calculate_line(item)
+            item.pop("tax_inclusive", None)
 
             POSSaleItem.objects.create(
                 sale=sale,
+                taxable_amount=values["taxable_amount"],
+                tax_amount=values["tax_amount"],
                 line_total=values["line_total"],
                 **item,
             )
 
     def _deduct_stock(self, sale):
+        request = self.context.get("request")
+
         for item in sale.items.select_related(
             "product",
             "variant",
         ):
-            stock = ProductStock.objects.select_for_update().get(
-                product=item.product,
-                variant=item.variant,
+            deduct_sales_item(
+                item=item,
                 branch=sale.branch,
-            )
-
-            previous_stock = stock.current_stock
-            stock.current_stock = stock.current_stock - item.quantity
-
-            stock.save(
-                update_fields=[
-                    "current_stock",
-                    "updated_at",
-                ]
-            )
-
-            StockMovement.objects.create(
-                movement_number=(f"MOV-{sale.receipt_number}-{item.id}"),
-                product=item.product,
-                variant=item.variant,
-                branch=sale.branch,
-                movement_type="SALE",
-                quantity=-item.quantity,
-                previous_stock=previous_stock,
-                new_stock=stock.current_stock,
+                user=sale.cashier,
                 reference_type="POS_SALE",
-                reference_id=str(sale.id),
-                remarks=(f"POS sale {sale.receipt_number}"),
-                performed_by=sale.cashier,
+                reference_id=sale.id,
+                request=request,
             )
 
     @transaction.atomic
@@ -1435,7 +1522,9 @@ class POSSaleSerializer(serializers.ModelSerializer):
         )
 
 
-class SalesCreditNoteItemSerializer(serializers.ModelSerializer):
+class SalesCreditNoteItemSerializer(
+    SalesTaxLineSerializerMixin, serializers.ModelSerializer
+):
     product_name = serializers.CharField(
         source="product.product_name",
         read_only=True,
@@ -1518,6 +1607,13 @@ class SalesCreditNoteSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
         read_only_fields = [
+            "credit_note_number",
+            "customer",
+            "branch",
+            "currency",
+            "subtotal",
+            "vat_amount",
+            "total_amount",
             "issued_at",
             "voided_at",
             "created_at",
@@ -1547,20 +1643,30 @@ class SalesCreditNoteSerializer(serializers.ModelSerializer):
         return f"{prefix}-{count + 1:04d}"
 
     def _calculate_line(self, item):
-        quantity = Decimal(str(item.get("credit_quantity", 0) or 0))
+        invoice_item = item.get("invoice_item")
 
-        unit_price = Decimal(str(item.get("unit_price", 0) or 0))
+        if invoice_item:
+            item = {
+                **item,
+                "unit_price": invoice_item.unit_price,
+                "vat_percentage": invoice_item.vat_percentage,
+                "tax_rate": invoice_item.tax_rate,
+                "tax_treatment": invoice_item.tax_treatment,
+                "tax_reason": invoice_item.tax_reason,
+                "stock_classification": invoice_item.stock_classification,
+                "tax_inclusive": bool(
+                    getattr(
+                        invoice_item.invoice,
+                        "tax_inclusive",
+                        False,
+                    )
+                ),
+            }
 
-        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
-
-        subtotal = quantity * unit_price
-        vat_amount = subtotal * vat_percentage / Decimal("100")
-
-        return {
-            "subtotal": subtotal,
-            "vat_amount": vat_amount,
-            "line_total": subtotal + vat_amount,
-        }
+        return calculate_serialized_sales_line(
+            item,
+            quantity_key="credit_quantity",
+        )
 
     def validate(self, attrs):
         invoice = attrs.get(
@@ -1692,8 +1798,6 @@ class SalesCreditNoteSerializer(serializers.ModelSerializer):
 
         for item in items:
             item.pop("id", None)
-            values = self._calculate_line(item)
-
             invoice_item = item.get("invoice_item")
 
             item.setdefault(
@@ -1721,13 +1825,26 @@ class SalesCreditNoteSerializer(serializers.ModelSerializer):
                 invoice_item.unit_price,
             )
 
-            item.setdefault(
-                "vat_percentage",
-                invoice_item.vat_percentage,
+            item["vat_percentage"] = invoice_item.vat_percentage
+            item["tax_rate"] = invoice_item.tax_rate
+            item["tax_treatment"] = invoice_item.tax_treatment
+            item["tax_reason"] = invoice_item.tax_reason
+            item["stock_classification"] = invoice_item.stock_classification
+            item["tax_inclusive"] = bool(
+                getattr(
+                    invoice_item.invoice,
+                    "tax_inclusive",
+                    False,
+                )
             )
+
+            values = self._calculate_line(item)
+            item.pop("tax_inclusive", None)
 
             SalesCreditNoteItem.objects.create(
                 credit_note=credit_note,
+                taxable_amount=values["taxable_amount"],
+                tax_amount=values["tax_amount"],
                 line_total=values["line_total"],
                 **item,
             )
@@ -2004,6 +2121,10 @@ class SalesPaymentSerializer(serializers.ModelSerializer):
         model = SalesPayment
         fields = "__all__"
         read_only_fields = [
+            "payment_number",
+            "customer",
+            "branch",
+            "currency",
             "cleared_at",
             "reversed_at",
             "created_at",

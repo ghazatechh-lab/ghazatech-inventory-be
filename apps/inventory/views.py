@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from collections import defaultdict
 
 from django.db import transaction
@@ -17,6 +19,7 @@ from .models import (
     Brand,
     Category,
     Product,
+    ProductVariant,
     ProductStock,
     Rack,
     StockAdjustment,
@@ -34,6 +37,7 @@ from .serializers import (
 )
 from .services import adjust_stock
 from .permissions import ReferenceDataPermission
+from rest_framework import status
 
 
 class BrandViewSet(ModelViewSet):
@@ -239,6 +243,15 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "total_reserved_restricted": 0,
                     "total_available_regular": 0,
                     "total_available_restricted": 0,
+                    "inventory_value_excluding_vat": 0,
+                    "recoverable_vat_value": 0,
+                    "capitalized_vat_value": 0,
+                    "total_inventory_value": 0,
+                    "regular_stock_value": 0,
+                    "restricted_stock_value": 0,
+                    "average_unit_cost": 0,
+                    "vat_treatment": stock.last_tax_treatment,
+                    "vat_percentage": stock.last_vat_percentage,
                 }
 
             available = stock.available_stock
@@ -285,6 +298,18 @@ class StockViewSet(ReadOnlyModelViewSet):
                     ),
                     "damaged_stock": stock.damaged_stock,
                     "available_stock": available,
+                    "average_unit_cost_excluding_vat": stock.average_unit_cost_excluding_vat,
+                    "recoverable_vat_per_unit": stock.recoverable_vat_per_unit,
+                    "capitalized_vat_per_unit": stock.capitalized_vat_per_unit,
+                    "average_unit_cost": stock.average_unit_cost,
+                    "inventory_value_excluding_vat": stock.inventory_value_excluding_vat,
+                    "recoverable_vat_value": stock.recoverable_vat_value,
+                    "capitalized_vat_value": stock.capitalized_vat_value,
+                    "total_inventory_value": stock.total_inventory_value,
+                    "regular_stock_value": stock.regular_stock_value,
+                    "restricted_stock_value": stock.restricted_stock_value,
+                    "vat_treatment": stock.last_tax_treatment,
+                    "vat_percentage": stock.last_vat_percentage,
                 }
             )
             group["total_current"] += stock.current_stock
@@ -311,6 +336,17 @@ class StockViewSet(ReadOnlyModelViewSet):
             )
             group["total_damaged"] += stock.damaged_stock
             group["total_available"] += available
+            group["inventory_value_excluding_vat"] += float(
+                stock.inventory_value_excluding_vat
+            )
+            group["recoverable_vat_value"] += float(stock.recoverable_vat_value)
+            group["capitalized_vat_value"] += float(stock.capitalized_vat_value)
+            group["total_inventory_value"] += float(stock.total_inventory_value)
+            group["regular_stock_value"] += float(stock.regular_stock_value)
+            group["restricted_stock_value"] += float(stock.restricted_stock_value)
+            group["average_unit_cost"] = float(stock.average_unit_cost or 0)
+            group["vat_treatment"] = stock.last_tax_treatment
+            group["vat_percentage"] = float(stock.last_vat_percentage or 0)
             group["reorder_level"] = max(group["reorder_level"], stock.reorder_level)
 
         results = []
@@ -375,6 +411,154 @@ class StockViewSet(ReadOnlyModelViewSet):
             ).data
         )
 
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="adjustment-options",
+    )
+    def adjustment_options(self, request):
+        branch_id = request.query_params.get("branch")
+        product_id = request.query_params.get("product")
+        variant_id = request.query_params.get("variant")
+
+        errors = {}
+
+        if not branch_id:
+            errors["branch"] = ["Branch is required."]
+
+        if not product_id:
+            errors["product"] = ["Product is required."]
+
+        if errors:
+            return Response(
+                errors,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            product = Product.objects.get(
+                pk=product_id,
+                is_deleted=False,
+            )
+        except Product.DoesNotExist:
+            return Response(
+                {"product": ["Selected product was not found."]},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        variant = None
+
+        if product.has_variants:
+            if not variant_id:
+                return Response(
+                    {"variant": ["Select an attribute for this product."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            try:
+                variant = ProductVariant.objects.get(
+                    pk=variant_id,
+                    product=product,
+                    is_active=True,
+                )
+            except ProductVariant.DoesNotExist:
+                return Response(
+                    {
+                        "variant": [
+                            "Selected attribute does not belong " "to this product."
+                        ]
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        stock = (
+            ProductStock.objects.select_related(
+                "product",
+                "variant",
+                "branch",
+            )
+            .filter(
+                branch_id=branch_id,
+                product=product,
+                variant=variant,
+            )
+            .first()
+        )
+
+        regular_quantity = int(getattr(stock, "regular_quantity", 0) or 0)
+        reserved_regular_quantity = int(
+            getattr(stock, "reserved_regular_quantity", 0) or 0
+        )
+        available_regular_quantity = max(
+            0,
+            regular_quantity - reserved_regular_quantity,
+        )
+
+        from apps.common.sensitive_permissions import (
+            can_view_restricted,
+        )
+
+        restricted_allowed = can_view_restricted(request.user)
+
+        restricted_quantity = (
+            int(
+                getattr(
+                    stock,
+                    "restricted_quantity",
+                    0,
+                )
+                or 0
+            )
+            if restricted_allowed
+            else 0
+        )
+
+        reserved_restricted_quantity = (
+            int(
+                getattr(
+                    stock,
+                    "reserved_restricted_quantity",
+                    0,
+                )
+                or 0
+            )
+            if restricted_allowed
+            else 0
+        )
+
+        available_restricted_quantity = max(
+            0,
+            restricted_quantity - reserved_restricted_quantity,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Stock adjustment options loaded."),
+                "data": {
+                    "stock_id": (stock.id if stock else None),
+                    "product": product.id,
+                    "product_name": product.product_name,
+                    "sku": product.sku,
+                    "variant": (variant.id if variant else None),
+                    "variant_label": (variant_label(variant) if variant else ""),
+                    "regular_quantity": regular_quantity,
+                    "reserved_regular_quantity": (reserved_regular_quantity),
+                    "available_regular_quantity": (available_regular_quantity),
+                    "restricted_quantity": (restricted_quantity),
+                    "reserved_restricted_quantity": (reserved_restricted_quantity),
+                    "available_restricted_quantity": (available_restricted_quantity),
+                    "restricted_allowed": (restricted_allowed),
+                    "average_unit_cost_excluding_vat": (
+                        str(stock.average_unit_cost_excluding_vat or 0)
+                        if stock
+                        else "0.0000"
+                    ),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 class StockMovementViewSet(ReadOnlyModelViewSet):
     queryset = StockMovement.objects.select_related(
@@ -389,6 +573,9 @@ class StockMovementViewSet(ReadOnlyModelViewSet):
         "product",
         "variant",
         "movement_type",
+        "stock_classification",
+        "vat_treatment",
+        "is_vat_relevant",
     ]
     search_fields = [
         "movement_number",
@@ -401,6 +588,9 @@ class StockMovementViewSet(ReadOnlyModelViewSet):
     ordering_fields = [
         "created_at",
         "quantity",
+        "net_value_change",
+        "running_stock_value",
+        "vat_percentage",
     ]
     ordering = ["-created_at"]
 
@@ -420,6 +610,7 @@ class StockAdjustmentViewSet(ModelViewSet):
         "product",
         "variant",
         "adjustment_type",
+        "stock_classification",
     ]
     search_fields = [
         "adjustment_number",
@@ -434,37 +625,96 @@ class StockAdjustmentViewSet(ModelViewSet):
         branch = serializer.validated_data.get("branch") or getattr(
             user, "branch", None
         )
+
         if not branch:
             raise ValidationError(
-                {"branch": "Branch is required for a stock adjustment."}
+                {"branch": ("Branch is required for a stock adjustment.")}
             )
 
         product = serializer.validated_data["product"]
         variant = serializer.validated_data.get("variant")
+        adjustment_type = serializer.validated_data["adjustment_type"]
+        quantity = int(serializer.validated_data["quantity"])
+        classification = str(
+            serializer.validated_data.get(
+                "stock_classification",
+                "REGULAR",
+            )
+        ).upper()
+
         stock, _ = ProductStock.objects.select_for_update().get_or_create(
             product=product,
             variant=variant,
             branch=branch,
-            defaults={"current_stock": 0},
+            defaults={
+                "current_stock": 0,
+                "regular_quantity": 0,
+                "restricted_quantity": 0,
+                "reserved_regular_quantity": 0,
+                "reserved_restricted_quantity": 0,
+            },
         )
-        current_quantity = stock.current_stock
-        actual_quantity = serializer.validated_data["actual_quantity_counted"]
-        difference = actual_quantity - current_quantity
-        if difference == 0:
+
+        current_quantity = (
+            int(stock.restricted_quantity or 0)
+            if classification == "RESTRICTED"
+            else int(stock.regular_quantity or 0)
+        )
+
+        available_quantity = (
+            int(stock.available_restricted_quantity)
+            if classification == "RESTRICTED"
+            else int(stock.available_regular_quantity)
+        )
+
+        if adjustment_type == "DEDUCT" and current_quantity <= 0:
             raise ValidationError(
                 {
-                    "actual_quantity_counted": "Actual quantity is already equal to current quantity."
+                    "quantity": (
+                        f"No {classification.lower()} stock is available "
+                        "for this product and attribute."
+                    )
                 }
             )
 
+        if adjustment_type == "DEDUCT" and quantity > available_quantity:
+            raise ValidationError(
+                {
+                    "quantity": (
+                        f"Only {available_quantity} "
+                        f"{classification.lower()} units are available."
+                    )
+                }
+            )
+
+        signed_quantity = quantity if adjustment_type == "ADD" else -quantity
+        actual_quantity = current_quantity + signed_quantity
+
+        unit_cost_excluding_vat = Decimal(
+            str(
+                stock.average_unit_cost_excluding_vat
+                or stock.last_purchase_cost_excluding_vat
+                or 0
+            )
+        )
+        capitalized_unit_cost = Decimal(
+            str(stock.average_unit_cost or unit_cost_excluding_vat or 0)
+        )
+
         adjustment_number = f"SA-{timezone.now():%Y%m%d%H%M%S%f}"
+
         adjustment = serializer.save(
             adjustment_number=adjustment_number,
             branch=branch,
             current_quantity=current_quantity,
             actual_quantity_counted=actual_quantity,
-            adjustment_type="ADD" if difference > 0 else "DEDUCT",
-            quantity=abs(difference),
+            quantity_difference=signed_quantity,
+            unit_cost_excluding_vat=(unit_cost_excluding_vat),
+            vat_treatment="OUT_OF_SCOPE",
+            vat_percentage=Decimal("0.00"),
+            value_before=(Decimal(current_quantity) * capitalized_unit_cost),
+            value_after=(Decimal(actual_quantity) * capitalized_unit_cost),
+            capitalized_adjustment_value=(Decimal(quantity) * capitalized_unit_cost),
             status="APPROVED",
             approved_by=user,
             created_by=user,
@@ -475,12 +725,17 @@ class StockAdjustmentViewSet(ModelViewSet):
             product=product,
             variant=variant,
             branch=branch,
-            quantity=difference,
+            quantity=signed_quantity,
             movement_type="ADJUSTMENT",
             performed_by=user,
             reference_type="STOCK_ADJUSTMENT",
             reference_id=adjustment.id,
-            remarks=(f"{adjustment.reason}. {adjustment.remarks}").strip(),
+            remarks=(f"{adjustment.reason}. " f"{adjustment.remarks}").strip(),
+            stock_classification=classification,
+            unit_cost=unit_cost_excluding_vat,
+            vat_percentage=Decimal("0.00"),
+            vat_treatment="OUT_OF_SCOPE",
+            vat_recoverable=False,
         )
 
 
