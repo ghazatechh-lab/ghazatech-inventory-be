@@ -601,6 +601,106 @@ class SalaryRevision(TimeStampedModel):
         return (self.basic_salary or 0) + (self.allowances or 0)
 
 
+class SalaryAdvance(TimeStampedModel):
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("PAID", "Paid"),
+        ("CANCELLED", "Cancelled"),
+        ("DEDUCTED", "Deducted"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name="salary_advances",
+    )
+    branch = models.ForeignKey(
+        "branches.Branch",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="salary_advances",
+    )
+    SALARY_TYPE_CHOICES = [
+        ("REGULAR", "Regular Salary"),
+        ("ADVANCE", "Legacy Advance Salary"),
+    ]
+
+    period = models.CharField(
+        max_length=7,
+        help_text="Payroll period in YYYY-MM format.",
+    )
+    advance_date = models.DateField()
+    salary_at_time = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+    remaining_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+    paid_by = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+    )
+    reference_number = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+    notes = models.TextField(
+        blank=True,
+        default="",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="PAID",
+    )
+    deducted_payroll_entry = models.ForeignKey(
+        "PayrollEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="deducted_salary_advances",
+    )
+
+    class Meta:
+        ordering = ["-advance_date", "-id"]
+        indexes = [
+            models.Index(
+                fields=["employee", "period", "status"],
+                name="hrms_adv_emp_period_status",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.branch_id and self.employee_id:
+            self.branch_id = self.employee.branch_id
+
+        if not self.salary_at_time:
+            self.salary_at_time = (
+                getattr(self.employee, "total_salary", None)
+                or getattr(self.employee, "basic_salary", 0)
+                or 0
+            )
+
+        if self._state.adding and not self.remaining_amount:
+            self.remaining_amount = self.amount
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.employee.full_name} - " f"{self.period} - {self.amount}"
+
+
 class PayrollRun(TimeStampedModel):
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
@@ -636,18 +736,14 @@ class PayrollRun(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="payroll_runs",
     )
-    paid_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        null=True,
+    paid_by = models.CharField(
+        max_length=255,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="paid_payroll_runs",
+        default="",
     )
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        null=True,
-        blank=True,
         default="DRAFT",
     )
     generated_by = models.ForeignKey(
@@ -664,15 +760,11 @@ class PayrollRun(TimeStampedModel):
     total_gross = models.DecimalField(
         max_digits=16,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     total_deductions = models.DecimalField(
         max_digits=16,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     total_advance_deduction = models.DecimalField(
@@ -683,20 +775,14 @@ class PayrollRun(TimeStampedModel):
     total_net = models.DecimalField(
         max_digits=16,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
 
     class Meta:
-        ordering = [
-            "-payroll_date",
-            "-period",
-            "-id",
-        ]
+        ordering = ["-payroll_date", "-period", "-id"]
 
     def __str__(self):
-        return (f"{self.get_salary_type_display()} " f"{self.period or ''}").strip()
+        return f"Payroll {self.period or ''}".strip()
 
 
 class PayrollEntry(TimeStampedModel):
@@ -710,13 +796,12 @@ class PayrollEntry(TimeStampedModel):
 
     SALARY_TYPE_CHOICES = [
         ("REGULAR", "Regular Salary"),
-        ("ADVANCE", "Advance Salary"),
+        ("ADVANCE", "Legacy Advance Salary"),
     ]
 
     CALCULATION_METHOD_CHOICES = [
         ("FULL", "Full Salary"),
         ("PRORATED", "Prorated Salary"),
-        ("ADVANCE", "Advance Salary"),
     ]
 
     payroll_run = models.ForeignKey(
@@ -728,10 +813,10 @@ class PayrollEntry(TimeStampedModel):
     )
     employee = models.ForeignKey(
         Employee,
-        null=True,
-        blank=True,
         on_delete=models.PROTECT,
         related_name="payroll_entries",
+        null=True,
+        blank=True,
     )
     branch = models.ForeignKey(
         "branches.Branch",
@@ -740,53 +825,36 @@ class PayrollEntry(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="payroll_entries",
     )
-    period = models.CharField(
-        max_length=7,
-        null=True,
-        blank=True,
-    )
-    payroll_date = models.DateField(
-        null=True,
-        blank=True,
-    )
+    period = models.CharField(max_length=7, null=True, blank=True)
+    payroll_date = models.DateField(null=True, blank=True)
     salary_type = models.CharField(
         max_length=20,
         choices=SALARY_TYPE_CHOICES,
         default="REGULAR",
     )
-    paid_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        null=True,
+    paid_by = models.CharField(
+        max_length=255,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="paid_payroll_entries",
+        default="",
     )
     basic_salary = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     allowances = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     gross_salary = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     deductions = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     advance_amount = models.DecimalField(
@@ -802,8 +870,6 @@ class PayrollEntry(TimeStampedModel):
     net_salary = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        null=True,
-        blank=True,
         default=0,
     )
     balance_payable = models.DecimalField(
@@ -814,8 +880,6 @@ class PayrollEntry(TimeStampedModel):
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        null=True,
-        blank=True,
         default="PENDING",
     )
     paid_at = models.DateTimeField(
@@ -844,26 +908,14 @@ class PayrollEntry(TimeStampedModel):
     )
 
     class Meta:
-        ordering = [
-            "-payroll_date",
-            "employee__first_name",
-        ]
+        ordering = ["-payroll_date", "employee__first_name"]
         constraints = [
             models.UniqueConstraint(
-                fields=[
-                    "employee",
-                    "period",
-                ],
-                condition=models.Q(
-                    salary_type="REGULAR",
-                ),
-                name=("unique_regular_employee_" "payroll_period"),
+                fields=["employee", "period"],
+                condition=models.Q(salary_type="REGULAR"),
+                name="unique_regular_payroll_employee_period",
             ),
         ]
 
     def __str__(self):
-        return (
-            f"{self.employee} - "
-            f"{self.get_salary_type_display()} - "
-            f"{self.period}"
-        )
+        return f"{self.employee.full_name} - {self.period}"

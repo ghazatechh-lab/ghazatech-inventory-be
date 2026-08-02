@@ -15,6 +15,7 @@ router.register("leaves", LeaveRequestViewSet, basename="leave-request")
 router.register("salary-revisions", SalaryRevisionViewSet, basename="salary-revision")
 router.register("payroll-runs", PayrollRunViewSet, basename="payroll-run")
 router.register("payroll", PayrollEntryViewSet, basename="payroll-entry")
+router.register("salary-advances", SalaryAdvanceViewSet, basename="salary-advance")
 router.register("document-expiry", DocumentExpiryViewSet, basename="document-expiry")
 router.register("reports", HRMSReportViewSet, basename="hrms-report")
 

@@ -7,6 +7,25 @@ from rest_framework import serializers
 
 from .models import *
 
+import calendar
+import re
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
+
+MONEY = Decimal("0.01")
+
+
+def payroll_period_dates(period):
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(period or "")):
+        raise serializers.ValidationError("Period must use YYYY-MM format.")
+
+    year, month = [int(value) for value in period.split("-")]
+
+    return (
+        date(year, month, 1),
+        date(year, month, calendar.monthrange(year, month)[1]),
+    )
+
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
@@ -564,7 +583,7 @@ class SalaryRevisionSerializer(serializers.ModelSerializer):
         return revision
 
 
-class PayrollEntrySerializer(serializers.ModelSerializer):
+class SalaryAdvanceSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(
         source="employee.full_name",
         read_only=True,
@@ -573,10 +592,98 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         source="employee.employee_code",
         read_only=True,
     )
-    employee_joining_date = serializers.DateField(
-        source="employee.joining_date",
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
         read_only=True,
         allow_null=True,
+    )
+
+    class Meta:
+        model = SalaryAdvance
+        fields = "__all__"
+        read_only_fields = [
+            "branch",
+            "salary_at_time",
+            "remaining_amount",
+            "deducted_payroll_entry",
+        ]
+
+    def validate_period(self, value):
+        payroll_period_dates(value)
+        return value
+
+    def validate(self, attrs):
+        employee = attrs.get(
+            "employee",
+            getattr(self.instance, "employee", None),
+        )
+        period = attrs.get(
+            "period",
+            getattr(self.instance, "period", None),
+        )
+        amount = Decimal(
+            str(
+                attrs.get(
+                    "amount",
+                    getattr(self.instance, "amount", 0),
+                )
+                or 0
+            )
+        ).quantize(MONEY)
+
+        if not employee:
+            raise serializers.ValidationError({"employee": "Employee is required."})
+
+        if amount <= 0:
+            raise serializers.ValidationError(
+                {"amount": "Advance amount must be greater than zero."}
+            )
+
+        salary = Decimal(
+            str(
+                getattr(employee, "total_salary", None)
+                or getattr(employee, "basic_salary", 0)
+                or 0
+            )
+        ).quantize(MONEY)
+
+        if salary <= 0:
+            raise serializers.ValidationError(
+                {
+                    "employee": (
+                        "The selected employee does not have " "a configured salary."
+                    )
+                }
+            )
+
+        if amount > salary:
+            raise serializers.ValidationError(
+                {
+                    "amount": (
+                        "Advance salary cannot exceed the "
+                        "employee's current monthly salary."
+                    )
+                }
+            )
+
+        attrs["salary_at_time"] = salary
+        attrs["branch"] = employee.branch
+        attrs.setdefault("status", "PAID")
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["remaining_amount"] = validated_data["amount"]
+        return super().create(validated_data)
+
+
+class PayrollEntrySerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(
+        source="employee.full_name",
+        read_only=True,
+    )
+    employee_code = serializers.CharField(
+        source="employee.employee_code",
+        read_only=True,
     )
     branch_name = serializers.CharField(
         source="branch.branch_name",
@@ -587,11 +694,10 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         source="get_status_display",
         read_only=True,
     )
-    salary_type_display = serializers.CharField(
-        source="get_salary_type_display",
+    paid_by_name = serializers.CharField(
+        source="paid_by",
         read_only=True,
     )
-    paid_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = PayrollEntry
@@ -599,6 +705,8 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         read_only_fields = [
             "payroll_run",
             "branch",
+            "basic_salary",
+            "allowances",
             "gross_salary",
             "advance_deduction",
             "net_salary",
@@ -606,470 +714,28 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
             "paid_at",
         ]
 
-    def get_paid_by_name(self, obj):
-        if not obj.paid_by:
-            return ""
-
-        return obj.paid_by.get_full_name() or obj.paid_by.username or obj.paid_by.email
-
-    def validate_period(self, value):
-        import re
-
-        period = str(value or "").strip()
-
-        if not re.fullmatch(
-            r"\d{4}-(0[1-9]|1[0-2])",
-            period,
-        ):
-            raise serializers.ValidationError("Period must use YYYY-MM format.")
-
-        return period
-
-    @staticmethod
-    def _period_dates(period):
-        import calendar
-        from datetime import date
-
-        year, month = [int(part) for part in str(period).split("-")]
-
-        month_start = date(
-            year,
-            month,
-            1,
-        )
-        month_end = date(
-            year,
-            month,
-            calendar.monthrange(
-                year,
-                month,
-            )[1],
-        )
-
-        return (
-            month_start,
-            month_end,
-        )
-
-    @staticmethod
-    def _approved_unpaid_leave_days(
-        employee,
-        month_start,
-        month_end,
-        employment_start,
-    ):
-        total = Decimal("0")
-
-        leaves = LeaveRequest.objects.filter(
-            employee=employee,
-            status="APPROVED",
-            leave_type__is_paid=False,
-            from_date__lte=month_end,
-            to_date__gte=employment_start,
-        )
-
-        for leave in leaves:
-            start = max(
-                leave.from_date,
-                employment_start,
-            )
-            end = min(
-                leave.to_date,
-                month_end,
-            )
-
-            if end >= start:
-                total += Decimal((end - start).days + 1)
-
-        return total
-
-    def validate(self, attrs):
-        employee = attrs.get(
-            "employee",
-            getattr(
-                self.instance,
-                "employee",
-                None,
-            ),
-        )
-        period = attrs.get(
-            "period",
-            getattr(
-                self.instance,
-                "period",
-                None,
-            ),
-        )
-        salary_type = str(
-            attrs.get(
-                "salary_type",
-                getattr(
-                    self.instance,
-                    "salary_type",
-                    "REGULAR",
-                ),
-            )
-            or "REGULAR"
-        ).upper()
-        payroll_date = attrs.get(
-            "payroll_date",
-            getattr(
-                self.instance,
-                "payroll_date",
-                None,
-            ),
-        )
-        paid_by = attrs.get(
-            "paid_by",
-            getattr(
-                self.instance,
-                "paid_by",
-                None,
-            ),
-        )
-
-        errors = {}
-
-        if not employee:
-            errors["employee"] = "Employee is required."
-
-        if salary_type not in {
-            "REGULAR",
-            "ADVANCE",
-        }:
-            errors["salary_type"] = "Select Regular Salary or " "Advance Salary."
-
-        if not payroll_date:
-            errors["payroll_date"] = "Payroll Date is required."
-
-        if not paid_by:
-            errors["paid_by"] = "Paid By is required."
-
-        month_start = None
-        month_end = None
-
-        if period:
-            try:
-                month_start, month_end = self._period_dates(period)
-            except (
-                TypeError,
-                ValueError,
-            ):
-                errors["period"] = "Period must use YYYY-MM format."
-
-        if (
-            payroll_date
-            and month_start
-            and (payroll_date < month_start or payroll_date > month_end)
-        ):
-            errors["payroll_date"] = (
-                "Payroll Date must be within " "the selected payroll month."
-            )
-
-        if month_start and month_start > timezone.localdate().replace(day=1):
-            errors["period"] = "Future payroll periods are " "not allowed."
-
-        if (
-            employee
-            and month_start
-            and employee.joining_date
-            and month_end < employee.joining_date
-        ):
-            errors["period"] = (
-                "Payroll period cannot be " "before the employee joining date."
-            )
-
-        if employee and period and salary_type == "REGULAR":
-            duplicate = PayrollEntry.objects.filter(
-                employee=employee,
-                period=period,
-                salary_type="REGULAR",
-            )
-
-            if self.instance:
-                duplicate = duplicate.exclude(pk=self.instance.pk)
-
-            if duplicate.exists():
-                errors["period"] = (
-                    "A regular salary record "
-                    "already exists for this "
-                    "employee and period."
-                )
-
-        if errors:
-            raise serializers.ValidationError(errors)
-
-        attrs["salary_type"] = salary_type
-        attrs["branch"] = employee.branch
-
-        if salary_type == "ADVANCE":
-            advance_amount = Decimal(
-                str(
-                    attrs.get(
-                        "advance_amount",
-                        getattr(
-                            self.instance,
-                            "advance_amount",
-                            0,
-                        ),
-                    )
-                    or 0
-                )
-            ).quantize(Decimal("0.01"))
-
-            if advance_amount <= 0:
-                raise serializers.ValidationError(
-                    {"advance_amount": ("Advance amount must be " "greater than zero.")}
-                )
-
-            attrs.update(
-                {
-                    "basic_salary": Decimal("0.00"),
-                    "allowances": Decimal("0.00"),
-                    "gross_salary": (advance_amount),
-                    "deductions": Decimal("0.00"),
-                    "advance_amount": (advance_amount),
-                    "advance_deduction": (Decimal("0.00")),
-                    "net_salary": (advance_amount),
-                    "balance_payable": (advance_amount),
-                    "total_period_days": (Decimal("0.00")),
-                    "payable_days": (Decimal("0.00")),
-                    "unpaid_leave_days": (Decimal("0.00")),
-                    "salary_calculation_method": ("ADVANCE"),
-                }
-            )
-
-            return attrs
-
-        total_days = Decimal(str((month_end - month_start).days + 1))
-
-        employment_start = max(
-            month_start,
-            employee.joining_date or month_start,
-        )
-
-        employment_days = Decimal(str((month_end - employment_start).days + 1))
-
-        unpaid_leave_days = self._approved_unpaid_leave_days(
-            employee,
-            month_start,
-            month_end,
-            employment_start,
-        )
-
-        default_payable_days = max(
-            Decimal("0.00"),
-            employment_days - unpaid_leave_days,
-        )
-
-        requested_payable_days = attrs.get(
-            "payable_days",
-            None,
-        )
-
-        payable_days = (
-            Decimal(str(requested_payable_days))
-            if requested_payable_days
-            not in (
-                None,
-                "",
-            )
-            else default_payable_days
-        )
-
-        payable_days = min(
-            payable_days,
-            employment_days,
-        )
-
-        if payable_days < 0:
-            raise serializers.ValidationError(
-                {"payable_days": ("Payable days cannot be " "negative.")}
-            )
-
-        full_basic = Decimal(
-            str(
-                attrs.get(
-                    "basic_salary",
-                    employee.basic_salary or 0,
-                )
-                or 0
-            )
-        )
-        full_allowances = Decimal(
-            str(
-                attrs.get(
-                    "allowances",
-                    employee.allowances or 0,
-                )
-                or 0
-            )
-        )
-        deductions = Decimal(
-            str(
-                attrs.get(
-                    "deductions",
-                    0,
-                )
-                or 0
-            )
-        )
-
-        factor = payable_days / total_days if total_days else Decimal("0.00")
-
-        basic_salary = (full_basic * factor).quantize(Decimal("0.01"))
-        allowances = (full_allowances * factor).quantize(Decimal("0.01"))
-        gross_salary = (basic_salary + allowances).quantize(Decimal("0.01"))
-
-        if deductions < 0:
-            raise serializers.ValidationError(
-                {"deductions": ("Deductions cannot be " "negative.")}
-            )
-
-        if deductions > gross_salary:
-            raise serializers.ValidationError(
-                {"deductions": ("Deductions cannot exceed " "gross salary.")}
-            )
-
-        paid_advances = PayrollEntry.objects.filter(
-            employee=employee,
-            period=period,
-            salary_type="ADVANCE",
-            status="PAID",
-        ).exclude(pk=(self.instance.pk if self.instance else None)).aggregate(
-            total=Sum("advance_amount")
-        )[
-            "total"
-        ] or Decimal(
-            "0.00"
-        )
-
-        available_after_deductions = max(
-            Decimal("0.00"),
-            gross_salary - deductions,
-        )
-        advance_deduction = min(
-            Decimal(str(paid_advances)),
-            available_after_deductions,
-        ).quantize(Decimal("0.01"))
-        balance_payable = max(
-            Decimal("0.00"),
-            available_after_deductions - advance_deduction,
-        ).quantize(Decimal("0.01"))
-
-        attrs.update(
-            {
-                "basic_salary": (basic_salary),
-                "allowances": (allowances),
-                "gross_salary": (gross_salary),
-                "deductions": (deductions),
-                "advance_amount": (Decimal("0.00")),
-                "advance_deduction": (advance_deduction),
-                "net_salary": (balance_payable),
-                "balance_payable": (balance_payable),
-                "total_period_days": (total_days),
-                "payable_days": (payable_days),
-                "unpaid_leave_days": (unpaid_leave_days),
-                "salary_calculation_method": (
-                    "PRORATED" if payable_days < total_days else "FULL"
-                ),
-            }
-        )
-
-        return attrs
-
-    @transaction.atomic
-    def create(self, validated_data):
-        payroll_run = validated_data.pop(
-            "payroll_run",
-            None,
-        )
-
-        if payroll_run:
-            validated_data["payroll_run"] = payroll_run
-
-            validated_data.setdefault(
-                "paid_by",
-                payroll_run.paid_by,
-            )
-
-            validated_data.setdefault(
-                "payroll_date",
-                payroll_run.payroll_date,
-            )
-
-            validated_data.setdefault(
-                "salary_type",
-                payroll_run.salary_type,
-            )
-
-        status_value = str(
-            validated_data.get(
-                "status",
-                "PENDING",
-            )
-            or "PENDING"
-        ).upper()
-
-        validated_data["status"] = status_value
-
-        if status_value == "PAID":
-            validated_data["paid_at"] = validated_data.get("paid_at") or timezone.now()
-
-        return PayrollEntry.objects.create(**validated_data)
-
-    @transaction.atomic
-    def update(
-        self,
-        instance,
-        validated_data,
-    ):
-        validated_data.pop(
-            "payroll_run",
-            None,
-        )
-
-        if (
-            validated_data.get(
-                "status",
-                instance.status,
-            )
-            == "PAID"
-            and not instance.paid_at
-        ):
-            validated_data["paid_at"] = timezone.now()
-
-        return super().update(
-            instance,
-            validated_data,
-        )
-
 
 class PayrollRunSerializer(serializers.ModelSerializer):
     entries = PayrollEntrySerializer(
         many=True,
         read_only=True,
     )
-    paid_by_name = serializers.SerializerMethodField()
-    salary_type_display = serializers.CharField(
-        source="get_salary_type_display",
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
         read_only=True,
+        allow_null=True,
     )
+    generated_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = PayrollRun
         fields = "__all__"
-        read_only_fields = [
-            "generated_by",
-            "generated_at",
-            "total_gross",
-            "total_deductions",
-            "total_advance_deduction",
-            "total_net",
-        ]
 
-    def get_paid_by_name(self, obj):
-        if not obj.paid_by:
+    def get_generated_by_name(self, obj):
+        if not obj.generated_by:
             return ""
-
-        return obj.paid_by.get_full_name() or obj.paid_by.username or obj.paid_by.email
+        return (
+            obj.generated_by.get_full_name()
+            or obj.generated_by.username
+            or obj.generated_by.email
+        )
