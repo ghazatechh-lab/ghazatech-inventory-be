@@ -51,9 +51,13 @@ def validate_tax_and_classification(
         raise ValueError("Invalid tax treatment.")
     non_standard = tax_treatment != "STANDARD_VAT"
     if non_standard and not has_sensitive_permission(
-        user, "create_non_standard_tax_sale"
+        user,
+        "create_non_standard_tax_sale",
     ):
-        raise PermissionError("You cannot create a non-standard-tax sale.")
+        raise PermissionError(
+            "You do not have permission to use Non-VAT "
+            "or non-standard VAT treatment."
+        )
     if stock_classification == "RESTRICTED" and not has_sensitive_permission(
         user, "manage_restricted_stock"
     ):

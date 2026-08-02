@@ -1,17 +1,34 @@
 from pathlib import Path
 from datetime import timedelta
-import environ
-
 from decimal import Decimal
 
+import environ
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-env = environ.Env(DEBUG=(bool, False))
+
+env = environ.Env(
+    DEBUG=(bool, False),
+)
+
 environ.Env.read_env(BASE_DIR / ".env")
 
 
-SECRET_KEY = env("SECRET_KEY", default="unsafe-dev-key")
+SECRET_KEY = env(
+    "SECRET_KEY",
+    default="unsafe-dev-key",
+)
+
 DEBUG = env("DEBUG")
-ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["localhost", "127.0.0.1"])
+
+ALLOWED_HOSTS = env.list(
+    "ALLOWED_HOSTS",
+    default=[
+        "localhost",
+        "127.0.0.1",
+    ],
+)
+
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -40,6 +57,8 @@ INSTALLED_APPS = [
     "apps.audit_logs",
     "apps.reports",
 ]
+
+
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
@@ -52,110 +71,191 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "apps.audit_logs.middleware.AuditMiddleware",
 ]
+
+
 ROOT_URLCONF = "config.urls"
+
+
 TEMPLATES = [
     {
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],
+        "BACKEND": ("django.template.backends." "django.DjangoTemplates"),
+        "DIRS": [
+            BASE_DIR / "templates",
+        ],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
-                "django.template.context_processors.request",
-                "django.contrib.auth.context_processors.auth",
-                "django.contrib.messages.context_processors.messages",
-            ]
+                ("django.template.context_processors." "request"),
+                ("django.contrib.auth.context_processors." "auth"),
+                ("django.contrib.messages.context_processors." "messages"),
+            ],
         },
-    }
+    },
 ]
+
+
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
+
+
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": env("POSTGRES_DB", default="ghaza_inventory_db"),
-        "USER": env("POSTGRES_USER", default="postgres"),
-        "PASSWORD": env("POSTGRES_PASSWORD", default="postgres"),
-        "HOST": env("POSTGRES_HOST", default="localhost"),
-        "PORT": env("POSTGRES_PORT", default="5432"),
-    }
+        "ENGINE": ("django.db.backends.postgresql"),
+        "NAME": env(
+            "POSTGRES_DB",
+            default="ghaza_inventory_db",
+        ),
+        "USER": env(
+            "POSTGRES_USER",
+            default="postgres",
+        ),
+        "PASSWORD": env(
+            "POSTGRES_PASSWORD",
+            default="postgres",
+        ),
+        "HOST": env(
+            "POSTGRES_HOST",
+            default="localhost",
+        ),
+        "PORT": env(
+            "POSTGRES_PORT",
+            default="5432",
+        ),
+    },
 }
+
+
 AUTH_USER_MODEL = "accounts.User"
+
 AUTH_PASSWORD_VALIDATORS = []
+
+
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Dubai"
+
 USE_I18N = True
 USE_TZ = True
+
+
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
 CORS_ALLOW_ALL_ORIGINS = True
+
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication"
+        ("rest_framework_simplejwt." "authentication.JWTAuthentication"),
     ],
-    "DEFAULT_PERMISSION_CLASSES": ["apps.accounts.permissions.RoleOperationPermission"],
-    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_PERMISSION_CLASSES": [
+        ("apps.accounts.permissions." "RoleOperationPermission"),
+        ("apps.common.permissions." "ERPProjectPermission"),
+    ],
+    "DEFAULT_SCHEMA_CLASS": ("drf_spectacular.openapi.AutoSchema"),
     "DEFAULT_FILTER_BACKENDS": [
-        "django_filters.rest_framework.DjangoFilterBackend",
-        "rest_framework.filters.SearchFilter",
-        "rest_framework.filters.OrderingFilter",
+        ("django_filters.rest_framework." "DjangoFilterBackend"),
+        ("rest_framework.filters." "SearchFilter"),
+        ("rest_framework.filters." "OrderingFilter"),
     ],
-    "DEFAULT_PAGINATION_CLASS": "apps.common.pagination.StandardResultsSetPagination",
+    "DEFAULT_PAGINATION_CLASS": (
+        "apps.common.pagination." "StandardResultsSetPagination"
+    ),
     "PAGE_SIZE": 12,
-    "EXCEPTION_HANDLER": "apps.common.exceptions.custom_exception_handler",
+    "EXCEPTION_HANDLER": ("apps.common.exceptions." "custom_exception_handler"),
 }
+
+
+# Keep this False while permission rules are being rolled out.
+# Change to True only after every custom API endpoint has been
+# mapped in apps.common.route_permission_rules or has an explicit
+# permission_map / required_permission on its ViewSet.
+ERP_PERMISSION_STRICT = False
+
+
 SPECTACULAR_SETTINGS = {
-    "TITLE": "Ghaza Computer Inventory API",
-    "DESCRIPTION": "Laptop spare parts inventory, sales, HRMS and finance APIs",
+    "TITLE": ("Ghaza Computer Inventory API"),
+    "DESCRIPTION": ("Laptop spare parts inventory, " "sales, HRMS and finance APIs"),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
 }
+
+
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(
-        minutes=env.int("JWT_ACCESS_TOKEN_LIFETIME", default=60)
+        minutes=env.int(
+            "JWT_ACCESS_TOKEN_LIFETIME",
+            default=60,
+        ),
     ),
     "REFRESH_TOKEN_LIFETIME": timedelta(
-        days=env.int("JWT_REFRESH_TOKEN_LIFETIME", default=7)
+        days=env.int(
+            "JWT_REFRESH_TOKEN_LIFETIME",
+            default=7,
+        ),
     ),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
 }
-CELERY_BROKER_URL = env("REDIS_URL", default="redis://localhost:6379/0")
+
+
+CELERY_BROKER_URL = env(
+    "REDIS_URL",
+    default="redis://localhost:6379/0",
+)
+
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+
 CELERY_BEAT_SCHEDULE = {
     "check-employee-documents-daily": {
-        "task": "apps.hrms.tasks.check_document_expiry",
+        "task": ("apps.hrms.tasks." "check_document_expiry"),
         "schedule": 86400,
-    }
+    },
 }
-DEFAULT_VAT_PERCENTAGE = Decimal(env("DEFAULT_VAT_PERCENTAGE", default="5"))
 
-# Console logging for API requests, serializer validation errors, and exceptions.
+
+DEFAULT_VAT_PERCENTAGE = Decimal(
+    env(
+        "DEFAULT_VAT_PERCENTAGE",
+        default="5",
+    )
+)
+
+
+# Console logging for API requests, serializer validation
+# errors, and exceptions.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": "{asctime} | {levelname} | {name} | {message}",
+            "format": ("{asctime} | {levelname} | " "{name} | {message}"),
             "style": "{",
         },
     },
     "handlers": {
         "console": {
-            "class": "logging.StreamHandler",
+            "class": ("logging.StreamHandler"),
             "formatter": "verbose",
         },
     },
     "loggers": {
         "ghazatech.api": {
-            "handlers": ["console"],
+            "handlers": [
+                "console",
+            ],
             "level": "INFO",
             "propagate": False,
         },
         "django.request": {
-            "handlers": ["console"],
+            "handlers": [
+                "console",
+            ],
             "level": "WARNING",
             "propagate": False,
         },
