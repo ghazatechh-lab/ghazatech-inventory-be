@@ -1037,44 +1037,94 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        product = attrs.get("product")
-        variant = attrs.get("variant")
-        adjustment_type = str(attrs.get("adjustment_type") or "").strip().upper()
-        quantity = attrs.get("quantity")
-        classification = (
-            str(attrs.get("stock_classification") or "REGULAR").strip().upper()
+        instance = self.instance
+
+        product = attrs.get(
+            "product",
+            getattr(instance, "product", None),
         )
+        variant = attrs.get(
+            "variant",
+            getattr(instance, "variant", None),
+        )
+        branch = attrs.get(
+            "branch",
+            getattr(instance, "branch", None),
+        )
+        adjustment_type = (
+            str(
+                attrs.get(
+                    "adjustment_type",
+                    getattr(instance, "adjustment_type", ""),
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+        )
+        quantity = attrs.get(
+            "quantity",
+            getattr(instance, "quantity", None),
+        )
+        classification = (
+            str(
+                attrs.get(
+                    "stock_classification",
+                    getattr(instance, "stock_classification", "REGULAR"),
+                )
+                or "REGULAR"
+            )
+            .strip()
+            .upper()
+        )
+        reason = str(
+            attrs.get(
+                "reason",
+                getattr(instance, "reason", ""),
+            )
+            or ""
+        ).strip()
+
+        errors = {}
+
+        if not branch:
+            errors["branch"] = "Branch is required."
+
+        if not product:
+            errors["product"] = "Product is required."
 
         if variant and product and variant.product_id != product.id:
-            raise serializers.ValidationError(
-                {"variant": ("Selected variant does not belong to the product.")}
-            )
+            errors["variant"] = "Selected variant does not belong to the product."
 
         if product and product.has_variants and not variant:
-            raise serializers.ValidationError(
-                {"variant": ("Select an attribute combination for this product.")}
-            )
+            errors["variant"] = "Select an attribute combination for this product."
 
         if adjustment_type not in {"ADD", "DEDUCT"}:
-            raise serializers.ValidationError(
-                {"adjustment_type": ("Select Increase or Decrease.")}
-            )
+            errors["adjustment_type"] = "Select Increase or Decrease."
 
-        if quantity is None or int(quantity) <= 0:
-            raise serializers.ValidationError(
-                {"quantity": ("Quantity must be greater than zero.")}
-            )
+        try:
+            parsed_quantity = int(quantity)
+        except (TypeError, ValueError):
+            parsed_quantity = 0
+
+        if parsed_quantity <= 0:
+            errors["quantity"] = "Quantity must be greater than zero."
 
         if classification not in {
             "REGULAR",
             "RESTRICTED",
         }:
-            raise serializers.ValidationError(
-                {"stock_classification": ("Select Regular or Restricted stock.")}
-            )
+            errors["stock_classification"] = "Select Regular or Restricted stock."
+
+        if not reason:
+            errors["reason"] = "Reason is required."
+
+        if errors:
+            raise serializers.ValidationError(errors)
 
         attrs["adjustment_type"] = adjustment_type
         attrs["stock_classification"] = classification
+
         return attrs
 
     def get_variant_label(self, obj):
@@ -1082,10 +1132,12 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
 
     def get_approved_by_name(self, obj):
         user = getattr(obj, "approved_by", None)
+
         if not user:
             return ""
 
         full_name = ""
+
         if hasattr(user, "get_full_name"):
             full_name = user.get_full_name() or ""
 

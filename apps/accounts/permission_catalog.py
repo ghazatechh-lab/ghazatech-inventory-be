@@ -3,7 +3,7 @@ PERMISSION_GROUPS = [
         "module": "dashboard",
         "label": "Dashboard",
         "resources": [
-            {"resource": "dashboard", "label": "Dashboard", "actions": ["view"]},
+            {"resource": "dashboard", "label": "Dashboard", "actions": ["view"]}
         ],
     },
     {
@@ -49,6 +49,16 @@ PERMISSION_GROUPS = [
                 "resource": "transfers",
                 "label": "Stock Transfers",
                 "actions": ["view", "create", "edit", "approve", "cancel"],
+            },
+            {
+                "resource": "stock_classification",
+                "label": "Stock Classification",
+                "actions": ["view", "assign", "change"],
+            },
+            {
+                "resource": "restricted_stock",
+                "label": "Restricted Stock",
+                "actions": ["view", "manage", "sell", "purchase", "transfer", "adjust"],
             },
         ],
     },
@@ -148,6 +158,36 @@ PERMISSION_GROUPS = [
         ],
     },
     {
+        "module": "purchases",
+        "label": "Purchase Special Access",
+        "resources": [
+            {
+                "resource": "stock_purchase",
+                "label": "Stock Purchase Controls",
+                "actions": ["regular", "restricted", "vat", "non_vat"],
+            },
+            {
+                "resource": "vat",
+                "label": "Purchase VAT",
+                "actions": [
+                    "view",
+                    "manage",
+                    "override_rate",
+                    "use_zero_rated",
+                    "use_exempt",
+                    "use_out_of_scope",
+                    "use_reverse_charge",
+                    "view_reason",
+                ],
+            },
+            {
+                "resource": "non_vat",
+                "label": "Purchase Non-VAT",
+                "actions": ["view", "use", "manage"],
+            },
+        ],
+    },
+    {
         "module": "sales",
         "label": "Sales",
         "resources": [
@@ -206,6 +246,37 @@ PERMISSION_GROUPS = [
                     "print",
                     "export",
                 ],
+            },
+            {
+                "resource": "selling",
+                "label": "Selling Controls",
+                "actions": [
+                    "regular",
+                    "restricted",
+                    "vat",
+                    "non_vat",
+                    "discount",
+                    "price_override",
+                ],
+            },
+            {
+                "resource": "vat",
+                "label": "Sales VAT",
+                "actions": [
+                    "view",
+                    "manage",
+                    "override_rate",
+                    "use_zero_rated",
+                    "use_exempt",
+                    "use_out_of_scope",
+                    "use_reverse_charge",
+                    "view_reason",
+                ],
+            },
+            {
+                "resource": "non_vat",
+                "label": "Sales Non-VAT",
+                "actions": ["view", "use", "manage"],
             },
         ],
     },
@@ -318,7 +389,7 @@ PERMISSION_GROUPS = [
             },
             {
                 "resource": "salary_history",
-                "label": "Salary History",
+                "label": "Salary Revision",
                 "actions": ["view", "create", "edit"],
             },
             {
@@ -336,6 +407,53 @@ PERMISSION_GROUPS = [
                 "resource": "reports",
                 "label": "All Reports",
                 "actions": ["view", "export", "print"],
+            }
+        ],
+    },
+    {
+        "module": "branches",
+        "label": "Branch Controls",
+        "description": (
+            "Controls branch visibility and whether a user can change "
+            "the active branch from the application top bar."
+        ),
+        "resources": [
+            {
+                "resource": "branch_access",
+                "label": "Branch Access",
+                "description": (
+                    "Controls whether the user is limited to the assigned "
+                    "branch or can view all branch details and records."
+                ),
+                "code_prefix": "branches",
+                "actions": ["view_all"],
+                "action_labels": {
+                    "view_all": "View All Branches",
+                },
+                "action_descriptions": {
+                    "view_all": (
+                        "Allow the user to view all branch details and "
+                        "all branch-scoped records."
+                    ),
+                },
+            },
+            {
+                "resource": "active_branch",
+                "label": "Active Branch",
+                "description": (
+                    "Controls branch switching from the top navigation bar."
+                ),
+                "code_prefix": "branches",
+                "actions": ["switch"],
+                "action_labels": {
+                    "switch": "Change Active Branch",
+                },
+                "action_descriptions": {
+                    "switch": (
+                        "Show the branch selector in the top bar and "
+                        "allow changing the active working branch."
+                    ),
+                },
             },
         ],
     },
@@ -373,9 +491,25 @@ PERMISSION_GROUPS = [
 ]
 
 
+def permission_code(group, resource, action):
+    """
+    Build a permission code.
+
+    Resources may provide ``code_prefix`` when the permission must use a
+    shorter explicit namespace. For example, the top-bar branch permission is
+    ``branches.switch`` instead of ``branches.active_branch.switch``.
+    """
+    code_prefix = resource.get("code_prefix")
+
+    if code_prefix:
+        return f"{code_prefix}.{action}"
+
+    return f"{group['module']}." f"{resource['resource']}." f"{action}"
+
+
 def all_permission_codes():
     return [
-        f"{group['module']}.{resource['resource']}.{action}"
+        permission_code(group, resource, action)
         for group in PERMISSION_GROUPS
         for resource in group["resources"]
         for action in resource["actions"]

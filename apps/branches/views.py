@@ -2,33 +2,94 @@ from django.contrib.auth import get_user_model
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.common.logging import LoggedModelViewSet as ModelViewSet
+from apps.common.branch_access import (
+    can_view_all_branches,
+    get_user_branch_id,
+)
+from apps.common.logging import (
+    LoggedModelViewSet as ModelViewSet,
+)
+
 from .models import Branch
-from .serializers import BranchManagerOptionSerializer, BranchSerializer
+from .serializers import (
+    BranchManagerOptionSerializer,
+    BranchSerializer,
+)
 
 User = get_user_model()
 
 
 class BranchViewSet(ModelViewSet):
-    queryset = Branch.objects.select_related("manager", "manager__role").all()
+    queryset = Branch.objects.select_related(
+        "manager",
+        "manager__role",
+    ).all()
     serializer_class = BranchSerializer
-    search_fields = ["branch_code", "branch_name", "city"]
-    filterset_fields = ["is_active", "emirate"]
+    search_fields = [
+        "branch_code",
+        "branch_name",
+        "city",
+    ]
+    filterset_fields = [
+        "is_active",
+        "emirate",
+    ]
 
-    @action(detail=False, methods=["get"], url_path="manager-options")
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = self.request.user
+
+        if can_view_all_branches(user):
+            return queryset
+
+        branch_id = get_user_branch_id(user)
+
+        if not branch_id:
+            return queryset.none()
+
+        return queryset.filter(pk=branch_id)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="manager-options",
+    )
     def manager_options(self, request):
-        """Return active users that can be selected as a branch manager."""
+        """Return active users selectable as branch managers."""
         queryset = (
             User.objects.filter(is_active=True)
-            .select_related("role")
-            .order_by("full_name", "username", "email")
+            .select_related(
+                "role",
+                "branch",
+                "employee",
+                "employee__branch",
+            )
+            .order_by(
+                "full_name",
+                "username",
+                "email",
+            )
         )
 
-        serializer = BranchManagerOptionSerializer(queryset, many=True)
+        if not can_view_all_branches(request.user):
+            branch_id = get_user_branch_id(request.user)
+
+            if not branch_id:
+                queryset = queryset.none()
+            else:
+                queryset = queryset.filter(
+                    branch_id=branch_id,
+                )
+
+        serializer = BranchManagerOptionSerializer(
+            queryset,
+            many=True,
+        )
+
         return Response(
             {
                 "success": True,
-                "message": "Manager options retrieved successfully",
+                "message": ("Manager options retrieved successfully"),
                 "data": serializer.data,
             }
         )

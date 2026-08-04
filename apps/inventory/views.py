@@ -619,9 +619,75 @@ class StockAdjustmentViewSet(ModelViewSet):
         "reason",
     ]
 
+    def _signed_quantity(self, adjustment_type, quantity):
+        parsed_quantity = int(quantity or 0)
+
+        return parsed_quantity if adjustment_type == "ADD" else -parsed_quantity
+
+    def _get_locked_stock(
+        self,
+        *,
+        product,
+        variant,
+        branch,
+    ):
+        stock, _ = ProductStock.objects.select_for_update().get_or_create(
+            product=product,
+            variant=variant,
+            branch=branch,
+            defaults={
+                "current_stock": 0,
+                "regular_quantity": 0,
+                "restricted_quantity": 0,
+                "reserved_regular_quantity": 0,
+                "reserved_restricted_quantity": 0,
+            },
+        )
+
+        return stock
+
+    def _classification_quantity(
+        self,
+        stock,
+        classification,
+    ):
+        if classification == "RESTRICTED":
+            return int(stock.restricted_quantity or 0)
+
+        return int(stock.regular_quantity or 0)
+
+    def _available_quantity(
+        self,
+        stock,
+        classification,
+    ):
+        if classification == "RESTRICTED":
+            return int(stock.available_restricted_quantity or 0)
+
+        return int(stock.available_regular_quantity or 0)
+
+    def _unit_costs(self, stock):
+        unit_cost_excluding_vat = Decimal(
+            str(
+                stock.average_unit_cost_excluding_vat
+                or stock.last_purchase_cost_excluding_vat
+                or 0
+            )
+        )
+
+        capitalized_unit_cost = Decimal(
+            str(stock.average_unit_cost or unit_cost_excluding_vat or 0)
+        )
+
+        return (
+            unit_cost_excluding_vat,
+            capitalized_unit_cost,
+        )
+
     @transaction.atomic
     def perform_create(self, serializer):
         user = self.request.user
+
         branch = serializer.validated_data.get("branch") or getattr(
             user, "branch", None
         )
@@ -642,64 +708,55 @@ class StockAdjustmentViewSet(ModelViewSet):
             )
         ).upper()
 
-        stock, _ = ProductStock.objects.select_for_update().get_or_create(
+        stock = self._get_locked_stock(
             product=product,
             variant=variant,
             branch=branch,
-            defaults={
-                "current_stock": 0,
-                "regular_quantity": 0,
-                "restricted_quantity": 0,
-                "reserved_regular_quantity": 0,
-                "reserved_restricted_quantity": 0,
-            },
         )
 
-        current_quantity = (
-            int(stock.restricted_quantity or 0)
-            if classification == "RESTRICTED"
-            else int(stock.regular_quantity or 0)
+        current_quantity = self._classification_quantity(
+            stock,
+            classification,
         )
 
-        available_quantity = (
-            int(stock.available_restricted_quantity)
-            if classification == "RESTRICTED"
-            else int(stock.available_regular_quantity)
+        available_quantity = self._available_quantity(
+            stock,
+            classification,
         )
 
-        if adjustment_type == "DEDUCT" and current_quantity <= 0:
+        signed_quantity = self._signed_quantity(
+            adjustment_type,
+            quantity,
+        )
+
+        if signed_quantity < 0 and current_quantity <= 0:
             raise ValidationError(
                 {
                     "quantity": (
-                        f"No {classification.lower()} stock is available "
-                        "for this product and attribute."
+                        f"No {classification.lower()} stock "
+                        "is available for this product "
+                        "and attribute."
                     )
                 }
             )
 
-        if adjustment_type == "DEDUCT" and quantity > available_quantity:
+        if signed_quantity < 0 and abs(signed_quantity) > available_quantity:
             raise ValidationError(
                 {
                     "quantity": (
                         f"Only {available_quantity} "
-                        f"{classification.lower()} units are available."
+                        f"{classification.lower()} units "
+                        "are available."
                     )
                 }
             )
 
-        signed_quantity = quantity if adjustment_type == "ADD" else -quantity
         actual_quantity = current_quantity + signed_quantity
 
-        unit_cost_excluding_vat = Decimal(
-            str(
-                stock.average_unit_cost_excluding_vat
-                or stock.last_purchase_cost_excluding_vat
-                or 0
-            )
-        )
-        capitalized_unit_cost = Decimal(
-            str(stock.average_unit_cost or unit_cost_excluding_vat or 0)
-        )
+        (
+            unit_cost_excluding_vat,
+            capitalized_unit_cost,
+        ) = self._unit_costs(stock)
 
         adjustment_number = f"SA-{timezone.now():%Y%m%d%H%M%S%f}"
 
@@ -730,9 +787,204 @@ class StockAdjustmentViewSet(ModelViewSet):
             performed_by=user,
             reference_type="STOCK_ADJUSTMENT",
             reference_id=adjustment.id,
-            remarks=(f"{adjustment.reason}. " f"{adjustment.remarks}").strip(),
+            remarks=(f"{adjustment.reason}. " f"{adjustment.remarks or ''}").strip(),
             stock_classification=classification,
             unit_cost=unit_cost_excluding_vat,
+            vat_percentage=Decimal("0.00"),
+            vat_treatment="OUT_OF_SCOPE",
+            vat_recoverable=False,
+        )
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        """
+        Reverse the original approved stock effect and apply
+        the edited adjustment inside one database transaction.
+        """
+        user = self.request.user
+
+        # Lock only the StockAdjustment row.
+        #
+        # Do not combine select_for_update() with select_related("variant")
+        # because variant is nullable. PostgreSQL represents that relation
+        # with an OUTER JOIN and raises:
+        # "FOR UPDATE cannot be applied to the nullable side of an outer join".
+        adjustment = StockAdjustment.objects.select_for_update().get(
+            pk=serializer.instance.pk
+        )
+
+        old_product = adjustment.product
+        old_variant = adjustment.variant
+        old_branch = adjustment.branch
+        old_classification = str(adjustment.stock_classification or "REGULAR").upper()
+        old_adjustment_type = str(adjustment.adjustment_type or "").upper()
+        old_quantity = int(adjustment.quantity or 0)
+
+        old_signed_quantity = self._signed_quantity(
+            old_adjustment_type,
+            old_quantity,
+        )
+
+        new_product = serializer.validated_data.get(
+            "product",
+            adjustment.product,
+        )
+        new_variant = serializer.validated_data.get(
+            "variant",
+            adjustment.variant,
+        )
+        new_branch = serializer.validated_data.get(
+            "branch",
+            adjustment.branch,
+        )
+        new_classification = str(
+            serializer.validated_data.get(
+                "stock_classification",
+                old_classification,
+            )
+        ).upper()
+        new_adjustment_type = str(
+            serializer.validated_data.get(
+                "adjustment_type",
+                old_adjustment_type,
+            )
+        ).upper()
+        new_quantity = int(
+            serializer.validated_data.get(
+                "quantity",
+                adjustment.quantity,
+            )
+        )
+
+        new_signed_quantity = self._signed_quantity(
+            new_adjustment_type,
+            new_quantity,
+        )
+
+        old_stock = self._get_locked_stock(
+            product=old_product,
+            variant=old_variant,
+            branch=old_branch,
+        )
+
+        same_stock_target = (
+            old_product.pk == new_product.pk
+            and getattr(old_variant, "pk", None) == getattr(new_variant, "pk", None)
+            and old_branch.pk == new_branch.pk
+            and old_classification == new_classification
+        )
+
+        new_stock = (
+            old_stock
+            if same_stock_target
+            else self._get_locked_stock(
+                product=new_product,
+                variant=new_variant,
+                branch=new_branch,
+            )
+        )
+
+        available_after_reversal = self._available_quantity(
+            new_stock,
+            new_classification,
+        )
+
+        if same_stock_target:
+            available_after_reversal -= old_signed_quantity
+
+        if (
+            new_signed_quantity < 0
+            and abs(new_signed_quantity) > available_after_reversal
+        ):
+            raise ValidationError(
+                {
+                    "quantity": (
+                        f"Only {available_after_reversal} "
+                        f"{new_classification.lower()} units "
+                        "will be available after reversing "
+                        "the original adjustment."
+                    )
+                }
+            )
+
+        (
+            old_unit_cost_excluding_vat,
+            _old_capitalized_unit_cost,
+        ) = self._unit_costs(old_stock)
+
+        # Reverse the original inventory effect.
+        adjust_stock(
+            product=old_product,
+            variant=old_variant,
+            branch=old_branch,
+            quantity=-old_signed_quantity,
+            movement_type="ADJUSTMENT",
+            performed_by=user,
+            reference_type=("STOCK_ADJUSTMENT_EDIT_REVERSAL"),
+            reference_id=adjustment.id,
+            remarks=(
+                "Reversal before editing stock adjustment "
+                f"{adjustment.adjustment_number}."
+            ),
+            stock_classification=old_classification,
+            unit_cost=old_unit_cost_excluding_vat,
+            vat_percentage=Decimal("0.00"),
+            vat_treatment="OUT_OF_SCOPE",
+            vat_recoverable=False,
+        )
+
+        # Refresh after reversal before calculating new values.
+        new_stock.refresh_from_db()
+
+        new_current_quantity = self._classification_quantity(
+            new_stock,
+            new_classification,
+        )
+
+        new_actual_quantity = new_current_quantity + new_signed_quantity
+
+        (
+            new_unit_cost_excluding_vat,
+            new_capitalized_unit_cost,
+        ) = self._unit_costs(new_stock)
+
+        updated_adjustment = serializer.save(
+            current_quantity=new_current_quantity,
+            actual_quantity_counted=(new_actual_quantity),
+            quantity_difference=(new_signed_quantity),
+            unit_cost_excluding_vat=(new_unit_cost_excluding_vat),
+            vat_treatment="OUT_OF_SCOPE",
+            vat_percentage=Decimal("0.00"),
+            recoverable_vat_amount=Decimal("0.00"),
+            non_recoverable_vat_amount=Decimal("0.00"),
+            value_before=(Decimal(new_current_quantity) * new_capitalized_unit_cost),
+            value_after=(Decimal(new_actual_quantity) * new_capitalized_unit_cost),
+            capitalized_adjustment_value=(
+                Decimal(new_quantity) * new_capitalized_unit_cost
+            ),
+            status="APPROVED",
+            approved_by=user,
+            updated_by=user,
+        )
+
+        # Apply the edited inventory effect.
+        adjust_stock(
+            product=updated_adjustment.product,
+            variant=updated_adjustment.variant,
+            branch=updated_adjustment.branch,
+            quantity=new_signed_quantity,
+            movement_type="ADJUSTMENT",
+            performed_by=user,
+            reference_type="STOCK_ADJUSTMENT_EDIT",
+            reference_id=updated_adjustment.id,
+            remarks=(
+                f"Edited adjustment "
+                f"{updated_adjustment.adjustment_number}. "
+                f"{updated_adjustment.reason}. "
+                f"{updated_adjustment.remarks or ''}"
+            ).strip(),
+            stock_classification=(updated_adjustment.stock_classification or "REGULAR"),
+            unit_cost=new_unit_cost_excluding_vat,
             vat_percentage=Decimal("0.00"),
             vat_treatment="OUT_OF_SCOPE",
             vat_recoverable=False,

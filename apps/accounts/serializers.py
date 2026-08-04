@@ -71,7 +71,15 @@ LEGACY_PERMISSION_ALIASES = {
     "reports.view": "reports.*",
     "reports.export": "reports.*",
     "sales.view": "sales.*",
+    "branches.branches.view_all": "branches.view_all",
+    "branches.branch_access.view_all": "branches.view_all",
+    # Regular stock and non-restricted stock are the same concept.
+    "sales.selling.non_restricted": "sales.selling.regular",
+    "purchases.stock_purchase.non_restricted": "purchases.stock_purchase.regular",
 }
+
+
+OBSOLETE_PERMISSION_PREFIXES = ("inventory.non_restricted_stock.",)
 
 
 MODULE_WILDCARD_PERMISSIONS = {
@@ -91,6 +99,12 @@ MODULE_WILDCARD_PERMISSIONS = {
 
 def normalize_permission_code(code):
     normalized = str(code or "").strip()
+
+    if normalized == "*":
+        return normalized
+
+    if normalized.startswith(OBSOLETE_PERMISSION_PREFIXES):
+        return None
 
     return LEGACY_PERMISSION_ALIASES.get(
         normalized,
@@ -162,9 +176,11 @@ class RoleSerializer(serializers.ModelSerializer):
 
         normalized = sorted(
             {
-                normalize_permission_code(permission)
+                normalized_code
                 for permission in value
                 if str(permission).strip()
+                for normalized_code in [normalize_permission_code(permission)]
+                if normalized_code
             }
         )
 

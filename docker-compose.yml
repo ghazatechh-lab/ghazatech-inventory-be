@@ -32,6 +32,8 @@ services:
       - db
       - redis
 
+      
+
   celery_worker:
     build: .
     command: celery -A config worker -l info
