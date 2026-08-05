@@ -88,7 +88,6 @@ class StockTransferItem(models.Model):
     received_quantity = models.PositiveIntegerField(default=0)
     damaged_quantity = models.PositiveIntegerField(default=0)
     remarks = models.TextField(blank=True)
-    stock_classification = models.CharField(max_length=20, default="REGULAR")
     transfer_unit_cost = models.DecimalField(max_digits=14, decimal_places=4, default=0)
     line_transfer_value = models.DecimalField(
         max_digits=16, decimal_places=2, default=0

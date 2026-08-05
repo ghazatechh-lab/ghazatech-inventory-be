@@ -57,7 +57,15 @@ class StockTransferViewSet(ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        q = self.request.query_params.get("q")
+        branch_id = self.request.query_params.get("branch")
+        if branch_id:
+            queryset = queryset.filter(
+                models.Q(from_branch_id=branch_id) | models.Q(to_branch_id=branch_id)
+            )
+
+        q = self.request.query_params.get("q") or self.request.query_params.get(
+            "search"
+        )
         if q:
             queryset = queryset.filter(
                 models.Q(transfer_number__icontains=q)

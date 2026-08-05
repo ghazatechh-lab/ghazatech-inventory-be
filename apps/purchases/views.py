@@ -695,7 +695,8 @@ class SupplierBillViewSet(Base):
         "grn",
         "branch",
     ).prefetch_related(
-        "items",
+        "items__product",
+        "items__variant",
         "attachments",
     )
 
@@ -727,6 +728,34 @@ class SupplierBillViewSet(Base):
         "supplier__supplier_name",
     ]
     ordering = ["-bill_date", "-id"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        supplier_id = self.request.query_params.get("supplier")
+        branch_id = self.request.query_params.get("branch")
+        status_value = self.request.query_params.get("status")
+        purchase_order_id = self.request.query_params.get("purchase_order")
+        grn_id = self.request.query_params.get("grn")
+
+        if supplier_id not in (None, "", "all"):
+            queryset = queryset.filter(supplier_id=supplier_id)
+
+        if branch_id not in (None, "", "all"):
+            queryset = queryset.filter(branch_id=branch_id)
+
+        if status_value not in (None, "", "all"):
+            queryset = queryset.filter(status=status_value)
+
+        if purchase_order_id not in (None, "", "all"):
+            queryset = queryset.filter(
+                purchase_order_id=purchase_order_id,
+            )
+
+        if grn_id not in (None, "", "all"):
+            queryset = queryset.filter(grn_id=grn_id)
+
+        return queryset.distinct()
 
     def _payload(self, request):
         if "payload" in request.data:
@@ -1060,6 +1089,26 @@ class SupplierPaymentViewSet(Base):
         "-id",
     ]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        supplier_id = self.request.query_params.get("supplier")
+        branch_id = self.request.query_params.get("branch")
+        payment_method = self.request.query_params.get("payment_method")
+
+        if supplier_id not in (None, "", "all"):
+            queryset = queryset.filter(supplier_id=supplier_id)
+
+        if branch_id not in (None, "", "all"):
+            queryset = queryset.filter(branch_id=branch_id)
+
+        if payment_method not in (None, "", "all"):
+            queryset = queryset.filter(
+                payment_method=payment_method,
+            )
+
+        return queryset.distinct()
+
     def _payload(self, request):
         if "payload" in request.data:
             try:
@@ -1333,6 +1382,36 @@ class SupplierReturnViewSet(Base):
         "-return_date",
         "-id",
     ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        supplier_id = self.request.query_params.get("supplier")
+        branch_id = self.request.query_params.get("branch")
+        status_value = self.request.query_params.get("status")
+        reason = self.request.query_params.get("reason")
+        resolution = self.request.query_params.get("resolution")
+        grn_id = self.request.query_params.get("grn")
+
+        if supplier_id not in (None, "", "all"):
+            queryset = queryset.filter(supplier_id=supplier_id)
+
+        if branch_id not in (None, "", "all"):
+            queryset = queryset.filter(branch_id=branch_id)
+
+        if status_value not in (None, "", "all"):
+            queryset = queryset.filter(status=status_value)
+
+        if reason not in (None, "", "all"):
+            queryset = queryset.filter(reason=reason)
+
+        if resolution not in (None, "", "all"):
+            queryset = queryset.filter(resolution=resolution)
+
+        if grn_id not in (None, "", "all"):
+            queryset = queryset.filter(grn_id=grn_id)
+
+        return queryset.distinct()
 
     def _payload(self, request):
         """

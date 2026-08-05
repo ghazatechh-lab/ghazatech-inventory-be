@@ -39,13 +39,11 @@ class ItemSerializer(serializers.ModelSerializer):
             "sku",
             "variant",
             "variant_label",
-            "stock_classification",
             "requested_quantity",
             "dispatched_quantity",
             "received_quantity",
             "damaged_quantity",
             "remarks",
-            "transfer_unit_cost",
             "line_transfer_value",
             "source_value",
             "destination_value",
@@ -59,7 +57,6 @@ class ItemSerializer(serializers.ModelSerializer):
             "dispatched_quantity",
             "received_quantity",
             "damaged_quantity",
-            "transfer_unit_cost",
             "line_transfer_value",
             "source_value",
             "destination_value",
@@ -107,7 +104,6 @@ class TransferSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "tax_scope",
-            "transfer_unit_cost",
             "transfer_value",
             "capitalized_vat_value",
             "courier_cost_excluding_vat",
@@ -199,22 +195,16 @@ class TransferSerializer(serializers.ModelSerializer):
                 continue
 
             variant = item.get("variant")
-            classification = (
-                str(item.get("stock_classification") or "REGULAR").strip().upper()
-            )
-
             duplicate_key = (
                 product.id,
                 variant.id if variant else None,
-                classification,
             )
 
             if duplicate_key in seen_products:
                 item_errors.append(
                     (
-                        f"{product.sku}: this product, "
-                        "attribute and stock type combination "
-                        "was added more than once."
+                        f"{product.sku}: this product and "
+                        "attribute combination was added more than once."
                     )
                 )
                 continue
@@ -232,22 +222,7 @@ class TransferSerializer(serializers.ModelSerializer):
                 branch=from_branch,
                 variant=variant,
             ).first()
-            if classification not in {"REGULAR", "RESTRICTED"}:
-                item_errors.append(
-                    f"{product.sku}: select regular or restricted stock."
-                )
-                continue
-
-            item["stock_classification"] = classification
-
-            if stock:
-                available = (
-                    stock.available_restricted_quantity
-                    if classification == "RESTRICTED"
-                    else stock.available_regular_quantity
-                )
-            else:
-                available = 0
+            available = int(stock.available_stock) if stock else 0
             if available <= 0:
                 item_errors.append(
                     f"{product.sku}: no available stock in {from_branch.branch_code}."
@@ -304,7 +279,6 @@ class TransferSerializer(serializers.ModelSerializer):
             classification = (
                 str(
                     item_data.get(
-                        "stock_classification",
                         "REGULAR",
                     )
                 )
@@ -335,11 +309,7 @@ class TransferSerializer(serializers.ModelSerializer):
                     }
                 )
 
-            available_quantity = (
-                int(stock.available_restricted_quantity)
-                if classification == "RESTRICTED"
-                else int(stock.available_regular_quantity)
-            )
+            available_quantity = int(stock.available_stock)
 
             if quantity > available_quantity:
                 raise serializers.ValidationError(
@@ -368,7 +338,6 @@ class TransferSerializer(serializers.ModelSerializer):
                 transfer=transfer,
                 product=product,
                 variant=variant,
-                stock_classification=classification,
                 requested_quantity=quantity,
                 remarks=str(item_data.get("remarks", "") or "").strip(),
                 transfer_unit_cost=unit_cost,

@@ -3,42 +3,49 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
-from apps.notifications.services import notify_branch
 from apps.common.tax import calculate_inventory_tax, quantize_money, quantize_unit
+from apps.notifications.services import notify_branch
 
 from .models import ProductStock, StockMovement
 
-REGULAR_CLASSIFICATION = "REGULAR"
-RESTRICTED_CLASSIFICATION = "RESTRICTED"
-
-RESTRICTED_MOVEMENT_TYPES = {
-    "PURCHASE_RESTRICTED",
-    "SALE_RESTRICTED",
-}
+VAT = "VAT"
+ZERO_VAT = "ZERO_VAT"
+NON_VAT = "NON_VAT"
+VALID_TAX_TREATMENTS = {VAT, ZERO_VAT, NON_VAT}
 
 
 def generate_stock_number(prefix="SM"):
     return f"{prefix}-{timezone.now():%Y%m%d%H%M%S%f}"
 
 
-def _resolve_classification(movement_type, stock_classification=None):
-    """Return a normalized stock classification for a movement."""
-    if stock_classification:
-        classification = str(stock_classification).strip().upper()
-    elif movement_type in RESTRICTED_MOVEMENT_TYPES:
-        classification = RESTRICTED_CLASSIFICATION
-    else:
-        # Existing OPENING, PURCHASE, SALE, ADJUSTMENT, TRANSFER and return
-        # flows are treated as regular stock unless explicitly classified.
-        classification = REGULAR_CLASSIFICATION
+def normalize_tax(product, vat_treatment=None, vat_percentage=None):
+    """Return the inventory tax treatment and effective VAT percentage.
 
-    if classification not in {
-        REGULAR_CLASSIFICATION,
-        RESTRICTED_CLASSIFICATION,
-    }:
-        raise ValueError("Invalid stock classification.")
+    VAT products use the UAE standard 5% rate. ZERO_VAT and NON_VAT products
+    always use 0%. ZERO_VAT remains a taxable zero-rated supply, whereas
+    NON_VAT is outside the VAT calculation.
+    """
+    treatment = (
+        str(vat_treatment or getattr(product, "tax_treatment", NON_VAT) or NON_VAT)
+        .strip()
+        .upper()
+    )
 
-    return classification
+    if treatment not in VALID_TAX_TREATMENTS:
+        raise ValueError("Invalid VAT treatment. Select VAT, Zero VAT, or Non-VAT.")
+
+    # Keep the service strict and consistent with the product tax choices.
+    percentage = Decimal("5.00") if treatment == VAT else Decimal("0.00")
+    return treatment, percentage
+
+
+def _common_tax_treatment(treatment):
+    """Map product tax choices to the shared tax utility choices."""
+    return {
+        VAT: "STANDARD_VAT",
+        ZERO_VAT: "ZERO_RATED",
+        NON_VAT: "OUT_OF_SCOPE",
+    }[treatment]
 
 
 @transaction.atomic
@@ -54,85 +61,85 @@ def adjust_stock(
     reference_id="",
     remarks="",
     allow_negative=False,
-    stock_classification=None,
     warehouse="",
     unit_cost=None,
-    vat_percentage=0,
-    vat_treatment="OUT_OF_SCOPE",
-    vat_inclusive=False,
+    vat_percentage=None,
+    vat_treatment=None,
+    vat_inclusive=None,
     vat_recoverable=True,
     tax_invoice_number="",
     tax_invoice_date=None,
     source_document_number="",
+    **_ignored,
 ):
-    """
-    Apply a signed stock quantity to one product/variant stock record.
+    """Apply a signed quantity to a unified ProductStock balance.
 
-    Positive quantity increases stock and negative quantity decreases stock.
-    Older callers that do not send a classification are treated as REGULAR.
-    This keeps product opening stock, adjustments, purchases and existing
-    sales flows backward compatible with classified inventory.
+    Positive quantities increase current_stock and negative quantities reduce
+    it. The stock row keeps one physical quantity and one reserved quantity;
+    regular/restricted classifications are no longer supported.
     """
     if variant and variant.product_id != product.id:
         raise ValueError("The selected variant does not belong to the product.")
 
-    quantity = int(quantity)
-    classification = _resolve_classification(
-        movement_type,
-        stock_classification,
-    )
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stock quantity must be a whole number.") from exc
 
-    lookup = {
-        "product": product,
-        "branch": branch,
-        "variant": variant,
-    }
+    if quantity == 0:
+        raise ValueError("Stock quantity cannot be zero.")
+
+    normalized_warehouse = str(warehouse or "").strip()
 
     stock, _created = ProductStock.objects.select_for_update().get_or_create(
-        **lookup,
+        product=product,
+        branch=branch,
+        variant=variant,
+        warehouse=normalized_warehouse,
         defaults={
             "reorder_level": product.reorder_level,
-            "warehouse": warehouse or "",
             "current_stock": 0,
             "reserved_stock": 0,
-            "regular_quantity": 0,
-            "restricted_quantity": 0,
-            "reserved_regular_quantity": 0,
-            "reserved_restricted_quantity": 0,
         },
     )
 
-    # Keep a warehouse value when supplied. The current ProductStock schema
-    # uses one stock row per product/variant/branch, so this is descriptive.
-    if warehouse and not stock.warehouse:
-        stock.warehouse = warehouse
+    previous_balance = int(stock.current_stock or 0)
+    new_balance = previous_balance + quantity
 
-    if classification == RESTRICTED_CLASSIFICATION:
-        previous_balance = int(stock.restricted_quantity or 0)
-        new_balance = previous_balance + quantity
+    # ProductStock is intentionally non-negative. Keep allow_negative in the
+    # signature for older callers, but never persist an invalid negative stock.
+    if new_balance < 0:
+        raise ValueError(
+            f"Insufficient stock for {product.sku}. "
+            f"Available stock: {stock.available_stock}."
+        )
 
-        if new_balance < 0 and not allow_negative:
-            raise ValueError(
-                f"Insufficient restricted stock for {product.sku}. "
-                f"Available restricted stock: {stock.available_restricted_quantity}."
-            )
+    # A physical deduction must not leave reserved stock above current stock.
+    # The calling sales/transfer flow should release its reservation first.
+    if new_balance < int(stock.reserved_stock or 0) and not allow_negative:
+        raise ValueError(
+            f"Insufficient available stock for {product.sku}. "
+            f"Available stock: {stock.available_stock}."
+        )
 
-        stock.restricted_quantity = new_balance
-    else:
-        previous_balance = int(stock.regular_quantity or 0)
-        new_balance = previous_balance + quantity
-
-        if new_balance < 0 and not allow_negative:
-            raise ValueError(
-                f"Insufficient regular stock for {product.sku}. "
-                f"Available regular stock: {stock.available_regular_quantity}."
-            )
-
-        stock.regular_quantity = new_balance
-
-    # Synchronize fields still used by older screens, filters and reports.
-    stock.sync_legacy_balances()
+    stock.current_stock = new_balance
     stock.reorder_level = product.reorder_level
+
+    treatment, percentage = normalize_tax(
+        product,
+        vat_treatment=vat_treatment,
+        vat_percentage=vat_percentage,
+    )
+
+    # Inclusive pricing only applies to standard VAT. Zero VAT and Non-VAT
+    # always have a zero tax amount and are treated as non-inclusive.
+    inclusive = (
+        bool(getattr(product, "vat_inclusive", False))
+        if vat_inclusive is None
+        else bool(vat_inclusive)
+    )
+    if treatment != VAT:
+        inclusive = False
 
     valuation = calculate_inventory_tax(
         unit_cost=(
@@ -140,22 +147,23 @@ def adjust_stock(
             if unit_cost is not None
             else stock.average_unit_cost_excluding_vat
         ),
-        vat_percentage=vat_percentage,
-        tax_treatment=vat_treatment,
-        vat_inclusive=vat_inclusive,
-        recoverable=vat_recoverable,
+        vat_percentage=percentage,
+        tax_treatment=_common_tax_treatment(treatment),
+        vat_inclusive=inclusive,
+        recoverable=bool(vat_recoverable) if treatment == VAT else False,
     )
 
-    # Weighted-average valuation is recalculated only for positive receipts with
-    # an explicit cost. Outgoing movements retain the existing carrying cost.
+    # Recalculate weighted-average carrying cost only for positive receipts
+    # having an explicit unit cost. Outgoing movements retain carrying cost.
     if quantity > 0 and unit_cost is not None:
-        old_quantity = max(0, stock.total_quantity - quantity)
+        old_quantity = max(0, previous_balance)
         old_value = Decimal(old_quantity) * Decimal(stock.average_unit_cost or 0)
         incoming_value = Decimal(quantity) * valuation["capitalized_unit_cost"]
-        new_total_quantity = max(0, stock.total_quantity)
+        total_quantity = max(0, stock.current_stock)
+
         stock.average_unit_cost = quantize_unit(
-            (old_value + incoming_value) / Decimal(new_total_quantity)
-            if new_total_quantity
+            (old_value + incoming_value) / Decimal(total_quantity)
+            if total_quantity
             else valuation["capitalized_unit_cost"]
         )
         stock.average_unit_cost_excluding_vat = valuation["unit_cost_excluding_vat"]
@@ -165,33 +173,11 @@ def adjust_stock(
         stock.last_purchase_cost = quantize_unit(
             valuation["unit_cost_excluding_vat"] + valuation["vat_per_unit"]
         )
-        stock.last_tax_treatment = str(vat_treatment or "OUT_OF_SCOPE").upper()
-        stock.last_vat_percentage = Decimal(str(vat_percentage or 0))
+        stock.last_tax_treatment = treatment
+        stock.last_vat_percentage = percentage
         stock.valuation_updated_at = timezone.now()
 
-    update_fields = [
-        "regular_quantity",
-        "restricted_quantity",
-        "current_stock",
-        "reserved_stock",
-        "reorder_level",
-        "last_stock_update",
-        "average_unit_cost_excluding_vat",
-        "recoverable_vat_per_unit",
-        "capitalized_vat_per_unit",
-        "average_unit_cost",
-        "last_purchase_cost_excluding_vat",
-        "last_purchase_cost",
-        "last_tax_treatment",
-        "last_vat_percentage",
-        "valuation_updated_at",
-        "updated_at",
-    ]
-
-    if warehouse and stock.warehouse == warehouse:
-        update_fields.append("warehouse")
-
-    stock.save(update_fields=list(dict.fromkeys(update_fields)))
+    stock.save()
 
     movement = StockMovement.objects.create(
         movement_number=generate_stock_number(),
@@ -199,11 +185,8 @@ def adjust_stock(
         variant=variant,
         branch=branch,
         movement_type=movement_type,
-        stock_classification=classification,
-        warehouse=warehouse or stock.warehouse or "",
+        warehouse=normalized_warehouse,
         quantity=quantity,
-        # These balances represent the selected classification, not a silently
-        # combined stock balance.
         previous_stock=previous_balance,
         new_stock=new_balance,
         reference_type=reference_type,
@@ -213,8 +196,8 @@ def adjust_stock(
         quantity_before=previous_balance,
         quantity_after=new_balance,
         unit_cost_excluding_vat=valuation["unit_cost_excluding_vat"],
-        vat_treatment=str(vat_treatment or "OUT_OF_SCOPE").upper(),
-        vat_percentage=Decimal(str(vat_percentage or 0)),
+        vat_treatment=treatment,
+        vat_percentage=percentage,
         recoverable_vat_amount=quantize_money(
             abs(Decimal(quantity)) * valuation["recoverable_vat_per_unit"]
         ),
@@ -228,14 +211,13 @@ def adjust_stock(
             * (valuation["unit_cost_excluding_vat"] + valuation["vat_per_unit"])
         ),
         running_stock_value=quantize_money(
-            Decimal(stock.total_quantity) * stock.average_unit_cost
+            Decimal(stock.current_stock) * stock.average_unit_cost
         ),
         source_document_type=reference_type,
-        source_document_number=source_document_number or str(reference_id or ""),
+        source_document_number=(source_document_number or str(reference_id or "")),
         tax_invoice_number=tax_invoice_number,
         tax_invoice_date=tax_invoice_date,
-        is_vat_relevant=str(vat_treatment or "").upper()
-        in {"STANDARD_VAT", "REVERSE_CHARGE"},
+        is_vat_relevant=treatment in {VAT, ZERO_VAT},
     )
 
     if stock.available_stock < 10:

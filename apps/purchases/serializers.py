@@ -1348,6 +1348,246 @@ class SupplierBillSerializer(serializers.ModelSerializer):
         return instance
 
 
+class SupplierBillItemDetailSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.product_name",
+        read_only=True,
+    )
+
+    variant_name = serializers.SerializerMethodField()
+    sku = serializers.SerializerMethodField()
+    quantity = serializers.SerializerMethodField()
+    unit_price = serializers.SerializerMethodField()
+    subtotal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierBillItem
+        fields = [
+            "id",
+            "product",
+            "product_name",
+            "variant",
+            "variant_name",
+            "sku",
+            "description",
+            "received_quantity",
+            "bill_quantity",
+            "quantity",
+            "unit_cost",
+            "unit_price",
+            "discount_amount",
+            "vat_percentage",
+            "vat_amount",
+            "subtotal",
+            "line_total",
+            "grn_item",
+        ]
+
+    def get_variant_name(self, obj):
+        if not obj.variant:
+            return ""
+
+        return (
+            getattr(obj.variant, "display_name", "")
+            or getattr(obj.variant, "variant_name", "")
+            or getattr(obj.variant, "name", "")
+            or str(obj.variant)
+        )
+
+    def get_sku(self, obj):
+        if obj.variant and getattr(obj.variant, "sku", None):
+            return obj.variant.sku
+
+        return getattr(obj.product, "sku", "") if obj.product else ""
+
+    def get_quantity(self, obj):
+        return obj.bill_quantity
+
+    def get_unit_price(self, obj):
+        return obj.unit_cost
+
+    def get_subtotal(self, obj):
+        quantity = obj.bill_quantity or 0
+        unit_cost = obj.unit_cost or 0
+        discount = obj.discount_amount or 0
+
+        return max((quantity * unit_cost) - discount, 0)
+
+
+class SupplierBillAttachmentDetailSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+    file_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierBillAttachment
+        fields = [
+            "id",
+            "file",
+            "file_url",
+            "file_name",
+            "original_name",
+            "file_size",
+            "content_type",
+            "created_at",
+        ]
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return ""
+
+        request = self.context.get("request")
+        url = obj.file.url
+
+        return request.build_absolute_uri(url) if request else url
+
+    def get_file_name(self, obj):
+        if obj.original_name:
+            return obj.original_name
+
+        return obj.file.name.rsplit("/", 1)[-1] if obj.file else ""
+
+
+class SupplierBillPaymentAllocationSerializer(serializers.ModelSerializer):
+    payment_number = serializers.CharField(
+        source="payment.payment_number",
+        read_only=True,
+    )
+
+    payment_date = serializers.DateField(
+        source="payment.payment_date",
+        read_only=True,
+    )
+
+    payment_method = serializers.CharField(
+        source="payment.payment_method",
+        read_only=True,
+    )
+
+    reference_number = serializers.CharField(
+        source="payment.reference_number",
+        read_only=True,
+    )
+
+    class Meta:
+        model = SupplierPaymentAllocation
+        fields = [
+            "id",
+            "payment",
+            "payment_number",
+            "payment_date",
+            "payment_method",
+            "reference_number",
+            "amount",
+        ]
+
+
+class SupplierBillDetailSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(
+        source="supplier.supplier_name",
+        read_only=True,
+    )
+
+    supplier_code = serializers.CharField(
+        source="supplier.supplier_code",
+        read_only=True,
+    )
+
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
+        read_only=True,
+    )
+
+    branch_code = serializers.CharField(
+        source="branch.branch_code",
+        read_only=True,
+    )
+
+    po_number = serializers.CharField(
+        source="purchase_order.po_number",
+        read_only=True,
+    )
+
+    grn_number = serializers.CharField(
+        source="grn.grn_number",
+        read_only=True,
+    )
+
+    approved_by_name = serializers.SerializerMethodField()
+
+    items = SupplierBillItemDetailSerializer(
+        many=True,
+        read_only=True,
+    )
+
+    attachments = SupplierBillAttachmentDetailSerializer(
+        many=True,
+        read_only=True,
+    )
+
+    payment_allocations = SupplierBillPaymentAllocationSerializer(
+        source="payment_allocations",
+        many=True,
+        read_only=True,
+    )
+
+    class Meta:
+        model = SupplierBill
+        fields = [
+            "id",
+            "bill_number",
+            "supplier_invoice_number",
+            "supplier",
+            "supplier_name",
+            "supplier_code",
+            "branch",
+            "branch_name",
+            "branch_code",
+            "purchase_order",
+            "po_number",
+            "grn",
+            "grn_number",
+            "bill_date",
+            "due_date",
+            "payment_terms_days",
+            "currency",
+            "subtotal",
+            "discount_amount",
+            "vat_amount",
+            "total_amount",
+            "paid_amount",
+            "balance_due",
+            "status",
+            "match_status",
+            "notes",
+            "approved_by",
+            "approved_by_name",
+            "approved_at",
+            "items",
+            "attachments",
+            "payment_allocations",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_approved_by_name(self, obj):
+        user = obj.approved_by
+
+        if not user:
+            return ""
+
+        full_name = user.get_full_name() if hasattr(user, "get_full_name") else ""
+
+        return (
+            full_name
+            or getattr(user, "username", "")
+            or getattr(
+                user,
+                "email",
+                "",
+            )
+        )
+
+
 class SupplierPaymentAttachmentSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
 

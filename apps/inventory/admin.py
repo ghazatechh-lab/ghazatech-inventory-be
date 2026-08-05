@@ -50,11 +50,17 @@ class ProductAdmin(admin.ModelAdmin):
         "is_active",
     )
     search_fields = ("sku", "barcode", "product_name")
-    list_filter = ("brand", "category", "branch", "rack", "has_variants", "is_active")
+    list_filter = (
+        "brand",
+        "category",
+        "branch",
+        "rack",
+        "tax_treatment",
+        "has_variants",
+        "is_active",
+    )
     inlines = [ProductVariantInline]
 
     @admin.display(description="Available Qty")
     def total_available_qty(self, obj):
-        return sum(
-            obj.variants.filter(is_active=True).values_list("available_qty", flat=True)
-        )
+        return sum(stock.available_stock for stock in obj.stocks.all())

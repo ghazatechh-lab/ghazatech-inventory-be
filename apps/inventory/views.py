@@ -1,9 +1,7 @@
 from decimal import Decimal
 
-from collections import defaultdict
-
 from django.db import transaction
-from django.db.models import ExpressionWrapper, F, IntegerField, Q, Sum
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
@@ -136,13 +134,7 @@ class StockViewSet(ReadOnlyModelViewSet):
     ]
 
     def get_queryset(self):
-        """
-        Return stock rows with database-calculated classified totals.
-
-        The *_db aliases can be used by serializers, filtering, ordering,
-        reports, and values() queries. The model properties remain available
-        for code working with individual ProductStock objects.
-        """
+        """Return unified stock rows for products and active variants."""
         return (
             ProductStock.objects.select_related(
                 "product",
@@ -153,27 +145,6 @@ class StockViewSet(ReadOnlyModelViewSet):
             )
             .prefetch_related("product__variants")
             .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
-            .annotate(
-                total_quantity_db=ExpressionWrapper(
-                    F("regular_quantity") + F("restricted_quantity"),
-                    output_field=IntegerField(),
-                ),
-                available_regular_db=ExpressionWrapper(
-                    F("regular_quantity") - F("reserved_regular_quantity"),
-                    output_field=IntegerField(),
-                ),
-                available_restricted_db=ExpressionWrapper(
-                    F("restricted_quantity") - F("reserved_restricted_quantity"),
-                    output_field=IntegerField(),
-                ),
-                total_available_db=ExpressionWrapper(
-                    F("regular_quantity")
-                    + F("restricted_quantity")
-                    - F("reserved_regular_quantity")
-                    - F("reserved_restricted_quantity"),
-                    output_field=IntegerField(),
-                ),
-            )
         )
 
     def list(self, request, *args, **kwargs):
@@ -237,18 +208,10 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "total_reserved": 0,
                     "total_damaged": 0,
                     "total_available": 0,
-                    "total_regular": 0,
-                    "total_restricted": 0,
-                    "total_reserved_regular": 0,
-                    "total_reserved_restricted": 0,
-                    "total_available_regular": 0,
-                    "total_available_restricted": 0,
                     "inventory_value_excluding_vat": 0,
                     "recoverable_vat_value": 0,
                     "capitalized_vat_value": 0,
                     "total_inventory_value": 0,
-                    "regular_stock_value": 0,
-                    "restricted_stock_value": 0,
                     "average_unit_cost": 0,
                     "vat_treatment": stock.last_tax_treatment,
                     "vat_percentage": stock.last_vat_percentage,
@@ -263,39 +226,8 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "branch_name": stock.branch.branch_name,
                     "current_stock": stock.current_stock,
                     "reserved_stock": stock.reserved_stock,
-                    "regular_quantity": stock.regular_quantity,
-                    "restricted_quantity": stock.restricted_quantity,
-                    "reserved_regular_quantity": stock.reserved_regular_quantity,
-                    "reserved_restricted_quantity": stock.reserved_restricted_quantity,
-                    "total_quantity": getattr(
-                        stock,
-                        "total_quantity_db",
-                        stock.total_quantity,
-                    ),
-                    "available_regular_quantity": max(
-                        0,
-                        getattr(
-                            stock,
-                            "available_regular_db",
-                            stock.available_regular_quantity,
-                        ),
-                    ),
-                    "available_restricted_quantity": max(
-                        0,
-                        getattr(
-                            stock,
-                            "available_restricted_db",
-                            stock.available_restricted_quantity,
-                        ),
-                    ),
-                    "total_available_quantity": max(
-                        0,
-                        getattr(
-                            stock,
-                            "total_available_db",
-                            stock.total_available_quantity,
-                        ),
-                    ),
+                    "total_quantity": stock.total_quantity,
+                    "total_available_quantity": stock.total_available_quantity,
                     "damaged_stock": stock.damaged_stock,
                     "available_stock": available,
                     "average_unit_cost_excluding_vat": stock.average_unit_cost_excluding_vat,
@@ -306,34 +238,12 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "recoverable_vat_value": stock.recoverable_vat_value,
                     "capitalized_vat_value": stock.capitalized_vat_value,
                     "total_inventory_value": stock.total_inventory_value,
-                    "regular_stock_value": stock.regular_stock_value,
-                    "restricted_stock_value": stock.restricted_stock_value,
                     "vat_treatment": stock.last_tax_treatment,
                     "vat_percentage": stock.last_vat_percentage,
                 }
             )
             group["total_current"] += stock.current_stock
             group["total_reserved"] += stock.reserved_stock
-            group["total_regular"] += stock.regular_quantity
-            group["total_restricted"] += stock.restricted_quantity
-            group["total_reserved_regular"] += stock.reserved_regular_quantity
-            group["total_reserved_restricted"] += stock.reserved_restricted_quantity
-            group["total_available_regular"] += max(
-                0,
-                getattr(
-                    stock,
-                    "available_regular_db",
-                    stock.available_regular_quantity,
-                ),
-            )
-            group["total_available_restricted"] += max(
-                0,
-                getattr(
-                    stock,
-                    "available_restricted_db",
-                    stock.available_restricted_quantity,
-                ),
-            )
             group["total_damaged"] += stock.damaged_stock
             group["total_available"] += available
             group["inventory_value_excluding_vat"] += float(
@@ -342,8 +252,6 @@ class StockViewSet(ReadOnlyModelViewSet):
             group["recoverable_vat_value"] += float(stock.recoverable_vat_value)
             group["capitalized_vat_value"] += float(stock.capitalized_vat_value)
             group["total_inventory_value"] += float(stock.total_inventory_value)
-            group["regular_stock_value"] += float(stock.regular_stock_value)
-            group["restricted_stock_value"] += float(stock.restricted_stock_value)
             group["average_unit_cost"] = float(stock.average_unit_cost or 0)
             group["vat_treatment"] = stock.last_tax_treatment
             group["vat_percentage"] = float(stock.last_vat_percentage or 0)
@@ -485,51 +393,9 @@ class StockViewSet(ReadOnlyModelViewSet):
             .first()
         )
 
-        regular_quantity = int(getattr(stock, "regular_quantity", 0) or 0)
-        reserved_regular_quantity = int(
-            getattr(stock, "reserved_regular_quantity", 0) or 0
-        )
-        available_regular_quantity = max(
-            0,
-            regular_quantity - reserved_regular_quantity,
-        )
-
-        from apps.common.sensitive_permissions import (
-            can_view_restricted,
-        )
-
-        restricted_allowed = can_view_restricted(request.user)
-
-        restricted_quantity = (
-            int(
-                getattr(
-                    stock,
-                    "restricted_quantity",
-                    0,
-                )
-                or 0
-            )
-            if restricted_allowed
-            else 0
-        )
-
-        reserved_restricted_quantity = (
-            int(
-                getattr(
-                    stock,
-                    "reserved_restricted_quantity",
-                    0,
-                )
-                or 0
-            )
-            if restricted_allowed
-            else 0
-        )
-
-        available_restricted_quantity = max(
-            0,
-            restricted_quantity - reserved_restricted_quantity,
-        )
+        current_stock = int(getattr(stock, "current_stock", 0) or 0)
+        reserved_stock = int(getattr(stock, "reserved_stock", 0) or 0)
+        available_stock = max(0, current_stock - reserved_stock)
 
         return Response(
             {
@@ -542,13 +408,10 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "sku": product.sku,
                     "variant": (variant.id if variant else None),
                     "variant_label": (variant_label(variant) if variant else ""),
-                    "regular_quantity": regular_quantity,
-                    "reserved_regular_quantity": (reserved_regular_quantity),
-                    "available_regular_quantity": (available_regular_quantity),
-                    "restricted_quantity": (restricted_quantity),
-                    "reserved_restricted_quantity": (reserved_restricted_quantity),
-                    "available_restricted_quantity": (available_restricted_quantity),
-                    "restricted_allowed": (restricted_allowed),
+                    "current_stock": current_stock,
+                    "reserved_stock": reserved_stock,
+                    "available_stock": available_stock,
+                    "available_quantity": available_stock,
                     "average_unit_cost_excluding_vat": (
                         str(stock.average_unit_cost_excluding_vat or 0)
                         if stock
@@ -573,7 +436,6 @@ class StockMovementViewSet(ReadOnlyModelViewSet):
         "product",
         "variant",
         "movement_type",
-        "stock_classification",
         "vat_treatment",
         "is_vat_relevant",
     ]
@@ -610,7 +472,6 @@ class StockAdjustmentViewSet(ModelViewSet):
         "product",
         "variant",
         "adjustment_type",
-        "stock_classification",
     ]
     search_fields = [
         "adjustment_number",
@@ -637,34 +498,20 @@ class StockAdjustmentViewSet(ModelViewSet):
             branch=branch,
             defaults={
                 "current_stock": 0,
-                "regular_quantity": 0,
-                "restricted_quantity": 0,
-                "reserved_regular_quantity": 0,
-                "reserved_restricted_quantity": 0,
+                "reserved_stock": 0,
+                "reorder_level": product.reorder_level,
             },
         )
 
         return stock
 
-    def _classification_quantity(
-        self,
-        stock,
-        classification,
-    ):
-        if classification == "RESTRICTED":
-            return int(stock.restricted_quantity or 0)
+    @staticmethod
+    def _current_quantity(stock):
+        return int(stock.current_stock or 0)
 
-        return int(stock.regular_quantity or 0)
-
-    def _available_quantity(
-        self,
-        stock,
-        classification,
-    ):
-        if classification == "RESTRICTED":
-            return int(stock.available_restricted_quantity or 0)
-
-        return int(stock.available_regular_quantity or 0)
+    @staticmethod
+    def _available_quantity(stock):
+        return int(stock.available_stock or 0)
 
     def _unit_costs(self, stock):
         unit_cost_excluding_vat = Decimal(
@@ -703,7 +550,6 @@ class StockAdjustmentViewSet(ModelViewSet):
         quantity = int(serializer.validated_data["quantity"])
         classification = str(
             serializer.validated_data.get(
-                "stock_classification",
                 "REGULAR",
             )
         ).upper()
@@ -714,15 +560,8 @@ class StockAdjustmentViewSet(ModelViewSet):
             branch=branch,
         )
 
-        current_quantity = self._classification_quantity(
-            stock,
-            classification,
-        )
-
-        available_quantity = self._available_quantity(
-            stock,
-            classification,
-        )
+        current_quantity = self._current_quantity(stock)
+        available_quantity = self._available_quantity(stock)
 
         signed_quantity = self._signed_quantity(
             adjustment_type,
@@ -731,24 +570,12 @@ class StockAdjustmentViewSet(ModelViewSet):
 
         if signed_quantity < 0 and current_quantity <= 0:
             raise ValidationError(
-                {
-                    "quantity": (
-                        f"No {classification.lower()} stock "
-                        "is available for this product "
-                        "and attribute."
-                    )
-                }
+                {"quantity": ("No stock is available for this product and attribute.")}
             )
 
         if signed_quantity < 0 and abs(signed_quantity) > available_quantity:
             raise ValidationError(
-                {
-                    "quantity": (
-                        f"Only {available_quantity} "
-                        f"{classification.lower()} units "
-                        "are available."
-                    )
-                }
+                {"quantity": (f"Only {available_quantity} units are available.")}
             )
 
         actual_quantity = current_quantity + signed_quantity
@@ -788,7 +615,6 @@ class StockAdjustmentViewSet(ModelViewSet):
             reference_type="STOCK_ADJUSTMENT",
             reference_id=adjustment.id,
             remarks=(f"{adjustment.reason}. " f"{adjustment.remarks or ''}").strip(),
-            stock_classification=classification,
             unit_cost=unit_cost_excluding_vat,
             vat_percentage=Decimal("0.00"),
             vat_treatment="OUT_OF_SCOPE",
@@ -816,7 +642,6 @@ class StockAdjustmentViewSet(ModelViewSet):
         old_product = adjustment.product
         old_variant = adjustment.variant
         old_branch = adjustment.branch
-        old_classification = str(adjustment.stock_classification or "REGULAR").upper()
         old_adjustment_type = str(adjustment.adjustment_type or "").upper()
         old_quantity = int(adjustment.quantity or 0)
 
@@ -839,7 +664,6 @@ class StockAdjustmentViewSet(ModelViewSet):
         )
         new_classification = str(
             serializer.validated_data.get(
-                "stock_classification",
                 old_classification,
             )
         ).upper()
@@ -871,7 +695,6 @@ class StockAdjustmentViewSet(ModelViewSet):
             old_product.pk == new_product.pk
             and getattr(old_variant, "pk", None) == getattr(new_variant, "pk", None)
             and old_branch.pk == new_branch.pk
-            and old_classification == new_classification
         )
 
         new_stock = (
@@ -884,10 +707,7 @@ class StockAdjustmentViewSet(ModelViewSet):
             )
         )
 
-        available_after_reversal = self._available_quantity(
-            new_stock,
-            new_classification,
-        )
+        available_after_reversal = self._available_quantity(new_stock)
 
         if same_stock_target:
             available_after_reversal -= old_signed_quantity
@@ -899,10 +719,8 @@ class StockAdjustmentViewSet(ModelViewSet):
             raise ValidationError(
                 {
                     "quantity": (
-                        f"Only {available_after_reversal} "
-                        f"{new_classification.lower()} units "
-                        "will be available after reversing "
-                        "the original adjustment."
+                        f"Only {available_after_reversal} units will be available "
+                        "after reversing the original adjustment."
                     )
                 }
             )
@@ -926,7 +744,6 @@ class StockAdjustmentViewSet(ModelViewSet):
                 "Reversal before editing stock adjustment "
                 f"{adjustment.adjustment_number}."
             ),
-            stock_classification=old_classification,
             unit_cost=old_unit_cost_excluding_vat,
             vat_percentage=Decimal("0.00"),
             vat_treatment="OUT_OF_SCOPE",
@@ -936,10 +753,7 @@ class StockAdjustmentViewSet(ModelViewSet):
         # Refresh after reversal before calculating new values.
         new_stock.refresh_from_db()
 
-        new_current_quantity = self._classification_quantity(
-            new_stock,
-            new_classification,
-        )
+        new_current_quantity = self._current_quantity(new_stock)
 
         new_actual_quantity = new_current_quantity + new_signed_quantity
 
@@ -983,7 +797,6 @@ class StockAdjustmentViewSet(ModelViewSet):
                 f"{updated_adjustment.reason}. "
                 f"{updated_adjustment.remarks or ''}"
             ).strip(),
-            stock_classification=(updated_adjustment.stock_classification or "REGULAR"),
             unit_cost=new_unit_cost_excluding_vat,
             vat_percentage=Decimal("0.00"),
             vat_treatment="OUT_OF_SCOPE",
@@ -993,37 +806,13 @@ class StockAdjustmentViewSet(ModelViewSet):
 
 @api_view(["GET"])
 def low_stock_products(request):
-    queryset = (
-        ProductStock.objects.select_related(
-            "product",
-            "variant",
-            "branch",
-            "product__brand",
-            "product__category",
-        )
-        .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
-        .annotate(
-            total_quantity_db=ExpressionWrapper(
-                F("regular_quantity") + F("restricted_quantity"),
-                output_field=IntegerField(),
-            ),
-            available_regular_db=ExpressionWrapper(
-                F("regular_quantity") - F("reserved_regular_quantity"),
-                output_field=IntegerField(),
-            ),
-            available_restricted_db=ExpressionWrapper(
-                F("restricted_quantity") - F("reserved_restricted_quantity"),
-                output_field=IntegerField(),
-            ),
-            total_available_db=ExpressionWrapper(
-                F("regular_quantity")
-                + F("restricted_quantity")
-                - F("reserved_regular_quantity")
-                - F("reserved_restricted_quantity"),
-                output_field=IntegerField(),
-            ),
-        )
-    )
+    queryset = ProductStock.objects.select_related(
+        "product",
+        "variant",
+        "branch",
+        "product__brand",
+        "product__category",
+    ).filter(Q(product__has_variants=False) | Q(variant__isnull=False))
 
     branch_id = request.query_params.get("branch")
 
