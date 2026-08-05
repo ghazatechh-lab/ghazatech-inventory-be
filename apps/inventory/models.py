@@ -93,7 +93,7 @@ class Product(TimeStampedModel, SoftDeleteModel):
         related_name="products",
     )
     has_variants = models.BooleanField(default=False)
-    compatible_models = models.TextField(blank=True)
+    compatible_models = models.TextField(blank=True, default="All Models")
     condition = models.CharField(
         max_length=20, choices=CONDITION_CHOICES, default="NEW"
     )
@@ -160,6 +160,10 @@ class Product(TimeStampedModel, SoftDeleteModel):
             self.vat_inclusive = False
 
     def save(self, *args, **kwargs):
+        self.compatible_models = (
+            str(self.compatible_models or "").strip() or "All Models"
+        )
+
         if self.tax_treatment == "VAT":
             self.vat_rate = Decimal("5.00")
         else:

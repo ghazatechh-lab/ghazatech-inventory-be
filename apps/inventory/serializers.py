@@ -398,6 +398,15 @@ class ProductSerializer(serializers.ModelSerializer):
 
         attrs["sku"] = sku
 
+        compatible_models = str(
+            attrs.get(
+                "compatible_models",
+                getattr(self.instance, "compatible_models", ""),
+            )
+            or ""
+        ).strip()
+        attrs["compatible_models"] = compatible_models or "All Models"
+
         tax_treatment = str(
             attrs.get(
                 "tax_treatment",

@@ -35,6 +35,10 @@ from .serializers import (
 )
 from .services import adjust_stock
 from .permissions import ReferenceDataPermission
+from .product_import_export import (
+    import_products_from_workbook,
+    product_export_response,
+)
 from rest_framework import status
 
 
@@ -123,6 +127,56 @@ class ProductViewSet(ModelViewSet):
         obj.is_deleted = True
         obj.deleted_by = self.request.user
         obj.save()
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="import",
+    )
+    def import_products(self, request):
+        uploaded_file = request.FILES.get("file")
+        branch_id = request.data.get("branch") or request.query_params.get("branch")
+
+        if not uploaded_file:
+            raise ValidationError({"file": "Upload the product Excel file."})
+
+        if not branch_id:
+            raise ValidationError(
+                {"branch": "Select a branch before importing products."}
+            )
+
+        from apps.branches.models import Branch
+
+        try:
+            branch = Branch.objects.get(pk=branch_id)
+        except Branch.DoesNotExist as exc:
+            raise ValidationError({"branch": "Selected branch was not found."}) from exc
+
+        products = import_products_from_workbook(
+            request=request,
+            branch=branch,
+            uploaded_file=uploaded_file,
+        )
+
+        return ok(
+            {
+                "created_count": len(products),
+                "product_ids": [product.id for product in products],
+            },
+            message=f"{len(products)} product(s) imported successfully.",
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="export",
+    )
+    def export_products(self, request):
+        queryset = self.filter_queryset(self.get_queryset()).order_by(
+            "product_name",
+            "id",
+        )
+        return product_export_response(queryset)
 
 
 class StockViewSet(ReadOnlyModelViewSet):
