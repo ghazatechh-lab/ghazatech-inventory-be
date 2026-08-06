@@ -46,10 +46,6 @@ class PurchaseOrder(TimeStampedModel, BranchAwareModel):
 
     class Meta:
         ordering = ["-order_date", "-id"]
-        permissions = [
-            ("create_restricted_purchase", "Can create restricted purchases"),
-            ("view_restricted_purchase", "Can view restricted purchases"),
-        ]
 
 
 class PurchaseOrderItem(models.Model):
@@ -62,11 +58,7 @@ class PurchaseOrderItem(models.Model):
     )
     description = models.TextField(blank=True)
     quantity = models.PositiveIntegerField()
-    regular_quantity = models.PositiveIntegerField(default=0)
-    restricted_quantity = models.PositiveIntegerField(default=0)
     received_quantity = models.PositiveIntegerField(default=0)
-    received_regular_quantity = models.PositiveIntegerField(default=0)
-    received_restricted_quantity = models.PositiveIntegerField(default=0)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     TAX_TREATMENTS = [
@@ -148,10 +140,6 @@ class GoodsReceivedItem(models.Model):
     received_quantity = models.PositiveIntegerField()
     damaged_quantity = models.PositiveIntegerField(default=0)
     accepted_quantity = models.PositiveIntegerField(default=0)
-    regular_received_quantity = models.PositiveIntegerField(default=0)
-    restricted_received_quantity = models.PositiveIntegerField(default=0)
-    regular_accepted_quantity = models.PositiveIntegerField(default=0)
-    restricted_accepted_quantity = models.PositiveIntegerField(default=0)
     rejected_quantity = models.PositiveIntegerField(default=0)
     quality_status = models.CharField(
         max_length=30,
@@ -408,6 +396,13 @@ class SupplierPayment(TimeStampedModel, BranchAwareModel):
     notes = models.TextField(
         blank=True,
     )
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supplier_payments_made",
+    )
 
     class Meta:
         ordering = [
@@ -544,6 +539,18 @@ class SupplierReturn(TimeStampedModel, BranchAwareModel):
         default="OTHER",
     )
 
+    subtotal = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+
+    vat_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+
     total_amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -604,8 +611,37 @@ class SupplierReturn(TimeStampedModel, BranchAwareModel):
             "-id",
         ]
 
+        indexes = [
+            models.Index(
+                fields=[
+                    "supplier",
+                    "status",
+                ],
+            ),
+            models.Index(
+                fields=[
+                    "branch",
+                    "return_date",
+                ],
+            ),
+            models.Index(
+                fields=[
+                    "grn",
+                ],
+            ),
+        ]
+
+    def __str__(self):
+        return self.return_number
+
 
 class SupplierReturnItem(models.Model):
+    TAX_TREATMENT_CHOICES = [
+        ("STANDARD_VAT", "Standard VAT"),
+        ("ZERO_VAT", "Zero VAT"),
+        ("NON_VAT", "Non-VAT"),
+    ]
+
     supplier_return = models.ForeignKey(
         SupplierReturn,
         on_delete=models.CASCADE,
@@ -636,10 +672,30 @@ class SupplierReturnItem(models.Model):
         null=True,
         blank=True,
     )
-    regular_quantity = models.PositiveIntegerField(default=0)
-    restricted_quantity = models.PositiveIntegerField(default=0)
-    quantity = models.PositiveIntegerField(default=0)
+
+    quantity = models.PositiveIntegerField(
+        default=0,
+    )
+
     unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+
+    tax_treatment = models.CharField(
+        max_length=30,
+        choices=TAX_TREATMENT_CHOICES,
+        default="STANDARD_VAT",
+    )
+
+    vat_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+    )
+
+    vat_amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=0,
@@ -655,6 +711,59 @@ class SupplierReturnItem(models.Model):
         max_length=200,
         blank=True,
     )
+
+    class Meta:
+        ordering = [
+            "id",
+        ]
+
+        indexes = [
+            models.Index(
+                fields=[
+                    "supplier_return",
+                ],
+            ),
+            models.Index(
+                fields=[
+                    "grn_item",
+                ],
+            ),
+            models.Index(
+                fields=[
+                    "product",
+                    "variant",
+                ],
+            ),
+        ]
+
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(quantity__gte=0),
+                name="supplier_return_item_quantity_gte_0",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(unit_price__gte=0),
+                name="supplier_return_item_unit_price_gte_0",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(vat_percentage__gte=0),
+                name="supplier_return_item_vat_percentage_gte_0",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(vat_amount__gte=0),
+                name="supplier_return_item_vat_amount_gte_0",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(line_total__gte=0),
+                name="supplier_return_item_line_total_gte_0",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.supplier_return.return_number} - "
+            f"{self.product} - {self.quantity}"
+        )
 
 
 class SupplierReturnAttachment(TimeStampedModel):
@@ -715,6 +824,8 @@ class VendorCredit(TimeStampedModel, BranchAwareModel):
 
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
+        ("PENDING", "Pending Approval"),
+        ("APPROVED", "Approved"),
         ("OPEN", "Open"),
         ("PARTIALLY_APPLIED", "Partially Applied"),
         ("FULLY_APPLIED", "Fully Applied"),

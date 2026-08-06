@@ -10,5 +10,8 @@ admin.site.register(
         SupplierBill,
         SupplierPayment,
         SupplierReturn,
+        SupplierReturnItem,
+        VendorCredit,
+        VendorCreditItem,
     ]
 )

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from django.db import transaction
 from django.db.models import Sum
 from rest_framework import serializers
 
@@ -81,12 +82,90 @@ class SupplierSerializer(
         fields = "__all__"
 
         read_only_fields = [
+            "supplier_code",
             "created_at",
             "updated_at",
             "is_deleted",
             "deleted_at",
             "deleted_by",
         ]
+
+    def validate(self, attrs):
+        branch = attrs.get(
+            "branch",
+            getattr(self.instance, "branch", None),
+        )
+
+        if not branch:
+            raise serializers.ValidationError(
+                {"branch": "Branch is required for a supplier."}
+            )
+
+        attrs["payment_terms_days"] = int(
+            attrs.get(
+                "payment_terms_days",
+                getattr(self.instance, "payment_terms_days", 0),
+            )
+            or 0
+        )
+
+        return attrs
+
+    def _generate_supplier_code(self, branch):
+        branch_code = (
+            str(getattr(branch, "branch_code", "") or f"B{branch.pk}")
+            .strip()
+            .upper()
+            .replace(" ", "")
+        )
+
+        prefix = f"SUP-{branch_code}-"
+
+        latest = (
+            Supplier.objects.select_for_update()
+            .filter(
+                branch=branch,
+                supplier_code__startswith=prefix,
+            )
+            .order_by("-supplier_code")
+            .values_list("supplier_code", flat=True)
+            .first()
+        )
+
+        sequence = 1
+
+        if latest:
+            try:
+                sequence = int(latest.rsplit("-", 1)[-1]) + 1
+            except (TypeError, ValueError):
+                sequence = (
+                    Supplier.objects.filter(
+                        branch=branch,
+                        supplier_code__startswith=prefix,
+                    ).count()
+                    + 1
+                )
+
+        candidate = f"{prefix}{sequence:04d}"
+
+        while Supplier.objects.filter(supplier_code=candidate).exists():
+            sequence += 1
+            candidate = f"{prefix}{sequence:04d}"
+
+        return candidate
+
+    @transaction.atomic
+    def create(self, validated_data):
+        branch = validated_data["branch"]
+        validated_data.pop("supplier_code", None)
+        validated_data["supplier_code"] = self._generate_supplier_code(branch)
+        validated_data.setdefault("payment_terms_days", 0)
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("supplier_code", None)
+        return super().update(instance, validated_data)
 
     def get_total_purchases(
         self,

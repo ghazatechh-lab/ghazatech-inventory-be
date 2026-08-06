@@ -35,10 +35,7 @@ class POItemSerializer(serializers.ModelSerializer):
         source="product.product_name",
         read_only=True,
     )
-    sku = serializers.CharField(
-        source="product.sku",
-        read_only=True,
-    )
+    sku = serializers.SerializerMethodField()
     product_image = serializers.SerializerMethodField()
     variant_name = serializers.SerializerMethodField()
     remaining_quantity = serializers.SerializerMethodField()
@@ -67,8 +64,13 @@ class POItemSerializer(serializers.ModelSerializer):
             return None
 
         request = self.context.get("request")
-
         return request.build_absolute_uri(url) if request else url
+
+    def get_sku(self, obj):
+        if obj.variant and getattr(obj.variant, "sku", None):
+            return obj.variant.sku
+
+        return getattr(obj.product, "sku", "")
 
     def get_variant_name(self, obj):
         if not obj.variant:
@@ -81,7 +83,7 @@ class POItemSerializer(serializers.ModelSerializer):
         )
 
     def get_total_quantity(self, obj):
-        return (obj.regular_quantity or 0) + (obj.restricted_quantity or 0)
+        return Decimal(str(obj.quantity or 0))
 
     def get_remaining_quantity(self, obj):
         ordered = Decimal(str(obj.quantity or 0))
@@ -93,34 +95,6 @@ class POItemSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
-        from apps.common.sensitive_permissions import has_sensitive_permission
-
-        request = self.context.get("request")
-        regular = int(
-            attrs.get("regular_quantity", getattr(self.instance, "regular_quantity", 0))
-            or 0
-        )
-        restricted = int(
-            attrs.get(
-                "restricted_quantity", getattr(self.instance, "restricted_quantity", 0)
-            )
-            or 0
-        )
-        if restricted and not has_sensitive_permission(
-            getattr(request, "user", None), "create_restricted_purchase"
-        ):
-            raise serializers.ValidationError(
-                {
-                    "restricted_quantity": "You are not authorized to enter restricted purchase quantity."
-                }
-            )
-        attrs["quantity"] = (
-            regular + restricted
-            if (regular or restricted)
-            else attrs.get("quantity", getattr(self.instance, "quantity", 0))
-        )
-        if attrs.get("tax_treatment") != "STANDARD_VAT":
-            attrs["vat_percentage"] = Decimal("0")
         quantity = Decimal(
             str(
                 attrs.get(
@@ -130,6 +104,7 @@ class POItemSerializer(serializers.ModelSerializer):
                 or 0
             )
         )
+
         unit_price = Decimal(
             str(
                 attrs.get(
@@ -139,6 +114,7 @@ class POItemSerializer(serializers.ModelSerializer):
                 or 0
             )
         )
+
         discount_amount = Decimal(
             str(
                 attrs.get(
@@ -148,6 +124,19 @@ class POItemSerializer(serializers.ModelSerializer):
                 or 0
             )
         )
+
+        tax_treatment = str(
+            attrs.get(
+                "tax_treatment",
+                getattr(
+                    self.instance,
+                    "tax_treatment",
+                    "STANDARD_VAT",
+                ),
+            )
+            or "STANDARD_VAT"
+        ).upper()
+
         vat_percentage = Decimal(
             str(
                 attrs.get(
@@ -174,30 +163,17 @@ class POItemSerializer(serializers.ModelSerializer):
         if discount_amount > gross:
             errors["discount_amount"] = "Discount cannot exceed the line amount."
 
-        if vat_percentage < 0:
+        if tax_treatment != "STANDARD_VAT":
+            attrs["vat_percentage"] = Decimal("0")
+        elif vat_percentage < 0:
             errors["vat_percentage"] = "VAT percentage cannot be negative."
+
+        attrs["quantity"] = quantity
 
         if errors:
             raise serializers.ValidationError(errors)
 
         return attrs
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        from apps.common.sensitive_permissions import has_sensitive_permission
-
-        request = self.context.get("request")
-        if not has_sensitive_permission(
-            getattr(request, "user", None), "view_restricted_purchase"
-        ):
-            for field in (
-                "restricted_quantity",
-                "received_restricted_quantity",
-                "total_quantity",
-            ):
-                data.pop(field, None)
-            data["quantity"] = instance.regular_quantity or instance.quantity
-        return data
 
 
 class POSerializer(serializers.ModelSerializer):
@@ -930,11 +906,34 @@ class SupplierBillItemSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     sku = serializers.SerializerMethodField()
+    variant_name = serializers.SerializerMethodField()
+    available_bill_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierBillItem
-        exclude = ["bill"]
+        fields = [
+            "id",
+            "grn_item",
+            "product",
+            "product_name",
+            "variant",
+            "variant_name",
+            "sku",
+            "received_quantity",
+            "bill_quantity",
+            "available_bill_quantity",
+            "unit_cost",
+            "discount_amount",
+            "vat_percentage",
+            "vat_amount",
+            "line_total",
+        ]
         read_only_fields = [
+            "id",
+            "product_name",
+            "variant_name",
+            "sku",
+            "available_bill_quantity",
             "vat_amount",
             "line_total",
         ]
@@ -942,12 +941,163 @@ class SupplierBillItemSerializer(serializers.ModelSerializer):
     def get_sku(self, obj):
         if obj.variant and getattr(obj.variant, "sku", None):
             return obj.variant.sku
+        return getattr(obj.product, "sku", "") if obj.product else ""
 
-        return getattr(
-            obj.product,
-            "sku",
-            "",
+    def get_variant_name(self, obj):
+        if not obj.variant:
+            return ""
+        return (
+            getattr(obj.variant, "display_name", "")
+            or getattr(obj.variant, "variant_name", "")
+            or getattr(obj.variant, "name", "")
+            or str(obj.variant)
         )
+
+    def _already_billed_quantity(self, grn_item, exclude_bill_id=None):
+        queryset = SupplierBillItem.objects.filter(
+            grn_item=grn_item,
+        ).exclude(
+            bill__status="CANCELLED",
+        )
+
+        if exclude_bill_id not in (None, "", "null"):
+            queryset = queryset.exclude(
+                bill_id=exclude_bill_id,
+            )
+
+        return int(queryset.aggregate(total=Sum("bill_quantity"))["total"] or 0)
+
+    def get_available_bill_quantity(self, obj):
+        if not obj.grn_item_id:
+            return 0
+
+        accepted = int(
+            obj.grn_item.accepted_quantity or obj.grn_item.received_quantity or 0
+        )
+        billed_elsewhere = self._already_billed_quantity(
+            obj.grn_item,
+            exclude_bill_id=obj.bill_id,
+        )
+        return max(0, accepted - billed_elsewhere)
+
+    def validate(self, attrs):
+        grn_item = attrs.get(
+            "grn_item",
+            getattr(self.instance, "grn_item", None),
+        )
+        product = attrs.get(
+            "product",
+            getattr(self.instance, "product", None),
+        )
+        variant = attrs.get(
+            "variant",
+            getattr(self.instance, "variant", None),
+        )
+
+        bill_quantity = int(
+            attrs.get(
+                "bill_quantity",
+                getattr(self.instance, "bill_quantity", 0),
+            )
+            or 0
+        )
+        unit_cost = Decimal(
+            str(
+                attrs.get(
+                    "unit_cost",
+                    getattr(self.instance, "unit_cost", 0),
+                )
+                or 0
+            )
+        )
+        discount_amount = Decimal(
+            str(
+                attrs.get(
+                    "discount_amount",
+                    getattr(self.instance, "discount_amount", 0),
+                )
+                or 0
+            )
+        )
+        vat_percentage = Decimal(
+            str(
+                attrs.get(
+                    "vat_percentage",
+                    getattr(self.instance, "vat_percentage", 5),
+                )
+                or 0
+            )
+        )
+
+        errors = {}
+
+        if not grn_item:
+            errors["grn_item"] = "GRN item is required."
+
+        if not product:
+            errors["product"] = "Product is required."
+
+        if grn_item and product and grn_item.product_id != product.id:
+            errors["product"] = "Product must match the selected GRN item."
+
+        grn_variant_id = grn_item.variant_id if grn_item else None
+        variant_id = variant.id if variant else None
+
+        if grn_item and grn_variant_id != variant_id:
+            errors["variant"] = "Variant must match the selected GRN item."
+
+        accepted_quantity = 0
+        available_quantity = 0
+
+        if grn_item:
+            accepted_quantity = int(
+                grn_item.accepted_quantity or grn_item.received_quantity or 0
+            )
+            exclude_bill_id = (
+                self.instance.bill_id
+                if self.instance is not None
+                else self.context.get("supplier_bill_id")
+            )
+            billed_elsewhere = self._already_billed_quantity(
+                grn_item,
+                exclude_bill_id=exclude_bill_id,
+            )
+            available_quantity = max(
+                0,
+                accepted_quantity - billed_elsewhere,
+            )
+
+            attrs["received_quantity"] = accepted_quantity
+
+        if bill_quantity <= 0:
+            errors["bill_quantity"] = "Bill quantity must be greater than zero."
+        elif grn_item and bill_quantity > available_quantity:
+            errors["bill_quantity"] = (
+                "Bill quantity cannot exceed the remaining unbilled "
+                f"GRN quantity ({available_quantity})."
+            )
+
+        if unit_cost < 0:
+            errors["unit_cost"] = "Unit cost cannot be negative."
+
+        gross = Decimal(bill_quantity) * unit_cost
+
+        if discount_amount < 0:
+            errors["discount_amount"] = "Discount cannot be negative."
+        elif discount_amount > gross:
+            errors["discount_amount"] = "Discount cannot exceed the gross line amount."
+
+        if vat_percentage < 0:
+            errors["vat_percentage"] = "VAT percentage cannot be negative."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs["bill_quantity"] = bill_quantity
+        attrs["unit_cost"] = unit_cost
+        attrs["discount_amount"] = discount_amount
+        attrs["vat_percentage"] = vat_percentage
+        return attrs
 
 
 class SupplierBillAttachmentSerializer(serializers.ModelSerializer):
@@ -969,14 +1119,38 @@ class SupplierBillAttachmentSerializer(serializers.ModelSerializer):
     def get_file_url(self, obj):
         if not obj.file:
             return None
-
         request = self.context.get("request")
-
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
 class SupplierBillSerializer(serializers.ModelSerializer):
     bill_number = serializers.CharField(read_only=True)
+
+    def to_internal_value(self, data):
+        """
+        Supplier Bill approval is handled only by the dedicated approve action.
+
+        Older frontend versions may submit PENDING_APPROVAL or APPROVED even
+        when those values are not part of SupplierBill.STATUS_CHOICES. Convert
+        them to DRAFT before DRF's ChoiceField validation runs.
+        """
+        mutable_data = data.copy() if hasattr(data, "copy") else dict(data)
+
+        requested_status = (
+            str(mutable_data.get("status", "DRAFT") or "DRAFT").strip().upper()
+        )
+
+        valid_statuses = {value for value, _label in SupplierBill.STATUS_CHOICES}
+
+        if requested_status in {
+            "PENDING_APPROVAL",
+            "APPROVED",
+        }:
+            mutable_data["status"] = "DRAFT"
+        elif requested_status not in valid_statuses:
+            mutable_data["status"] = "DRAFT"
+
+        return super().to_internal_value(mutable_data)
 
     supplier_name = serializers.CharField(
         source="supplier.supplier_name",
@@ -999,7 +1173,6 @@ class SupplierBillSerializer(serializers.ModelSerializer):
         many=True,
         required=True,
     )
-
     attachments = SupplierBillAttachmentSerializer(
         many=True,
         read_only=True,
@@ -1008,10 +1181,13 @@ class SupplierBillSerializer(serializers.ModelSerializer):
     class Meta:
         model = SupplierBill
         fields = "__all__"
-
         read_only_fields = [
             "bill_number",
+            "subtotal",
+            "vat_amount",
+            "total_amount",
             "balance_due",
+            "match_status",
             "approved_by",
             "approved_at",
             "created_by",
@@ -1020,41 +1196,20 @@ class SupplierBillSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
-        extra_kwargs = {
-            "bill_number": {
-                "required": False,
-            },
-        }
-
     def _generate_number(self):
         prefix = timezone.localdate().strftime("SB-%Y%m-")
-
         last_bill = (
             SupplierBill.objects.select_for_update()
-            .filter(
-                bill_number__startswith=prefix,
-            )
+            .filter(bill_number__startswith=prefix)
             .order_by("-bill_number")
-            .values_list(
-                "bill_number",
-                flat=True,
-            )
+            .values_list("bill_number", flat=True)
             .first()
         )
 
         sequence = 1
-
         if last_bill:
             try:
-                sequence = (
-                    int(
-                        last_bill.rsplit(
-                            "-",
-                            1,
-                        )[-1]
-                    )
-                    + 1
-                )
+                sequence = int(last_bill.rsplit("-", 1)[-1]) + 1
             except (TypeError, ValueError):
                 sequence = (
                     SupplierBill.objects.filter(
@@ -1063,54 +1218,50 @@ class SupplierBillSerializer(serializers.ModelSerializer):
                     + 1
                 )
 
-        bill_number = f"{prefix}{sequence:04d}"
-
-        while SupplierBill.objects.filter(
-            bill_number=bill_number,
-        ).exists():
+        candidate = f"{prefix}{sequence:04d}"
+        while SupplierBill.objects.filter(bill_number=candidate).exists():
             sequence += 1
-            bill_number = f"{prefix}{sequence:04d}"
-
-        return bill_number
+            candidate = f"{prefix}{sequence:04d}"
+        return candidate
 
     def validate(self, attrs):
         purchase_order = attrs.get(
             "purchase_order",
-            getattr(
-                self.instance,
-                "purchase_order",
-                None,
-            ),
+            getattr(self.instance, "purchase_order", None),
         )
-
         grn = attrs.get(
             "grn",
-            getattr(
-                self.instance,
-                "grn",
-                None,
-            ),
+            getattr(self.instance, "grn", None),
         )
-
         supplier = attrs.get(
             "supplier",
-            getattr(
-                self.instance,
-                "supplier",
-                None,
-            ),
+            getattr(self.instance, "supplier", None),
         )
-
         branch = attrs.get(
             "branch",
-            getattr(
-                self.instance,
-                "branch",
-                None,
-            ),
+            getattr(self.instance, "branch", None),
         )
+        requested_status = str(
+            attrs.get(
+                "status",
+                getattr(self.instance, "status", "DRAFT"),
+            )
+            or "DRAFT"
+        ).upper()
 
         errors = {}
+
+        if self.instance and self.instance.approved_at:
+            errors["status"] = "Approved Supplier Bills cannot be edited."
+
+        editable_statuses = {
+            value
+            for value, _label in SupplierBill.STATUS_CHOICES
+            if value in {"DRAFT", "UNMATCHED"}
+        }
+
+        if requested_status not in editable_statuses:
+            errors["status"] = "Use the approval action to approve a Supplier Bill."
 
         if not purchase_order:
             errors["purchase_order"] = "Purchase Order Reference is required."
@@ -1119,192 +1270,210 @@ class SupplierBillSerializer(serializers.ModelSerializer):
             errors["grn"] = "A confirmed GRN is required."
 
         if purchase_order:
-            if supplier and purchase_order.supplier_id != supplier.id:
-                errors["supplier"] = (
-                    "Supplier must match the " "selected Purchase Order."
-                )
+            if not supplier:
+                attrs["supplier"] = purchase_order.supplier
+                supplier = purchase_order.supplier
 
-            if branch and purchase_order.branch_id != branch.id:
-                errors["branch"] = "Branch must match the " "selected Purchase Order."
+            if not branch:
+                attrs["branch"] = purchase_order.branch
+                branch = purchase_order.branch
+
+            if purchase_order.supplier_id != supplier.id:
+                errors["supplier"] = "Supplier must match the selected Purchase Order."
+
+            if purchase_order.branch_id != branch.id:
+                errors["branch"] = "Branch must match the selected Purchase Order."
 
         if grn:
             if not grn.is_confirmed:
-                errors["grn"] = (
-                    "Only a confirmed GRN can be " "used for a Supplier Bill."
-                )
+                errors["grn"] = "Only a confirmed GRN can be used for a Supplier Bill."
 
             if purchase_order and grn.purchase_order_id != purchase_order.id:
                 errors["grn"] = (
-                    "The selected GRN does not belong "
-                    "to the selected Purchase Order."
+                    "The selected GRN does not belong to the "
+                    "selected Purchase Order."
                 )
 
             if supplier and grn.supplier_id != supplier.id:
-                errors["supplier"] = "Supplier must match the " "selected GRN."
+                errors["supplier"] = "Supplier must match the selected GRN."
 
             if branch and grn.branch_id != branch.id:
-                errors["branch"] = "Branch must match the " "selected GRN."
+                errors["branch"] = "Branch must match the selected GRN."
 
-        total = Decimal(
-            str(
-                attrs.get(
-                    "total_amount",
-                    getattr(
-                        self.instance,
-                        "total_amount",
-                        0,
-                    ),
-                )
-                or 0
+        supplier_invoice_number = str(
+            attrs.get(
+                "supplier_invoice_number",
+                getattr(
+                    self.instance,
+                    "supplier_invoice_number",
+                    "",
+                ),
             )
+            or ""
+        ).strip()
+
+        if not supplier_invoice_number:
+            errors["supplier_invoice_number"] = "Supplier invoice number is required."
+        elif supplier:
+            duplicate_query = SupplierBill.objects.filter(
+                supplier=supplier,
+                supplier_invoice_number__iexact=(supplier_invoice_number),
+            )
+            if self.instance:
+                duplicate_query = duplicate_query.exclude(pk=self.instance.pk)
+            if duplicate_query.exists():
+                errors["supplier_invoice_number"] = (
+                    "This supplier invoice number already exists "
+                    "for the selected supplier."
+                )
+
+        bill_date = attrs.get(
+            "bill_date",
+            getattr(self.instance, "bill_date", None),
+        )
+        due_date = attrs.get(
+            "due_date",
+            getattr(self.instance, "due_date", None),
         )
 
-        paid = Decimal(
-            str(
-                attrs.get(
-                    "paid_amount",
-                    getattr(
-                        self.instance,
-                        "paid_amount",
-                        0,
-                    ),
-                )
-                or 0
-            )
-        )
-
-        if paid < 0:
-            errors["paid_amount"] = "Paid amount cannot be negative."
-
-        if paid > total:
-            errors["paid_amount"] = "Paid amount cannot exceed " "the bill total."
+        if bill_date and due_date and due_date < bill_date:
+            errors["due_date"] = "Due date cannot be before the bill date."
 
         if errors:
             raise serializers.ValidationError(errors)
 
-        attrs["balance_due"] = max(
-            Decimal("0"),
-            total - paid,
+        attrs["supplier_invoice_number"] = supplier_invoice_number
+        attrs["paid_amount"] = (
+            getattr(self.instance, "paid_amount", Decimal("0"))
+            if self.instance
+            else Decimal("0")
         )
-
-        requested_status = attrs.get(
-            "status",
-            getattr(
-                self.instance,
-                "status",
-                "DRAFT",
-            ),
-        )
-
-        if requested_status not in {
-            "DRAFT",
-            "UNMATCHED",
-            "CANCELLED",
-        }:
-            attrs["status"] = (
-                "PAID"
-                if attrs["balance_due"] == 0
-                else ("PARTIALLY_PAID" if paid > 0 else "UNPAID")
-            )
-
         return attrs
 
-    def _save_items(
-        self,
-        bill,
-        items,
-    ):
+    def _calculate_item_values(self, item):
+        bill_quantity = int(item["bill_quantity"])
+        received_quantity = int(item["received_quantity"])
+        unit_cost = Decimal(str(item["unit_cost"]))
+        discount_amount = Decimal(str(item.get("discount_amount", 0) or 0))
+        vat_percentage = Decimal(str(item.get("vat_percentage", 0) or 0))
+
+        gross = Decimal(bill_quantity) * unit_cost
+        taxable = max(
+            Decimal("0"),
+            gross - discount_amount,
+        )
+        vat_amount = taxable * vat_percentage / Decimal("100")
+
+        return {
+            "received_quantity": received_quantity,
+            "bill_quantity": bill_quantity,
+            "unit_cost": unit_cost,
+            "discount_amount": discount_amount,
+            "vat_percentage": vat_percentage,
+            "subtotal": taxable,
+            "vat_amount": vat_amount,
+            "line_total": taxable + vat_amount,
+        }
+
+    def _save_items(self, bill, items):
         bill.items.all().delete()
 
-        for item in items:
-            received_quantity = int(item["received_quantity"])
+        subtotal = Decimal("0")
+        vat_amount = Decimal("0")
+        item_total = Decimal("0")
 
-            bill_quantity = int(item["bill_quantity"])
+        for raw_item in items:
+            item = dict(raw_item)
 
-            unit_cost = Decimal(str(item["unit_cost"]))
+            for field in (
+                "id",
+                "available_bill_quantity",
+                "quantity",
+                "unit_price",
+                "subtotal",
+                "product_name",
+                "variant_name",
+                "sku",
+            ):
+                item.pop(field, None)
 
-            discount_amount = Decimal(
-                str(
-                    item.get(
-                        "discount_amount",
-                        0,
-                    )
-                    or 0
-                )
-            )
-
-            vat_percentage = Decimal(
-                str(
-                    item.get(
-                        "vat_percentage",
-                        0,
-                    )
-                    or 0
-                )
-            )
-
-            if bill_quantity <= 0:
-                raise serializers.ValidationError(
-                    {"items": ("Bill quantity must be " "greater than zero.")}
-                )
-
-            if bill_quantity > received_quantity:
-                raise serializers.ValidationError(
-                    {"items": ("Bill quantity cannot exceed " "the received quantity.")}
-                )
-
-            gross = Decimal(str(bill_quantity)) * unit_cost
-
-            taxable = max(
-                Decimal("0"),
-                gross - discount_amount,
-            )
-
-            vat_amount = taxable * vat_percentage / Decimal("100")
-
-            line_total = taxable + vat_amount
+            values = self._calculate_item_values(item)
 
             SupplierBillItem.objects.create(
                 bill=bill,
                 grn_item=item["grn_item"],
                 product=item["product"],
                 variant=item.get("variant"),
-                received_quantity=(received_quantity),
-                bill_quantity=(bill_quantity),
-                unit_cost=unit_cost,
-                discount_amount=(discount_amount),
-                vat_percentage=(vat_percentage),
-                vat_amount=vat_amount,
-                line_total=line_total,
+                received_quantity=values["received_quantity"],
+                bill_quantity=values["bill_quantity"],
+                unit_cost=values["unit_cost"],
+                discount_amount=values["discount_amount"],
+                vat_percentage=values["vat_percentage"],
+                vat_amount=values["vat_amount"],
+                line_total=values["line_total"],
             )
+
+            subtotal += values["subtotal"]
+            vat_amount += values["vat_amount"]
+            item_total += values["line_total"]
+
+        header_discount = Decimal(str(bill.discount_amount or 0))
+
+        if header_discount < 0:
+            raise serializers.ValidationError(
+                {"discount_amount": "Discount cannot be negative."}
+            )
+
+        if header_discount > item_total:
+            raise serializers.ValidationError(
+                {
+                    "discount_amount": (
+                        "Additional discount cannot exceed the " "bill amount."
+                    )
+                }
+            )
+
+        total_amount = max(
+            Decimal("0"),
+            item_total - header_discount,
+        )
+
+        bill.subtotal = subtotal
+        bill.vat_amount = vat_amount
+        bill.total_amount = total_amount
+        bill.paid_amount = Decimal("0")
+        bill.balance_due = total_amount
+        bill.match_status = "PENDING"
+        bill.save(
+            update_fields=[
+                "subtotal",
+                "vat_amount",
+                "total_amount",
+                "paid_amount",
+                "balance_due",
+                "match_status",
+                "updated_at",
+            ]
+        )
 
     @transaction.atomic
-    def create(
-        self,
-        validated_data,
-    ):
-        items = validated_data.pop(
-            "items",
-            [],
-        )
-
+    def create(self, validated_data):
+        items = validated_data.pop("items", [])
         if not items:
             raise serializers.ValidationError(
-                {"items": ("At least one Supplier Bill " "item is required.")}
+                {"items": ("At least one Supplier Bill item is required.")}
             )
 
-        # Ignore any bill number submitted by older frontend code.
-        validated_data.pop(
-            "bill_number",
-            None,
-        )
-
+        validated_data.pop("bill_number", None)
         validated_data["bill_number"] = self._generate_number()
+        validated_data["paid_amount"] = Decimal("0")
+        validated_data["balance_due"] = Decimal("0")
+        validated_data["match_status"] = "PENDING"
 
-        bill = SupplierBill.objects.create(
-            **validated_data,
-        )
+        bill = SupplierBill.objects.create(**validated_data)
 
+        # Nested item data has already been validated by DRF. Related fields
+        # such as product and grn_item are model instances at this point.
         self._save_items(
             bill,
             items,
@@ -1313,33 +1482,25 @@ class SupplierBillSerializer(serializers.ModelSerializer):
         return bill
 
     @transaction.atomic
-    def update(
-        self,
-        instance,
-        validated_data,
-    ):
-        items = validated_data.pop(
-            "items",
-            None,
-        )
+    def update(self, instance, validated_data):
+        if instance.approved_at:
+            raise serializers.ValidationError(
+                {"status": "Approved Supplier Bills cannot be edited."}
+            )
 
-        # Bill number must never change during edit.
-        validated_data.pop(
-            "bill_number",
-            None,
-        )
+        items = validated_data.pop("items", None)
+        validated_data.pop("bill_number", None)
+        validated_data.pop("paid_amount", None)
 
-        instance = super().update(
-            instance,
-            validated_data,
-        )
+        instance = super().update(instance, validated_data)
 
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": ("At least one Supplier Bill " "item is required.")}
+                    {"items": ("At least one Supplier Bill item is required.")}
                 )
 
+            # Do not revalidate model instances as raw primary keys.
             self._save_items(
                 instance,
                 items,
@@ -1369,7 +1530,6 @@ class SupplierBillItemDetailSerializer(serializers.ModelSerializer):
             "variant",
             "variant_name",
             "sku",
-            "description",
             "received_quantity",
             "bill_quantity",
             "quantity",
@@ -1525,7 +1685,6 @@ class SupplierBillDetailSerializer(serializers.ModelSerializer):
     )
 
     payment_allocations = SupplierBillPaymentAllocationSerializer(
-        source="payment_allocations",
         many=True,
         read_only=True,
     )
@@ -1621,6 +1780,8 @@ class PaymentAllocationSerializer(serializers.ModelSerializer):
 
 class SupplierPaymentSerializer(serializers.ModelSerializer):
     payment_number = serializers.CharField(read_only=True)
+    paid_by_name = serializers.SerializerMethodField()
+
     allocations = PaymentAllocationSerializer(
         many=True,
         required=False,
@@ -1638,40 +1799,263 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
         model = SupplierPayment
         fields = "__all__"
         read_only_fields = [
+            "payment_number",
             "paid_by",
             "created_by",
             "updated_by",
         ]
 
-    @transaction.atomic
-    def create(self, validated_data):
-        allocations = validated_data.pop(
-            "allocations",
-            [],
+    def get_paid_by_name(self, obj):
+        user = obj.paid_by
+
+        if not user:
+            return ""
+
+        full_name = (
+            user.get_full_name().strip() if hasattr(user, "get_full_name") else ""
         )
 
-        payment = SupplierPayment.objects.create(**validated_data)
+        return (
+            full_name
+            or getattr(user, "display_name", "")
+            or getattr(user, "username", "")
+            or getattr(user, "email", "")
+        )
+
+    def _generate_payment_number(self, branch):
+        """
+        Generate a branch-specific sequential payment number.
+
+        Locking the branch row ensures that two requests for the same branch
+        cannot calculate the same next sequence concurrently.
+        """
+        from apps.branches.models import Branch
+
+        locked_branch = Branch.objects.select_for_update().get(
+            pk=branch.pk,
+        )
+
+        branch_code = (
+            str(getattr(locked_branch, "branch_code", "") or f"B{locked_branch.pk}")
+            .strip()
+            .upper()
+            .replace(" ", "")
+        )
+
+        prefix = f"SP-{branch_code}-" f"{timezone.localdate():%Y%m}-"
+
+        latest_number = (
+            SupplierPayment.objects.filter(
+                payment_number__startswith=prefix,
+            )
+            .order_by("-payment_number")
+            .values_list("payment_number", flat=True)
+            .first()
+        )
+
+        sequence = 1
+
+        if latest_number:
+            try:
+                sequence = int(latest_number.rsplit("-", 1)[-1]) + 1
+            except (TypeError, ValueError):
+                sequence = (
+                    SupplierPayment.objects.filter(
+                        payment_number__startswith=prefix,
+                    ).count()
+                    + 1
+                )
+
+        candidate = f"{prefix}{sequence:04d}"
+
+        while SupplierPayment.objects.filter(
+            payment_number=candidate,
+        ).exists():
+            sequence += 1
+            candidate = f"{prefix}{sequence:04d}"
+
+        return candidate
+
+    def validate(self, attrs):
+        supplier = attrs.get(
+            "supplier",
+            getattr(self.instance, "supplier", None),
+        )
+        branch = attrs.get(
+            "branch",
+            getattr(self.instance, "branch", None),
+        )
+        payment_method = attrs.get(
+            "payment_method",
+            getattr(self.instance, "payment_method", None),
+        )
+        bank_account = attrs.get(
+            "bank_account",
+            getattr(self.instance, "bank_account", None),
+        )
+        cash_register = attrs.get(
+            "cash_register",
+            getattr(self.instance, "cash_register", None),
+        )
+        amount = Decimal(
+            str(
+                attrs.get(
+                    "amount",
+                    getattr(self.instance, "amount", 0),
+                )
+                or 0
+            )
+        )
+
+        errors = {}
+
+        if not supplier:
+            errors["supplier"] = "Supplier is required."
+
+        if not branch:
+            errors["branch"] = "Branch is required."
+
+        if (
+            supplier
+            and branch
+            and getattr(supplier, "branch_id", None)
+            and supplier.branch_id != branch.id
+        ):
+            errors["supplier"] = "Supplier must belong to the selected branch."
+
+        if amount <= Decimal("0.00"):
+            errors["amount"] = "Payment amount must be greater than zero."
+
+        if payment_method == "CASH":
+            if not cash_register:
+                errors["cash_register"] = "Cash register is required for cash payments."
+            attrs["bank_account"] = None
+
+        elif payment_method in {
+            "BANK_TRANSFER",
+            "CHEQUE",
+            "CARD",
+        }:
+            if not bank_account:
+                errors["bank_account"] = (
+                    "Bank account is required for this payment method."
+                )
+            attrs["cash_register"] = None
+
+        if payment_method == "CHEQUE":
+            cheque_number = str(
+                attrs.get(
+                    "cheque_number",
+                    getattr(self.instance, "cheque_number", ""),
+                )
+                or ""
+            ).strip()
+            cheque_date = attrs.get(
+                "cheque_date",
+                getattr(self.instance, "cheque_date", None),
+            )
+
+            if not cheque_number:
+                errors["cheque_number"] = "Cheque number is required."
+            if not cheque_date:
+                errors["cheque_date"] = "Cheque date is required."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs["amount"] = amount
+        return attrs
+
+    def _validate_allocations(
+        self,
+        *,
+        allocations,
+        supplier,
+        branch,
+        payment_amount,
+    ):
+        if not allocations:
+            raise serializers.ValidationError(
+                {
+                    "allocations": (
+                        "Allocate the payment to at least one " "Supplier Bill."
+                    )
+                }
+            )
+
+        bill_ids = [allocation["bill"].pk for allocation in allocations]
+
+        if len(bill_ids) != len(set(bill_ids)):
+            raise serializers.ValidationError(
+                {
+                    "allocations": (
+                        "The same Supplier Bill cannot be " "allocated more than once."
+                    )
+                }
+            )
+
+        locked_bills = {
+            bill.pk: bill
+            for bill in SupplierBill.objects.select_for_update().filter(pk__in=bill_ids)
+        }
 
         allocated_total = Decimal("0.00")
+        prepared = []
 
-        for allocation in allocations:
-            bill = SupplierBill.objects.select_for_update().get(
-                pk=allocation["bill"].pk
-            )
+        for index, allocation in enumerate(allocations):
+            bill = locked_bills.get(allocation["bill"].pk)
 
-            amount = Decimal(
-                str(
-                    allocation.get(
-                        "amount",
-                        0,
-                    )
-                    or 0
+            if not bill:
+                raise serializers.ValidationError(
+                    {
+                        "allocations": (
+                            f"Allocation {index + 1}: Supplier Bill " "was not found."
+                        )
+                    }
                 )
-            )
+
+            if bill.supplier_id != supplier.id:
+                raise serializers.ValidationError(
+                    {
+                        "allocations": (
+                            f"Allocation {index + 1}: "
+                            f"{bill.bill_number} belongs to another "
+                            "supplier."
+                        )
+                    }
+                )
+
+            if bill.branch_id != branch.id:
+                raise serializers.ValidationError(
+                    {
+                        "allocations": (
+                            f"Allocation {index + 1}: "
+                            f"{bill.bill_number} belongs to another "
+                            "branch."
+                        )
+                    }
+                )
+
+            if bill.status == "CANCELLED":
+                raise serializers.ValidationError(
+                    {
+                        "allocations": (
+                            f"Allocation {index + 1}: cancelled bill "
+                            f"{bill.bill_number} cannot receive a payment."
+                        )
+                    }
+                )
+
+            amount = Decimal(str(allocation.get("amount", 0) or 0))
 
             if amount <= Decimal("0.00"):
                 raise serializers.ValidationError(
-                    {"allocations": ("Allocation amount must be greater than zero.")}
+                    {
+                        "allocations": (
+                            f"Allocation {index + 1}: amount must be "
+                            "greater than zero."
+                        )
+                    }
                 )
 
             current_balance = Decimal(
@@ -1686,41 +2070,80 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {
                         "allocations": (
-                            f"Allocation exceeds balance for "
-                            f"{bill.bill_number}. "
-                            f"Available balance is "
+                            f"Allocation for {bill.bill_number} "
+                            f"exceeds its available balance of "
                             f"{current_balance:.2f}."
                         )
                     }
                 )
 
-            if allocated_total + amount > payment.amount:
-                raise serializers.ValidationError(
-                    {"allocations": ("Allocated amount exceeds payment amount.")}
-                )
+            allocated_total += amount
+            prepared.append((bill, amount))
 
+        if allocated_total > payment_amount:
+            raise serializers.ValidationError(
+                {
+                    "allocations": (
+                        "Total allocated amount cannot exceed the " "payment amount."
+                    )
+                }
+            )
+
+        # Require complete allocation to prevent unexplained payment balances.
+        if allocated_total != payment_amount:
+            raise serializers.ValidationError(
+                {
+                    "allocations": (
+                        "Total allocated amount must equal the "
+                        f"payment amount ({payment_amount:.2f})."
+                    )
+                }
+            )
+
+        return prepared
+
+    @transaction.atomic
+    def create(self, validated_data):
+        allocations = validated_data.pop(
+            "allocations",
+            [],
+        )
+
+        # Never accept an empty/old frontend-generated number.
+        validated_data.pop("payment_number", None)
+
+        supplier = validated_data["supplier"]
+        branch = validated_data["branch"]
+        payment_amount = Decimal(str(validated_data.get("amount", 0) or 0))
+
+        prepared_allocations = self._validate_allocations(
+            allocations=allocations,
+            supplier=supplier,
+            branch=branch,
+            payment_amount=payment_amount,
+        )
+
+        validated_data["payment_number"] = self._generate_payment_number(branch)
+
+        payment = SupplierPayment.objects.create(**validated_data)
+
+        for bill, amount in prepared_allocations:
             SupplierPaymentAllocation.objects.create(
                 payment=payment,
                 bill=bill,
                 amount=amount,
             )
 
-            bill.paid_amount = Decimal(str(bill.paid_amount or 0)) + amount
-
-            bill.balance_due = max(
+            paid_amount = Decimal(str(bill.paid_amount or 0)) + amount
+            total_amount = Decimal(str(bill.total_amount or 0))
+            balance_due = max(
                 Decimal("0.00"),
-                Decimal(str(bill.total_amount or 0)) - bill.paid_amount,
+                total_amount - paid_amount,
             )
 
-            if bill.balance_due == Decimal("0.00"):
-                bill.status = "PAID"
-
-            elif bill.paid_amount > Decimal("0.00"):
-                bill.status = "PARTIALLY_PAID"
-
-            else:
-                bill.status = "UNPAID"
-
+            bill.paid_amount = paid_amount
+            bill.balance_due = balance_due
+            bill.status = "PAID" if balance_due == Decimal("0.00") else "PARTIALLY_PAID"
             bill.save(
                 update_fields=[
                     "paid_amount",
@@ -1729,8 +2152,6 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
                     "updated_at",
                 ]
             )
-
-            allocated_total += amount
 
         return payment
 
@@ -1776,36 +2197,47 @@ class SupplierReturnItemSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     sku = serializers.SerializerMethodField()
-    total_quantity = serializers.SerializerMethodField()
-    available_regular_quantity = serializers.SerializerMethodField()
-    available_restricted_quantity = serializers.SerializerMethodField()
+    available_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReturnItem
-        exclude = ["supplier_return"]
-        read_only_fields = [
+        fields = [
+            "id",
+            "grn_item",
+            "product",
+            "product_name",
+            "variant",
+            "sku",
+            "received_quantity",
+            "available_quantity",
             "quantity",
+            "unit_price",
+            "tax_treatment",
+            "vat_percentage",
+            "vat_amount",
             "line_total",
-            "total_quantity",
-            "available_regular_quantity",
-            "available_restricted_quantity",
+            "reason",
+        ]
+        read_only_fields = [
+            "id",
+            "product_name",
+            "sku",
+            "available_quantity",
+            "vat_amount",
+            "line_total",
         ]
 
     def get_sku(self, obj):
         if obj.variant and getattr(obj.variant, "sku", None):
             return obj.variant.sku
+
         return getattr(obj.product, "sku", "")
 
-    def get_total_quantity(self, obj):
-        return int(obj.regular_quantity or 0) + int(obj.restricted_quantity or 0)
-
-    def _already_returned(self, grn_item, classification):
-        if not grn_item:
-            return 0
-
-        field = (
-            "regular_quantity" if classification == "REGULAR" else "restricted_quantity"
-        )
+    def _already_returned(
+        self,
+        grn_item,
+        exclude_return_id=None,
+    ):
         queryset = SupplierReturnItem.objects.filter(
             grn_item=grn_item,
             supplier_return__status__in=[
@@ -1814,135 +2246,183 @@ class SupplierReturnItemSerializer(serializers.ModelSerializer):
                 "CREDIT_ISSUED",
             ],
         )
-        if self.instance:
-            queryset = queryset.exclude(pk=self.instance.pk)
 
-        return int(queryset.aggregate(total=Sum(field))["total"] or 0)
+        if exclude_return_id:
+            queryset = queryset.exclude(
+                supplier_return_id=exclude_return_id,
+            )
 
-    def get_available_regular_quantity(self, obj):
-        source = obj.grn_item
-        accepted = int(getattr(source, "regular_accepted_quantity", 0) or 0)
-        return max(0, accepted - self._already_returned(source, "REGULAR"))
+        return int(queryset.aggregate(total=Sum("quantity"))["total"] or 0)
 
-    def get_available_restricted_quantity(self, obj):
-        source = obj.grn_item
-        accepted = int(getattr(source, "restricted_accepted_quantity", 0) or 0)
-        return max(
-            0,
-            accepted - self._already_returned(source, "RESTRICTED"),
+    def get_available_quantity(self, obj):
+        if not obj.grn_item_id:
+            return 0
+
+        accepted = int(
+            obj.grn_item.accepted_quantity or obj.grn_item.received_quantity or 0
         )
 
-    def validate(self, attrs):
-        from apps.common.sensitive_permissions import has_sensitive_permission
+        already_returned = self._already_returned(
+            obj.grn_item,
+            exclude_return_id=obj.supplier_return_id,
+        )
 
+        return max(0, accepted - already_returned)
+
+    def validate(self, attrs):
         grn_item = attrs.get(
             "grn_item",
             getattr(self.instance, "grn_item", None),
         )
-        regular = int(
+        product = attrs.get(
+            "product",
+            getattr(self.instance, "product", None),
+        )
+        variant = attrs.get(
+            "variant",
+            getattr(self.instance, "variant", None),
+        )
+
+        quantity = int(
             attrs.get(
-                "regular_quantity",
-                getattr(self.instance, "regular_quantity", 0),
+                "quantity",
+                getattr(self.instance, "quantity", 0),
             )
             or 0
         )
-        restricted = int(
-            attrs.get(
-                "restricted_quantity",
-                getattr(self.instance, "restricted_quantity", 0),
+
+        unit_price = Decimal(
+            str(
+                attrs.get(
+                    "unit_price",
+                    getattr(self.instance, "unit_price", 0),
+                )
+                or 0
             )
-            or 0
+        )
+
+        tax_treatment = str(
+            attrs.get(
+                "tax_treatment",
+                getattr(
+                    self.instance,
+                    "tax_treatment",
+                    "STANDARD_VAT",
+                ),
+            )
+            or "STANDARD_VAT"
+        ).upper()
+
+        if tax_treatment in {
+            "ZERO_RATED",
+            "ZERO_VAT",
+        }:
+            tax_treatment = "ZERO_VAT"
+        elif tax_treatment in {
+            "EXEMPT",
+            "NON_TAXABLE",
+            "NON_VAT",
+            "OUT_OF_SCOPE",
+        }:
+            tax_treatment = "NON_VAT"
+        else:
+            tax_treatment = "STANDARD_VAT"
+
+        vat_percentage = Decimal(
+            str(
+                attrs.get(
+                    "vat_percentage",
+                    getattr(self.instance, "vat_percentage", 0),
+                )
+                or 0
+            )
         )
 
         errors = {}
 
         if not grn_item:
-            errors["grn_item"] = "Select a GRN item."
+            errors["grn_item"] = "GRN item is required."
 
-        if regular < 0:
-            errors["regular_quantity"] = "Regular return quantity cannot be negative."
+        if not product:
+            errors["product"] = "Product is required."
 
-        if restricted < 0:
-            errors["restricted_quantity"] = (
-                "Restricted return quantity cannot be negative."
-            )
-
-        total = regular + restricted
-        if total <= 0:
-            errors["quantity"] = "Enter a regular or restricted return quantity."
-
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
-        if restricted > 0 and not has_sensitive_permission(
-            user,
-            "create_restricted_purchase",
-        ):
-            errors["restricted_quantity"] = (
-                "You are not authorized to return restricted stock."
-            )
+        if grn_item and product and grn_item.product_id != product.id:
+            errors["product"] = "Product must match the selected GRN item."
 
         if grn_item:
-            accepted_regular = int(
-                getattr(grn_item, "regular_accepted_quantity", 0) or 0
-            )
-            accepted_restricted = int(
-                getattr(grn_item, "restricted_accepted_quantity", 0) or 0
+            grn_variant_id = grn_item.variant_id
+            variant_id = variant.id if variant else None
+
+            if grn_variant_id != variant_id:
+                errors["variant"] = "Variant must match the selected GRN item."
+
+            accepted = int(
+                grn_item.accepted_quantity or grn_item.received_quantity or 0
             )
 
-            returned_regular = self._already_returned(
+            exclude_return_id = (
+                self.instance.supplier_return_id
+                if self.instance
+                else self.context.get("supplier_return_id")
+            )
+
+            returned = self._already_returned(
                 grn_item,
-                "REGULAR",
-            )
-            returned_restricted = self._already_returned(
-                grn_item,
-                "RESTRICTED",
+                exclude_return_id=exclude_return_id,
             )
 
-            available_regular = max(
-                0,
-                accepted_regular - returned_regular,
-            )
-            available_restricted = max(
-                0,
-                accepted_restricted - returned_restricted,
-            )
+            available = max(0, accepted - returned)
 
-            if regular > available_regular:
-                errors["regular_quantity"] = (
-                    f"Regular return quantity cannot exceed " f"{available_regular}."
+            if quantity > available:
+                errors["quantity"] = (
+                    "Return quantity cannot exceed the remaining "
+                    f"returnable quantity ({available})."
                 )
 
-            if restricted > available_restricted:
-                errors["restricted_quantity"] = (
-                    f"Restricted return quantity cannot exceed "
-                    f"{available_restricted}."
-                )
+            attrs["received_quantity"] = accepted
+
+        if quantity <= 0:
+            errors["quantity"] = "Return quantity must be greater than zero."
+
+        if unit_price < 0:
+            errors["unit_price"] = "Unit price cannot be negative."
+
+        if vat_percentage < 0:
+            errors["vat_percentage"] = "VAT percentage cannot be negative."
+
+        if tax_treatment != "STANDARD_VAT":
+            vat_percentage = Decimal("0")
 
         if errors:
             raise serializers.ValidationError(errors)
 
-        attrs["quantity"] = total
-        attrs["received_quantity"] = total
+        net_amount = Decimal(quantity) * unit_price
+        vat_amount = net_amount * vat_percentage / Decimal("100")
+
+        attrs["quantity"] = quantity
+        attrs["unit_price"] = unit_price
+        attrs["tax_treatment"] = tax_treatment
+        attrs["vat_percentage"] = vat_percentage
+        attrs["vat_amount"] = vat_amount
+        attrs["line_total"] = net_amount + vat_amount
+
         return attrs
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-
-        from apps.common.sensitive_permissions import has_sensitive_permission
-
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
-        if not has_sensitive_permission(user, "view_restricted_purchase"):
-            data.pop("restricted_quantity", None)
-            data.pop("available_restricted_quantity", None)
-            data["quantity"] = int(instance.regular_quantity or 0)
-            data["total_quantity"] = int(instance.regular_quantity or 0)
-
-        return data
 
 
 class SupplierReturnSerializer(serializers.ModelSerializer):
     return_number = serializers.CharField(
+        read_only=True,
+    )
+
+    subtotal = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    vat_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
         read_only=True,
     )
 
@@ -2003,6 +2483,8 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
 
         read_only_fields = [
             "return_number",
+            "subtotal",
+            "vat_amount",
             "total_amount",
             "approved_at",
             "approved_by",
@@ -2016,6 +2498,12 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
 
         extra_kwargs = {
             "return_number": {
+                "required": False,
+            },
+            "subtotal": {
+                "required": False,
+            },
+            "vat_amount": {
                 "required": False,
             },
             "total_amount": {
@@ -2072,6 +2560,28 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
 
         return candidate
 
+    def _normalize_tax_treatment(self, value):
+        treatment = str(value or "STANDARD_VAT").strip().upper()
+
+        if treatment in {
+            "ZERO_VAT",
+            "ZERO_RATED",
+            "ZERO-RATED",
+        }:
+            return "ZERO_VAT"
+
+        if treatment in {
+            "NON_VAT",
+            "NON-VAT",
+            "OUT_OF_SCOPE",
+            "EXEMPT",
+            "VAT_EXEMPT",
+            "NON_TAXABLE",
+        }:
+            return "NON_VAT"
+
+        return "STANDARD_VAT"
+
     def validate(self, attrs):
         grn = attrs.get(
             "grn",
@@ -2104,7 +2614,6 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
 
         if not grn:
             errors["grn"] = "A confirmed GRN is required."
-
         elif not grn.is_confirmed:
             errors["grn"] = "Only a confirmed GRN can be returned."
 
@@ -2114,17 +2623,40 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
         if grn and branch and branch.id != grn.branch_id:
             errors["branch"] = "Branch must match the selected GRN."
 
+        if grn:
+            if not supplier:
+                attrs["supplier"] = grn.supplier
+
+            if not branch:
+                attrs["branch"] = grn.branch
+
         if errors:
             raise serializers.ValidationError(errors)
 
         return attrs
+
+    def _get_po_item(self, grn, grn_item):
+        return (
+            grn.purchase_order.items.filter(
+                product_id=grn_item.product_id,
+                variant_id=grn_item.variant_id,
+            )
+            .order_by("id")
+            .first()
+        )
 
     def _validate_items(
         self,
         grn,
         items,
     ):
-        grn_items = {item.id: item for item in grn.items.all()}
+        grn_items = {
+            item.id: item
+            for item in grn.items.select_related(
+                "product",
+                "variant",
+            ).all()
+        }
 
         for item in items:
             grn_item = item.get("grn_item")
@@ -2144,7 +2676,6 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
                 )
 
             variant = item.get("variant")
-
             variant_id = variant.id if variant else None
 
             if variant_id != source.variant_id:
@@ -2152,7 +2683,7 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
                     {"items": ("Return variant does not match " "the GRN item.")}
                 )
 
-            previously_returned = (
+            previously_returned = int(
                 SupplierReturnItem.objects.filter(
                     grn_item=source,
                     supplier_return__status__in=[
@@ -2165,106 +2696,158 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
                     supplier_return=self.instance,
                 )
                 .aggregate(
-                    regular=Sum("regular_quantity"),
-                    restricted=Sum("restricted_quantity"),
-                )
-            )
-
-            accepted_regular = int(
-                getattr(
-                    source,
-                    "regular_accepted_quantity",
-                    0,
-                )
+                    total=Sum("quantity"),
+                )["total"]
                 or 0
             )
 
-            accepted_restricted = int(
-                getattr(
-                    source,
-                    "restricted_accepted_quantity",
-                    0,
-                )
-                or 0
+            accepted_quantity = int(
+                source.accepted_quantity or source.received_quantity or 0
             )
 
-            # Backward compatibility for older GRN records.
-            if (
-                accepted_regular == 0
-                and accepted_restricted == 0
-                and int(source.accepted_quantity or 0) > 0
-            ):
-                accepted_regular = int(source.accepted_quantity or 0)
-
-            already_regular = int(previously_returned["regular"] or 0)
-
-            already_restricted = int(previously_returned["restricted"] or 0)
-
-            available_regular = max(
+            available_quantity = max(
                 0,
-                accepted_regular - already_regular,
+                accepted_quantity - previously_returned,
             )
 
-            available_restricted = max(
+            quantity = int(
+                item.get(
+                    "quantity",
+                    0,
+                )
+                or 0
+            )
+
+            if quantity <= 0:
+                raise serializers.ValidationError(
+                    {"items": ("Return quantity must be greater " "than zero.")}
+                )
+
+            if quantity > available_quantity:
+                raise serializers.ValidationError(
+                    {
+                        "items": (
+                            f"Return quantity for {source.product} "
+                            f"exceeds the available quantity of "
+                            f"{available_quantity}."
+                        )
+                    }
+                )
+
+            po_item = self._get_po_item(
+                grn,
+                source,
+            )
+
+            source_tax_treatment = self._normalize_tax_treatment(
+                getattr(
+                    po_item,
+                    "tax_treatment",
+                    getattr(
+                        po_item,
+                        "vat_treatment",
+                        "STANDARD_VAT",
+                    ),
+                )
+                if po_item
+                else "STANDARD_VAT"
+            )
+
+            source_vat_percentage = Decimal(
+                str(
+                    getattr(
+                        po_item,
+                        "vat_percentage",
+                        0,
+                    )
+                    or 0
+                )
+            )
+
+            if source_tax_treatment != "STANDARD_VAT":
+                source_vat_percentage = Decimal("0")
+
+            source_unit_price = Decimal(
+                str(
+                    getattr(
+                        po_item,
+                        "unit_price",
+                        item.get("unit_price", 0),
+                    )
+                    or 0
+                )
+            )
+
+            item["received_quantity"] = accepted_quantity
+            item["quantity"] = quantity
+            item["unit_price"] = source_unit_price
+            item["tax_treatment"] = source_tax_treatment
+            item["vat_percentage"] = source_vat_percentage
+
+    def _calculate_item_values(
+        self,
+        item,
+    ):
+        quantity = int(
+            item.get(
+                "quantity",
                 0,
-                accepted_restricted - already_restricted,
             )
+            or 0
+        )
 
-            regular_quantity = int(
+        unit_price = Decimal(
+            str(
                 item.get(
-                    "regular_quantity",
+                    "unit_price",
                     0,
                 )
                 or 0
             )
+        )
 
-            restricted_quantity = int(
+        tax_treatment = self._normalize_tax_treatment(
+            item.get(
+                "tax_treatment",
+                "STANDARD_VAT",
+            )
+        )
+
+        vat_percentage = Decimal(
+            str(
                 item.get(
-                    "restricted_quantity",
+                    "vat_percentage",
                     0,
                 )
                 or 0
             )
+        )
 
-            total_quantity = regular_quantity + restricted_quantity
+        if tax_treatment != "STANDARD_VAT":
+            vat_percentage = Decimal("0")
 
-            if total_quantity <= 0:
-                raise serializers.ValidationError(
-                    {
-                        "items": (
-                            "Enter at least one regular "
-                            "or restricted return quantity."
-                        )
-                    }
+        net_amount = Decimal(quantity) * unit_price
+
+        item_vat_amount = net_amount * vat_percentage / Decimal("100")
+
+        line_total = net_amount + item_vat_amount
+
+        return {
+            "received_quantity": int(
+                item.get(
+                    "received_quantity",
+                    quantity,
                 )
-
-            if regular_quantity > available_regular:
-                raise serializers.ValidationError(
-                    {
-                        "items": (
-                            f"Regular return quantity for "
-                            f"{source.product} exceeds "
-                            f"the available quantity of "
-                            f"{available_regular}."
-                        )
-                    }
-                )
-
-            if restricted_quantity > available_restricted:
-                raise serializers.ValidationError(
-                    {
-                        "items": (
-                            f"Restricted return quantity for "
-                            f"{source.product} exceeds "
-                            f"the available quantity of "
-                            f"{available_restricted}."
-                        )
-                    }
-                )
-
-            item["quantity"] = total_quantity
-
-            item["received_quantity"] = total_quantity
+                or quantity
+            ),
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "tax_treatment": tax_treatment,
+            "vat_percentage": vat_percentage,
+            "vat_amount": item_vat_amount,
+            "net_amount": net_amount,
+            "line_total": line_total,
+        }
 
     def _save_items(
         self,
@@ -2273,112 +2856,62 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
     ):
         supplier_return.items.all().delete()
 
+        subtotal = Decimal("0.00")
+        vat_amount = Decimal("0.00")
+        total_amount = Decimal("0.00")
+
         for source_item in items:
             item = dict(source_item)
 
-            item.pop(
+            for field in (
                 "id",
-                None,
-            )
-
-            item.pop(
                 "supplier_return",
-                None,
-            )
-
-            item.pop(
-                "line_total",
-                None,
-            )
-
-            regular_quantity = int(
-                item.get(
-                    "regular_quantity",
-                    0,
-                )
-                or 0
-            )
-
-            restricted_quantity = int(
-                item.get(
-                    "restricted_quantity",
-                    0,
-                )
-                or 0
-            )
-
-            total_quantity = regular_quantity + restricted_quantity
-
-            if total_quantity <= 0:
-                raise serializers.ValidationError(
-                    {
-                        "items": (
-                            "Enter at least one regular "
-                            "or restricted return quantity."
-                        )
-                    }
+                "available_quantity",
+                "product_name",
+                "sku",
+            ):
+                item.pop(
+                    field,
+                    None,
                 )
 
-            unit_price = Decimal(
-                str(
-                    item.get(
-                        "unit_price",
-                        0,
-                    )
-                    or 0
-                )
+            values = self._calculate_item_values(
+                item,
             )
-
-            item["regular_quantity"] = regular_quantity
-
-            item["restricted_quantity"] = restricted_quantity
-
-            item["quantity"] = total_quantity
-
-            item["received_quantity"] = total_quantity
 
             SupplierReturnItem.objects.create(
                 supplier_return=supplier_return,
-                line_total=(Decimal(str(total_quantity)) * unit_price),
-                **item,
+                grn_item=item["grn_item"],
+                product=item["product"],
+                variant=item.get("variant"),
+                received_quantity=values["received_quantity"],
+                quantity=values["quantity"],
+                unit_price=values["unit_price"],
+                tax_treatment=values["tax_treatment"],
+                vat_percentage=values["vat_percentage"],
+                vat_amount=values["vat_amount"],
+                line_total=values["line_total"],
+                reason=item.get(
+                    "reason",
+                    "",
+                ),
             )
 
-    def _calculate_total(
-        self,
-        items,
-    ):
-        return sum(
-            (
-                Decimal(
-                    str(
-                        int(
-                            item.get(
-                                "regular_quantity",
-                                0,
-                            )
-                            or 0
-                        )
-                        + int(
-                            item.get(
-                                "restricted_quantity",
-                                0,
-                            )
-                            or 0
-                        )
-                    )
-                )
-                * Decimal(
-                    str(
-                        item.get(
-                            "unit_price",
-                            0,
-                        )
-                        or 0
-                    )
-                )
-                for item in items
-            ),
-            Decimal("0.00"),
+            subtotal += values["net_amount"]
+            vat_amount += values["vat_amount"]
+            total_amount += values["line_total"]
+
+        supplier_return.subtotal = subtotal
+        supplier_return.vat_amount = vat_amount
+        supplier_return.total_amount = total_amount
+
+        supplier_return.save(
+            update_fields=[
+                "subtotal",
+                "vat_amount",
+                "total_amount",
+                "updated_at",
+            ]
         )
 
     @transaction.atomic
@@ -2412,13 +2945,25 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
         )
 
         validated_data.pop(
+            "subtotal",
+            None,
+        )
+
+        validated_data.pop(
+            "vat_amount",
+            None,
+        )
+
+        validated_data.pop(
             "total_amount",
             None,
         )
 
         validated_data["return_number"] = self._generate_number()
 
-        validated_data["total_amount"] = self._calculate_total(items)
+        validated_data["subtotal"] = Decimal("0.00")
+        validated_data["vat_amount"] = Decimal("0.00")
+        validated_data["total_amount"] = Decimal("0.00")
 
         if validated_data.get("status") == "PENDING_APPROVAL":
             validated_data["submitted_at"] = timezone.now()
@@ -2458,6 +3003,16 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
         )
 
         validated_data.pop(
+            "subtotal",
+            None,
+        )
+
+        validated_data.pop(
+            "vat_amount",
+            None,
+        )
+
+        validated_data.pop(
             "total_amount",
             None,
         )
@@ -2477,8 +3032,6 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
                 grn,
                 items,
             )
-
-            validated_data["total_amount"] = self._calculate_total(items)
 
         if (
             validated_data.get("status") == "PENDING_APPROVAL"
@@ -2557,6 +3110,49 @@ class VendorCreditItemSerializer(
             "tax_amount",
             "line_total",
         ]
+
+    def validate(self, attrs):
+        treatment = str(
+            attrs.get(
+                "tax_treatment",
+                getattr(
+                    self.instance,
+                    "tax_treatment",
+                    "STANDARD_VAT",
+                ),
+            )
+            or "STANDARD_VAT"
+        ).upper()
+
+        if treatment in {"ZERO_RATED", "ZERO_VAT"}:
+            treatment = "ZERO_VAT"
+        elif treatment in {
+            "NON_VAT",
+            "OUT_OF_SCOPE",
+            "EXEMPT",
+            "NON_TAXABLE",
+        }:
+            treatment = "NON_VAT"
+        else:
+            treatment = "STANDARD_VAT"
+
+        percentage = Decimal(
+            str(
+                attrs.get(
+                    "tax_percentage",
+                    getattr(self.instance, "tax_percentage", 0),
+                )
+                or 0
+            )
+        )
+
+        if treatment != "STANDARD_VAT":
+            percentage = Decimal("0")
+
+        attrs["tax_treatment"] = treatment
+        attrs["tax_percentage"] = percentage
+
+        return attrs
 
 
 class VendorCreditApplicationSerializer(
@@ -2789,6 +3385,26 @@ class VendorCreditSerializer(serializers.ModelSerializer):
             )
         )
 
+        tax_treatment = str(
+            item.get(
+                "tax_treatment",
+                "STANDARD_VAT",
+            )
+            or "STANDARD_VAT"
+        ).upper()
+
+        if tax_treatment in {"ZERO_RATED", "ZERO_VAT"}:
+            tax_treatment = "ZERO_VAT"
+        elif tax_treatment in {
+            "NON_VAT",
+            "OUT_OF_SCOPE",
+            "EXEMPT",
+            "NON_TAXABLE",
+        }:
+            tax_treatment = "NON_VAT"
+        else:
+            tax_treatment = "STANDARD_VAT"
+
         tax_percentage = Decimal(
             str(
                 item.get(
@@ -2798,6 +3414,12 @@ class VendorCreditSerializer(serializers.ModelSerializer):
                 or 0
             )
         )
+
+        if tax_treatment != "STANDARD_VAT":
+            tax_percentage = Decimal("0")
+
+        item["tax_treatment"] = tax_treatment
+        item["tax_percentage"] = tax_percentage
 
         if quantity <= 0:
             raise serializers.ValidationError(
@@ -2872,6 +3494,44 @@ class VendorCreditSerializer(serializers.ModelSerializer):
 
         errors = {}
 
+        if not supplier_return:
+            errors["supplier_return"] = "An approved Supplier Return is required."
+        elif supplier_return.status not in {
+            "APPROVED",
+            "CREDIT_ISSUED",
+        }:
+            errors["supplier_return"] = (
+                "Only an approved Supplier Return can create a Vendor Credit."
+            )
+
+        if supplier_return:
+            existing_credit = VendorCredit.objects.filter(
+                supplier_return=supplier_return,
+            )
+
+            if self.instance:
+                existing_credit = existing_credit.exclude(
+                    pk=self.instance.pk,
+                )
+
+            if existing_credit.exists():
+                errors["supplier_return"] = (
+                    "This Supplier Return is already linked to another "
+                    "Vendor Credit."
+                )
+
+            if not supplier:
+                attrs["supplier"] = supplier_return.supplier
+                supplier = supplier_return.supplier
+
+            if not branch:
+                attrs["branch"] = supplier_return.branch
+                branch = supplier_return.branch
+
+            if not purchase_order:
+                attrs["purchase_order"] = supplier_return.grn.purchase_order
+                purchase_order = supplier_return.grn.purchase_order
+
         if not supplier:
             errors["supplier"] = "Vendor is required."
 
@@ -2903,10 +3563,7 @@ class VendorCreditSerializer(serializers.ModelSerializer):
         if not self.instance:
             attrs["status"] = "DRAFT"
         elif self.instance.status != "DRAFT":
-            attrs.pop(
-                "status",
-                None,
-            )
+            attrs.pop("status", None)
 
         return attrs
 
@@ -3174,6 +3831,18 @@ class VendorCreditSerializer(serializers.ModelSerializer):
             vendor_credit,
             applications,
         )
+
+        if vendor_credit.supplier_return_id:
+            supplier_return = vendor_credit.supplier_return
+
+            if supplier_return.vendor_credit_id != vendor_credit.id:
+                supplier_return.vendor_credit = vendor_credit
+                supplier_return.save(
+                    update_fields=[
+                        "vendor_credit",
+                        "updated_at",
+                    ]
+                )
 
         return vendor_credit
 

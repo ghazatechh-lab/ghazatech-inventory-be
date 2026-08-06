@@ -15,6 +15,10 @@ from .models import (
     Supplier,
     SupplierDocument,
 )
+
+import logging
+
+
 from .serializers import (
     SupplierSerializer,
 )
@@ -56,9 +60,12 @@ class SupplierViewSet(
         "phone",
         "email",
         "trn_number",
+        "branch__branch_name",
+        "branch__branch_code",
     ]
 
     filterset_fields = [
+        "branch",
         "is_active",
         "supplier_category",
         "currency",
@@ -75,6 +82,15 @@ class SupplierViewSet(
     ordering = [
         "supplier_name",
     ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        branch_id = self.request.query_params.get("branch")
+
+        if branch_id not in (None, "", "all"):
+            queryset = queryset.filter(branch_id=branch_id)
+
+        return queryset
 
     def _validate_documents(
         self,

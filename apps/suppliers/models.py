@@ -48,9 +48,18 @@ class Supplier(
         ("INR", "INR"),
     ]
 
+    branch = models.ForeignKey(
+        "branches.Branch",
+        on_delete=models.PROTECT,
+        related_name="suppliers",
+        null=True,
+        blank=True,
+    )
+
     supplier_code = models.CharField(
         max_length=50,
         unique=True,
+        blank=True,
     )
 
     supplier_name = models.CharField(
@@ -122,7 +131,7 @@ class Supplier(
     )
 
     payment_terms_days = models.PositiveIntegerField(
-        default=15,
+        default=0,
     )
 
     currency = models.CharField(
@@ -186,6 +195,12 @@ class Supplier(
             ),
             models.Index(
                 fields=[
+                    "supplier_code",
+                ],
+            ),
+            models.Index(
+                fields=[
+                    "branch",
                     "supplier_code",
                 ],
             ),

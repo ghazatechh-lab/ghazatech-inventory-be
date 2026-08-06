@@ -233,30 +233,31 @@ LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "verbose": {
-            "format": ("{asctime} | {levelname} | " "{name} | {message}"),
+        "supplier_bill_verbose": {
+            "format": (
+                "{asctime} {levelname} {name} "
+                "message={message} "
+                "context={supplier_bill_context} "
+                "errors={supplier_bill_errors}"
+            ),
             "style": "{",
+            "defaults": {
+                "supplier_bill_context": {},
+                "supplier_bill_errors": {},
+            },
         },
     },
     "handlers": {
-        "console": {
-            "class": ("logging.StreamHandler"),
-            "formatter": "verbose",
+        "supplier_bill_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "supplier_bill_verbose",
+            "level": "INFO",
         },
     },
     "loggers": {
-        "ghazatech.api": {
-            "handlers": [
-                "console",
-            ],
+        "apps.purchases.supplier_bills": {
+            "handlers": ["supplier_bill_console"],
             "level": "INFO",
-            "propagate": False,
-        },
-        "django.request": {
-            "handlers": [
-                "console",
-            ],
-            "level": "WARNING",
             "propagate": False,
         },
     },
