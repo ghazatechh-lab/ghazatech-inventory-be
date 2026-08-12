@@ -616,14 +616,23 @@ class SalaryAdvanceViewSet(BaseViewSet):
 
 
 class PayrollRunViewSet(BaseViewSet):
-    queryset = PayrollRun.objects.select_related(
-        "branch",
-        "generated_by",
-    ).prefetch_related(
-        "entries__employee",
-        "entries__branch",
+    queryset = (
+        PayrollRun.objects.select_related(
+            "branch",
+            "generated_by",
+        )
+        .prefetch_related(
+            "entries__employee",
+            "entries__branch",
+        )
+        .order_by(
+            "-payroll_date",
+            "-id",
+        )
     )
+
     serializer_class = PayrollRunSerializer
+
     filterset_fields = [
         "period",
         "branch",
@@ -631,6 +640,7 @@ class PayrollRunViewSet(BaseViewSet):
         "payroll_date",
         "paid_by",
     ]
+
     search_fields = [
         "period",
         "paid_by",
@@ -642,9 +652,25 @@ class PayrollRunViewSet(BaseViewSet):
     @staticmethod
     def _period_dates(period):
         year, month = [int(part) for part in str(period).split("-")]
+
+        month_start = date(
+            year,
+            month,
+            1,
+        )
+
+        month_end = date(
+            year,
+            month,
+            calendar.monthrange(
+                year,
+                month,
+            )[1],
+        )
+
         return (
-            date(year, month, 1),
-            date(year, month, calendar.monthrange(year, month)[1]),
+            month_start,
+            month_end,
         )
 
     @staticmethod
@@ -665,8 +691,15 @@ class PayrollRunViewSet(BaseViewSet):
         )
 
         for leave in leaves:
-            start = max(leave.from_date, employment_start)
-            end = min(leave.to_date, month_end)
+            start = max(
+                leave.from_date,
+                employment_start,
+            )
+
+            end = min(
+                leave.to_date,
+                month_end,
+            )
 
             if end >= start:
                 total += Decimal(str((end - start).days + 1))
@@ -678,40 +711,59 @@ class PayrollRunViewSet(BaseViewSet):
         methods=["get"],
         url_path="eligible-employees",
     )
-    def eligible_employees(self, request):
-        period = request.query_params.get("period")
+    def eligible_employees(
+        self,
+        request,
+    ):
+        period = str(request.query_params.get("period") or "").strip()
+
         branch_id = request.query_params.get("branch")
 
         if not period:
             return Response(
-                {"period": "Pay period is required."},
+                {"period": ("Pay period is required.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             month_start, month_end = self._period_dates(period)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return Response(
-                {"period": "Period must use YYYY-MM format."},
+                {"period": ("Period must use YYYY-MM format.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        employees = Employee.objects.filter(
-            is_active=True,
-            employment_status__in=[
-                "ACTIVE",
-                "ON_LEAVE",
-                "PROBATION",
-            ],
-            joining_date__lte=month_end,
-        ).select_related("branch", "department")
+        employees = (
+            Employee.objects.filter(
+                is_active=True,
+                employment_status__in=[
+                    "ACTIVE",
+                    "ON_LEAVE",
+                    "PROBATION",
+                ],
+                joining_date__lte=month_end,
+            )
+            .select_related(
+                "branch",
+                "department",
+            )
+            .order_by(
+                "first_name",
+                "last_name",
+                "id",
+            )
+        )
 
         if branch_id:
             employees = employees.filter(branch_id=branch_id)
 
         generated_ids = set(
             PayrollEntry.objects.filter(period=period).values_list(
-                "employee_id", flat=True
+                "employee_id",
+                flat=True,
             )
         )
 
@@ -719,17 +771,21 @@ class PayrollRunViewSet(BaseViewSet):
 
         for employee in employees:
             total_period_days = Decimal(str((month_end - month_start).days + 1))
+
             employment_start = max(
                 month_start,
                 employee.joining_date or month_start,
             )
+
             employment_days = Decimal(str((month_end - employment_start).days + 1))
+
             unpaid_leave_days = self._approved_unpaid_leave_days(
                 employee,
                 month_start,
                 month_end,
                 employment_start,
             )
+
             suggested_payable_days = max(
                 Decimal("0"),
                 employment_days - unpaid_leave_days,
@@ -742,61 +798,71 @@ class PayrollRunViewSet(BaseViewSet):
                 remaining_amount__gt=0,
             ).aggregate(total=Sum("remaining_amount"))["total"] or Decimal("0")
 
-            # Backward compatibility with old ADVANCE PayrollEntry rows.
-            legacy_advance = (
-                (
-                    PayrollEntry.objects.filter(
-                        employee=employee,
-                        period=period,
-                        status="PAID",
-                    )
-                    .exclude(advance_deduction__gt=0)
-                    .aggregate(total=Sum("advance_amount"))["total"]
-                    or Decimal("0")
-                )
-                if hasattr(PayrollEntry, "advance_amount")
-                else Decimal("0")
+            legacy_advance = PayrollEntry.objects.filter(
+                employee=employee,
+                period=period,
+                status="PAID",
+            ).exclude(advance_deduction__gt=0).aggregate(total=Sum("advance_amount"))[
+                "total"
+            ] or Decimal(
+                "0"
             )
+
+            basic_salary = Decimal(str(employee.basic_salary or 0))
+
+            allowances = Decimal(str(employee.allowances or 0))
 
             gross_salary = Decimal(
                 str(
-                    getattr(employee, "total_salary", None)
-                    or employee.basic_salary
-                    or 0
+                    getattr(
+                        employee,
+                        "total_salary",
+                        None,
+                    )
+                    or (basic_salary + allowances)
                 )
+            )
+
+            estimated_gross = (
+                gross_salary * suggested_payable_days / total_period_days
+                if total_period_days
+                else Decimal("0")
+            )
+
+            estimated_balance = max(
+                Decimal("0"),
+                estimated_gross - pending_advance - legacy_advance,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
             )
 
             response.append(
                 {
                     "id": employee.id,
-                    "employee_code": employee.employee_code,
-                    "full_name": employee.full_name,
+                    "employee_code": (employee.employee_code),
+                    "full_name": (employee.full_name),
                     "branch_name": (
                         employee.branch.branch_name if employee.branch else ""
                     ),
-                    "joining_date": employee.joining_date,
-                    "basic_salary": employee.basic_salary,
-                    "allowances": employee.allowances,
-                    "gross_salary": gross_salary,
-                    "total_period_days": total_period_days,
-                    "employment_days": employment_days,
-                    "unpaid_leave_days": unpaid_leave_days,
-                    "suggested_payable_days": suggested_payable_days,
-                    "advance_received": pending_advance + legacy_advance,
-                    "estimated_balance": max(
-                        Decimal("0"),
-                        (gross_salary * suggested_payable_days / total_period_days)
-                        - pending_advance
-                        - legacy_advance,
-                    ).quantize(MONEY),
-                    "already_generated": employee.id in generated_ids,
+                    "joining_date": (employee.joining_date),
+                    "basic_salary": (employee.basic_salary),
+                    "allowances": (employee.allowances),
+                    "gross_salary": (gross_salary),
+                    "total_period_days": (total_period_days),
+                    "employment_days": (employment_days),
+                    "unpaid_leave_days": (unpaid_leave_days),
+                    "suggested_payable_days": (suggested_payable_days),
+                    "advance_received": (pending_advance + legacy_advance),
+                    "estimated_balance": (estimated_balance),
+                    "already_generated": (employee.id in generated_ids),
                 }
             )
 
         return Response(
             {
                 "success": True,
-                "message": "Eligible payroll employees loaded.",
+                "message": ("Eligible payroll employees loaded."),
                 "data": response,
             }
         )
@@ -807,66 +873,110 @@ class PayrollRunViewSet(BaseViewSet):
         url_path="generate",
     )
     @transaction.atomic
-    def generate(self, request):
+    def generate(
+        self,
+        request,
+    ):
         period = str(request.data.get("period") or "").strip()
+
         payroll_date = request.data.get("payroll_date")
+
         branch_id = request.data.get("branch")
-        paid_by = str(request.data.get("paid_by") or "").strip()
+
         employee_ids = request.data.get("employee_ids") or []
+
         payable_days_map = request.data.get("payable_days") or {}
+
+        # IMPORTANT:
+        # This is the status selected in the frontend.
+        requested_status = str(request.data.get("status") or "PENDING").strip().upper()
+
+        # Paid By remains a TEXT value.
+        paid_by = str(request.data.get("paid_by") or "").strip()
+
+        valid_statuses = {value for value, _label in PayrollEntry.STATUS_CHOICES}
+
+        if requested_status not in valid_statuses:
+            return Response(
+                {"status": ("Select a valid payroll status.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if not period:
             return Response(
-                {"period": "Pay period is required."},
+                {"period": ("Pay period is required.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         if not payroll_date:
             return Response(
-                {"payroll_date": "Payroll date is required."},
+                {"payroll_date": ("Payroll date is required.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if not paid_by:
+        if requested_status == "PAID" and not paid_by:
             return Response(
-                {"paid_by": "Paid By is required."},
+                {"paid_by": ("Paid By is required when " "status is Paid.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         if not employee_ids:
             return Response(
-                {"employee_ids": "Select at least one employee."},
+                {"employee_ids": ("Select at least one employee.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             month_start, month_end = self._period_dates(period)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return Response(
-                {"period": "Period must use YYYY-MM format."},
+                {"period": ("Period must use YYYY-MM format.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        employees = Employee.objects.filter(
-            id__in=employee_ids,
-            is_active=True,
-            joining_date__lte=month_end,
-        ).select_related("branch")
+        employees = (
+            Employee.objects.filter(
+                id__in=employee_ids,
+                is_active=True,
+                joining_date__lte=month_end,
+            )
+            .select_related("branch")
+            .order_by("id")
+        )
 
         if branch_id:
             employees = employees.filter(branch_id=branch_id)
 
+        if not employees.exists():
+            return Response(
+                {"employee_ids": ("No eligible employees were found.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        run_status_map = {
+            "PENDING": "DRAFT",
+            "PROCESSING": "PROCESSING",
+            "PAID": "COMPLETED",
+            "FAILED": "FAILED",
+            "CANCELLED": "CANCELLED",
+        }
+
         run = PayrollRun.objects.create(
             period=period,
             payroll_date=payroll_date,
-            branch_id=branch_id or None,
-            paid_by=paid_by,
-            status="PROCESSING",
+            branch_id=(branch_id or None),
+            paid_by=(paid_by if requested_status == "PAID" else ""),
+            status=run_status_map[requested_status],
             generated_by=request.user,
             generated_at=timezone.now(),
         )
 
         created_entries = []
+
+        # Keep the existing advance deduction behavior.
         advance_rows_to_update = []
 
         for employee in employees:
@@ -877,11 +987,14 @@ class PayrollRunViewSet(BaseViewSet):
                 continue
 
             total_period_days = Decimal(str((month_end - month_start).days + 1))
+
             employment_start = max(
                 month_start,
                 employee.joining_date or month_start,
             )
+
             employment_days = Decimal(str((month_end - employment_start).days + 1))
+
             unpaid_leave_days = self._approved_unpaid_leave_days(
                 employee,
                 month_start,
@@ -893,27 +1006,75 @@ class PayrollRunViewSet(BaseViewSet):
                 Decimal("0"),
                 employment_days - unpaid_leave_days,
             )
+
             requested_days = payable_days_map.get(
                 str(employee.id),
-                payable_days_map.get(employee.id, default_payable_days),
-            )
-            payable_days = max(
-                Decimal("0"),
-                min(
-                    Decimal(str(requested_days or 0)),
-                    employment_days,
+                payable_days_map.get(
+                    employee.id,
+                    default_payable_days,
                 ),
             )
 
+            try:
+                payable_days = Decimal(
+                    str(
+                        requested_days
+                        if requested_days
+                        not in (
+                            None,
+                            "",
+                        )
+                        else default_payable_days
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                return Response(
+                    {
+                        "payable_days": (
+                            f"Invalid payable days for " f"{employee.full_name}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if payable_days < 0 or payable_days > employment_days:
+                return Response(
+                    {
+                        "payable_days": (
+                            f"Payable days for "
+                            f"{employee.full_name} "
+                            f"must be between 0 and "
+                            f"{employment_days}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             basic_salary = Decimal(str(employee.basic_salary or 0))
+
             allowances = Decimal(str(employee.allowances or 0))
+
             monthly_gross = Decimal(
                 str(
-                    getattr(employee, "total_salary", None) or basic_salary + allowances
+                    getattr(
+                        employee,
+                        "total_salary",
+                        None,
+                    )
+                    or (basic_salary + allowances)
                 )
             )
-            gross_salary = (monthly_gross * payable_days / total_period_days).quantize(
-                MONEY, rounding=ROUND_HALF_UP
+
+            gross_salary = (
+                monthly_gross * payable_days / total_period_days
+                if total_period_days
+                else Decimal("0")
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
             )
 
             regular_deductions = Decimal("0")
@@ -926,48 +1087,63 @@ class PayrollRunViewSet(BaseViewSet):
                     status="PAID",
                     remaining_amount__gt=0,
                 )
-                .order_by("advance_date", "id")
+                .order_by(
+                    "advance_date",
+                    "id",
+                )
             )
 
             available_advance = sum(
-                (row.remaining_amount for row in advance_rows),
+                (Decimal(advance.remaining_amount or 0) for advance in advance_rows),
                 Decimal("0"),
             )
+
             advance_deduction = min(
                 available_advance,
                 max(
                     Decimal("0"),
                     gross_salary - regular_deductions,
                 ),
-            ).quantize(MONEY)
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
 
             net_salary = max(
                 Decimal("0"),
                 gross_salary - regular_deductions - advance_deduction,
-            ).quantize(MONEY)
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
 
+            # FIX:
+            # Do NOT hard-code status="PENDING".
+            # Save exactly the status selected in the UI.
             entry = PayrollEntry.objects.create(
                 payroll_run=run,
                 employee=employee,
                 branch=employee.branch,
                 period=period,
                 payroll_date=payroll_date,
-                paid_by=paid_by,
+                paid_by=(paid_by if requested_status == "PAID" else ""),
                 basic_salary=basic_salary,
                 allowances=allowances,
                 gross_salary=gross_salary,
-                deductions=regular_deductions,
-                advance_deduction=advance_deduction,
+                deductions=(regular_deductions),
+                advance_deduction=(advance_deduction),
                 net_salary=net_salary,
                 balance_payable=net_salary,
-                status="PENDING",
-                total_period_days=total_period_days,
-                payable_days=payable_days,
-                unpaid_leave_days=unpaid_leave_days,
+                status=requested_status,
+                paid_at=(timezone.now() if requested_status == "PAID" else None),
+                total_period_days=(total_period_days),
+                payable_days=(payable_days),
+                unpaid_leave_days=(unpaid_leave_days),
                 salary_calculation_method=(
                     "PRORATED" if payable_days < total_period_days else "FULL"
                 ),
             )
+
             created_entries.append(entry)
 
             remaining_to_apply = advance_deduction
@@ -977,23 +1153,46 @@ class PayrollRunViewSet(BaseViewSet):
                     break
 
                 applied = min(
-                    advance.remaining_amount,
+                    Decimal(advance.remaining_amount or 0),
                     remaining_to_apply,
                 )
+
                 advance.remaining_amount = (
-                    advance.remaining_amount - applied
-                ).quantize(MONEY)
+                    Decimal(advance.remaining_amount or 0) - applied
+                ).quantize(
+                    MONEY,
+                    rounding=ROUND_HALF_UP,
+                )
+
                 remaining_to_apply -= applied
 
                 if advance.remaining_amount <= 0:
                     advance.status = "DEDUCTED"
+
                     advance.deducted_payroll_entry = entry
 
                 advance_rows_to_update.append(advance)
 
+        if not created_entries:
+            run.delete()
+
+            return Response(
+                {
+                    "employee_ids": (
+                        "Payroll already exists "
+                        "for the selected employees "
+                        "and period."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         if advance_rows_to_update:
+            # Remove duplicate model objects before bulk update.
+            deduped_advances = {item.pk: item for item in advance_rows_to_update}
+
             SalaryAdvance.objects.bulk_update(
-                advance_rows_to_update,
+                list(deduped_advances.values()),
                 [
                     "remaining_amount",
                     "status",
@@ -1003,22 +1202,31 @@ class PayrollRunViewSet(BaseViewSet):
             )
 
         run.total_gross = sum(
-            (entry.gross_salary for entry in created_entries),
+            (Decimal(entry.gross_salary or 0) for entry in created_entries),
             Decimal("0"),
         )
+
         run.total_deductions = sum(
-            (entry.deductions for entry in created_entries),
+            (Decimal(entry.deductions or 0) for entry in created_entries),
             Decimal("0"),
         )
+
         run.total_advance_deduction = sum(
-            (entry.advance_deduction for entry in created_entries),
+            (Decimal(entry.advance_deduction or 0) for entry in created_entries),
             Decimal("0"),
         )
+
         run.total_net = sum(
-            (entry.net_salary for entry in created_entries),
+            (Decimal(entry.net_salary or 0) for entry in created_entries),
             Decimal("0"),
         )
-        run.status = "COMPLETED"
+
+        # FIX:
+        # Do NOT force run.status = "COMPLETED".
+        run.status = run_status_map[requested_status]
+
+        run.paid_by = paid_by if requested_status == "PAID" else ""
+
         run.save(
             update_fields=[
                 "total_gross",
@@ -1026,6 +1234,7 @@ class PayrollRunViewSet(BaseViewSet):
                 "total_advance_deduction",
                 "total_net",
                 "status",
+                "paid_by",
                 "updated_at",
             ]
         )
@@ -1033,7 +1242,7 @@ class PayrollRunViewSet(BaseViewSet):
         return Response(
             {
                 "success": True,
-                "message": "Payroll generated successfully.",
+                "message": ("Payroll generated " f"with {requested_status} status."),
                 "data": PayrollRunSerializer(run).data,
             },
             status=status.HTTP_201_CREATED,
@@ -1044,17 +1253,24 @@ class PayrollRunViewSet(BaseViewSet):
         methods=["get"],
         url_path="summary",
     )
-    def summary(self, request):
+    def summary(
+        self,
+        request,
+    ):
         queryset = PayrollEntry.objects.all()
 
         period = request.query_params.get("period")
+
         branch = request.query_params.get("branch")
+
         status_value = request.query_params.get("status")
 
         if period:
             queryset = queryset.filter(period=period)
+
         if branch:
             queryset = queryset.filter(branch_id=branch)
+
         if status_value:
             queryset = queryset.filter(status=status_value)
 
@@ -1066,33 +1282,35 @@ class PayrollRunViewSet(BaseViewSet):
         )
 
         advance_qs = SalaryAdvance.objects.all()
+
         if period:
             advance_qs = advance_qs.filter(period=period)
+
         if branch:
             advance_qs = advance_qs.filter(branch_id=branch)
 
-        total_advances = (
-            advance_qs.filter(
-                status__in=["PAID", "DEDUCTED"],
-            ).aggregate(
-                total=Sum("amount")
-            )["total"]
-            or 0
-        )
+        total_advances = advance_qs.filter(
+            status__in=[
+                "PAID",
+                "DEDUCTED",
+            ],
+        ).aggregate(
+            total=Sum("amount")
+        )["total"] or Decimal("0")
 
         return Response(
             {
                 "success": True,
-                "message": "Payroll summary loaded.",
+                "message": ("Payroll summary loaded."),
                 "data": {
-                    "employees_on_payroll": queryset.values("employee_id")
-                    .distinct()
-                    .count(),
-                    "total_gross": totals["gross"] or 0,
-                    "total_deductions": totals["deductions"] or 0,
-                    "total_advances": total_advances,
+                    "employees_on_payroll": (
+                        queryset.values("employee_id").distinct().count()
+                    ),
+                    "total_gross": (totals["gross"] or 0),
+                    "total_deductions": (totals["deductions"] or 0),
+                    "total_advances": (total_advances),
                     "total_advance_deductions": (totals["advance_deductions"] or 0),
-                    "total_net": totals["net"] or 0,
+                    "total_net": (totals["net"] or 0),
                 },
             }
         )
@@ -1102,37 +1320,52 @@ class PayrollRunViewSet(BaseViewSet):
         methods=["get"],
         url_path="export",
     )
-    def export(self, request):
+    def export(
+        self,
+        request,
+    ):
         queryset = PayrollEntry.objects.select_related(
             "employee",
             "branch",
+        ).order_by(
+            "period",
+            "employee__employee_code",
         )
 
         period = request.query_params.get("period")
+
         branch = request.query_params.get("branch")
 
         if period:
             queryset = queryset.filter(period=period)
+
         if branch:
             queryset = queryset.filter(branch_id=branch)
 
         response = HttpResponse(content_type="text/csv")
+
         response["Content-Disposition"] = (
-            f'attachment; filename="payroll-{period or "all"}.csv"'
+            f"attachment; " f'filename="payroll-' f'{period or "all"}.csv"'
         )
 
         writer = csv.writer(response)
+
         writer.writerow(
             [
                 "Employee Code",
                 "Employee",
                 "Period",
                 "Payroll Date",
+                "Payable Days",
+                "Total Period Days",
+                "Basic Salary",
+                "Allowances",
                 "Gross Salary",
                 "Deductions",
                 "Advance Deduction",
                 "Net Salary",
                 "Paid By",
+                "Method",
                 "Status",
             ]
         )
@@ -1144,11 +1377,16 @@ class PayrollRunViewSet(BaseViewSet):
                     entry.employee.full_name,
                     entry.period,
                     entry.payroll_date,
+                    entry.payable_days,
+                    entry.total_period_days,
+                    entry.basic_salary,
+                    entry.allowances,
                     entry.gross_salary,
                     entry.deductions,
                     entry.advance_deduction,
                     entry.net_salary,
                     entry.paid_by,
+                    entry.salary_calculation_method,
                     entry.status,
                 ]
             )
@@ -1161,8 +1399,13 @@ class PayrollEntryViewSet(BaseViewSet):
         "employee",
         "branch",
         "payroll_run",
+    ).order_by(
+        "-payroll_date",
+        "-id",
     )
+
     serializer_class = PayrollEntrySerializer
+
     filterset_fields = [
         "employee",
         "branch",
@@ -1171,6 +1414,7 @@ class PayrollEntryViewSet(BaseViewSet):
         "payroll_date",
         "paid_by",
     ]
+
     search_fields = [
         "employee__first_name",
         "employee__last_name",
@@ -1181,29 +1425,298 @@ class PayrollEntryViewSet(BaseViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+
         branch = self.request.query_params.get("branch")
+
         if branch:
             queryset = queryset.filter(branch_id=branch)
+
         return queryset
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="form-options",
+    )
+    def form_options(
+        self,
+        request,
+    ):
+        paid_by_values = (
+            PayrollEntry.objects.exclude(paid_by__isnull=True)
+            .exclude(paid_by="")
+            .values_list(
+                "paid_by",
+                flat=True,
+            )
+            .distinct()
+            .order_by("paid_by")
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Payroll form options loaded."),
+                "data": {
+                    "statuses": [
+                        {
+                            "value": "PENDING",
+                            "label": "Pending",
+                        },
+                        {
+                            "value": "PROCESSING",
+                            "label": "Processing",
+                        },
+                        {
+                            "value": "PAID",
+                            "label": "Paid",
+                        },
+                        {
+                            "value": "FAILED",
+                            "label": "Failed",
+                        },
+                        {
+                            "value": "CANCELLED",
+                            "label": "Cancelled",
+                        },
+                    ],
+                    "paid_by_options": [
+                        {
+                            "value": value,
+                            "label": value,
+                        }
+                        for value in paid_by_values
+                    ],
+                },
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="update-status",
+    )
+    @transaction.atomic
+    def update_status(
+        self,
+        request,
+        pk=None,
+    ):
+        entry = (
+            PayrollEntry.objects.select_for_update()
+            .select_related("payroll_run")
+            .get(pk=self.get_object().pk)
+        )
+
+        requested_status = str(request.data.get("status") or "").strip().upper()
+
+        valid_statuses = {value for value, _label in PayrollEntry.STATUS_CHOICES}
+
+        if requested_status not in valid_statuses:
+            return Response(
+                {"status": ("Select a valid payroll status.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_status = str(entry.status or "PENDING").upper()
+
+        transitions = {
+            "PENDING": {
+                "PROCESSING",
+                "PAID",
+                "FAILED",
+                "CANCELLED",
+            },
+            "PROCESSING": {
+                "PAID",
+                "FAILED",
+                "CANCELLED",
+            },
+            "FAILED": {
+                "PENDING",
+                "PROCESSING",
+                "PAID",
+                "CANCELLED",
+            },
+            "PAID": set(),
+            "CANCELLED": set(),
+        }
+
+        if requested_status == current_status:
+            return Response(
+                {
+                    "success": True,
+                    "message": ("Payroll status is unchanged."),
+                    "data": (self.get_serializer(entry).data),
+                }
+            )
+
+        if requested_status not in transitions.get(
+            current_status,
+            set(),
+        ):
+            return Response(
+                {
+                    "status": (
+                        f"Status cannot change "
+                        f"from {current_status} "
+                        f"to {requested_status}."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        paid_by = str(request.data.get("paid_by") or "").strip()
+
+        entry.status = requested_status
+
+        update_fields = [
+            "status",
+            "updated_at",
+        ]
+
+        if requested_status == "PAID":
+            if not paid_by:
+                return Response(
+                    {
+                        "paid_by": (
+                            "Paid By is required " "when marking payroll " "as Paid."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.paid_by = paid_by
+            entry.paid_at = timezone.now()
+
+            update_fields.extend(
+                [
+                    "paid_by",
+                    "paid_at",
+                ]
+            )
+
+        else:
+            entry.paid_by = ""
+            entry.paid_at = None
+
+            update_fields.extend(
+                [
+                    "paid_by",
+                    "paid_at",
+                ]
+            )
+
+        entry.save(update_fields=update_fields)
+
+        payroll_run = entry.payroll_run
+
+        if payroll_run:
+            entries = payroll_run.entries.all()
+
+            total_entries = entries.count()
+
+            if (
+                total_entries > 0
+                and entries.filter(status="PAID").count() == total_entries
+            ):
+                payroll_run.status = "COMPLETED"
+
+            elif entries.filter(status="PROCESSING").exists():
+                payroll_run.status = "PROCESSING"
+
+            elif entries.filter(status="FAILED").exists():
+                payroll_run.status = "FAILED"
+
+            elif (
+                total_entries > 0
+                and entries.filter(status="CANCELLED").count() == total_entries
+            ):
+                payroll_run.status = "CANCELLED"
+
+            else:
+                payroll_run.status = "DRAFT"
+
+            if hasattr(
+                payroll_run,
+                "paid_by",
+            ):
+                if payroll_run.status == "COMPLETED":
+                    paid_entry = (
+                        entries.filter(status="PAID").exclude(paid_by="").first()
+                    )
+
+                    payroll_run.paid_by = paid_entry.paid_by if paid_entry else ""
+                else:
+                    payroll_run.paid_by = ""
+
+            run_update_fields = [
+                "status",
+                "updated_at",
+            ]
+
+            if hasattr(
+                payroll_run,
+                "paid_by",
+            ):
+                run_update_fields.append("paid_by")
+
+            payroll_run.save(update_fields=(run_update_fields))
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Payroll status updated successfully."),
+                "data": (self.get_serializer(entry).data),
+            }
+        )
 
     @action(
         detail=True,
         methods=["post"],
         url_path="mark-paid",
     )
-    def mark_paid(self, request, pk=None):
-        entry = self.get_object()
+    @transaction.atomic
+    def mark_paid(
+        self,
+        request,
+        pk=None,
+    ):
+        entry = (
+            PayrollEntry.objects.select_for_update()
+            .select_related("payroll_run")
+            .get(pk=self.get_object().pk)
+        )
+
+        current_status = str(entry.status or "").upper()
+
+        if current_status == "PAID":
+            return Response(
+                {
+                    "success": True,
+                    "message": ("Payroll is already marked as paid."),
+                    "data": (self.get_serializer(entry).data),
+                }
+            )
+
+        if current_status == "CANCELLED":
+            return Response(
+                {"status": ("Cancelled payroll cannot " "be marked as paid.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         paid_by = str(request.data.get("paid_by") or entry.paid_by or "").strip()
 
         if not paid_by:
             return Response(
-                {"paid_by": "Paid By is required."},
+                {"paid_by": ("Paid By is required.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         entry.paid_by = paid_by
         entry.status = "PAID"
         entry.paid_at = timezone.now()
+
         entry.save(
             update_fields=[
                 "paid_by",
@@ -1213,11 +1726,42 @@ class PayrollEntryViewSet(BaseViewSet):
             ]
         )
 
+        payroll_run = entry.payroll_run
+
+        if payroll_run:
+            entries = payroll_run.entries.all()
+
+            total_entries = entries.count()
+
+            paid_count = entries.filter(status="PAID").count()
+
+            if total_entries > 0 and paid_count == total_entries:
+                payroll_run.status = "COMPLETED"
+
+                if hasattr(
+                    payroll_run,
+                    "paid_by",
+                ):
+                    payroll_run.paid_by = paid_by
+
+                fields = [
+                    "status",
+                    "updated_at",
+                ]
+
+                if hasattr(
+                    payroll_run,
+                    "paid_by",
+                ):
+                    fields.append("paid_by")
+
+                payroll_run.save(update_fields=fields)
+
         return Response(
             {
                 "success": True,
-                "message": "Payroll marked as paid.",
-                "data": PayrollEntrySerializer(entry).data,
+                "message": ("Payroll marked as paid."),
+                "data": (self.get_serializer(entry).data),
             }
         )
 
