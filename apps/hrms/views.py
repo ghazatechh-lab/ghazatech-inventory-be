@@ -1502,11 +1502,7 @@ class PayrollEntryViewSet(BaseViewSet):
         request,
         pk=None,
     ):
-        entry = (
-            PayrollEntry.objects.select_for_update()
-            .select_related("payroll_run")
-            .get(pk=self.get_object().pk)
-        )
+        entry = PayrollEntry.objects.select_for_update().get(pk=self.get_object().pk)
 
         requested_status = str(request.data.get("status") or "").strip().upper()
 
