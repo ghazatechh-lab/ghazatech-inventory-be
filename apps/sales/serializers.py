@@ -9,7 +9,7 @@ from apps.common.sensitive_permissions import has_sensitive_permission
 from apps.sales.tax_stock_services import (
     calculate_sales_line,
     deduct_sales_item,
-    validate_tax_and_classification,
+    validate_tax_treatment,
 )
 
 
@@ -23,8 +23,7 @@ def calc(item, q="quantity"):
 
 class SalesTaxLineSerializerMixin:
     """
-    Shared VAT and stock-classification validation for quotation, invoice,
-    POS and credit-note lines.
+    Shared VAT validation for quotation, invoice, POS and credit-note lines.
 
     `tax_inclusive` is accepted only as a temporary calculation input. It is
     removed before the model row is created because inclusiveness belongs to
@@ -46,16 +45,12 @@ class SalesTaxLineSerializerMixin:
 
         user = self._request_user()
         treatment = str(attrs.get("tax_treatment") or "STANDARD_VAT").strip().upper()
-        classification = (
-            str(attrs.get("stock_classification") or "REGULAR").strip().upper()
-        )
         reason = str(attrs.get("tax_reason") or "").strip()
 
         try:
-            validate_tax_and_classification(
+            validate_tax_treatment(
                 user,
                 treatment,
-                classification,
                 reason,
             )
         except PermissionError as exc:
@@ -77,7 +72,6 @@ class SalesTaxLineSerializerMixin:
             tax_rate = Decimal("0.00")
 
         attrs["tax_treatment"] = treatment
-        attrs["stock_classification"] = classification
         attrs["tax_reason"] = reason
         attrs["tax_rate"] = tax_rate
         attrs["vat_percentage"] = tax_rate
@@ -92,16 +86,8 @@ class SalesTaxLineSerializerMixin:
             user,
             "view_non_standard_tax_sale",
         )
-        can_view_restricted = has_sensitive_permission(
-            user,
-            "view_restricted_stock",
-        )
-
         if not can_view_sensitive_tax:
             data.pop("tax_reason", None)
-
-        if not can_view_restricted:
-            data.pop("stock_classification", None)
 
         return data
 
@@ -244,83 +230,160 @@ class QuotationSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
+        # -------------------------------------------------
+        # Prevent editing converted/cancelled quotations
+        # -------------------------------------------------
+        if self.instance:
+            current_status = str(self.instance.status or "").upper()
+
+            if current_status in [
+                "CONVERTED",
+                "CANCELLED",
+            ]:
+                raise serializers.ValidationError(
+                    {
+                        "status": (
+                            f"{self.instance.get_status_display()} "
+                            "quotations cannot be edited."
+                        )
+                    }
+                )
+
         quote_date = attrs.get(
             "quote_date",
-            getattr(self.instance, "quote_date", None),
+            getattr(
+                self.instance,
+                "quote_date",
+                None,
+            ),
         )
 
         valid_until = attrs.get(
             "valid_until",
-            getattr(self.instance, "valid_until", None),
+            getattr(
+                self.instance,
+                "valid_until",
+                None,
+            ),
         )
 
         customer = attrs.get(
             "customer",
-            getattr(self.instance, "customer", None),
+            getattr(
+                self.instance,
+                "customer",
+                None,
+            ),
         )
 
         branch = attrs.get(
             "branch",
-            getattr(self.instance, "branch", None),
+            getattr(
+                self.instance,
+                "branch",
+                None,
+            ),
         )
 
         items = attrs.get("items")
 
         if not customer:
-            raise serializers.ValidationError({"customer": "Customer is required."})
+            raise serializers.ValidationError({"customer": ("Customer is required.")})
 
         if not branch:
-            raise serializers.ValidationError({"branch": "Branch is required."})
+            raise serializers.ValidationError({"branch": ("Branch is required.")})
 
         if not quote_date:
-            raise serializers.ValidationError({"quote_date": "Quote date is required."})
+            raise serializers.ValidationError(
+                {"quote_date": ("Quote date is required.")}
+            )
 
         if not valid_until:
             raise serializers.ValidationError(
-                {"valid_until": "Valid-until date is required."}
+                {"valid_until": ("Valid-until date is required.")}
             )
 
         if quote_date and valid_until and valid_until < quote_date:
             raise serializers.ValidationError(
-                {"valid_until": "Valid-until date cannot be before quote date."}
+                {"valid_until": ("Valid-until date cannot " "be before quote date.")}
             )
 
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": "Add at least one quotation item."}
+                    {"items": ("Add at least one " "quotation item.")}
                 )
 
-            for index, item in enumerate(items, start=1):
+            for index, item in enumerate(
+                items,
+                start=1,
+            ):
                 if not item.get("product"):
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: product is required."}
+                        {"items": (f"Line {index}: " "product is required.")}
                     )
 
-                quantity = Decimal(str(item.get("quantity", 0) or 0))
+                quantity = Decimal(
+                    str(
+                        item.get(
+                            "quantity",
+                            0,
+                        )
+                        or 0
+                    )
+                )
 
-                price = Decimal(str(item.get("unit_price", 0) or 0))
+                price = Decimal(
+                    str(
+                        item.get(
+                            "unit_price",
+                            0,
+                        )
+                        or 0
+                    )
+                )
 
                 if quantity <= 0:
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: quantity must be greater than zero."}
+                        {
+                            "items": (
+                                f"Line {index}: "
+                                "quantity must be "
+                                "greater than zero."
+                            )
+                        }
                     )
 
                 if price < 0:
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: unit price cannot be negative."}
+                        {
+                            "items": (
+                                f"Line {index}: " "unit price cannot " "be negative."
+                            )
+                        }
                     )
 
         return attrs
 
-    def _save_items(self, quotation, items):
+    def _save_items(
+        self,
+        quotation,
+        items,
+    ):
         quotation.items.all().delete()
 
         for item in items:
-            item.pop("id", None)
+            item.pop(
+                "id",
+                None,
+            )
 
             calculated = self._calculate_line(item)
-            item.pop("tax_inclusive", None)
+
+            item.pop(
+                "tax_inclusive",
+                None,
+            )
 
             QuotationItem.objects.create(
                 quotation=quotation,
@@ -330,20 +393,32 @@ class QuotationSerializer(serializers.ModelSerializer):
                 **item,
             )
 
-    def _calculate_totals(self, items, data, instance=None):
+    def _calculate_totals(
+        self,
+        items,
+        data,
+        instance=None,
+    ):
         subtotal = Decimal("0")
         vat_amount = Decimal("0")
 
         for item in items:
             calculated = self._calculate_line(item)
+
             subtotal += calculated["subtotal"]
+
             vat_amount += calculated["vat_amount"]
 
         shipping = Decimal(
             str(
                 data.get(
                     "shipping_amount",
-                    getattr(instance, "shipping_amount", 0) or 0,
+                    getattr(
+                        instance,
+                        "shipping_amount",
+                        0,
+                    )
+                    or 0,
                 )
                 or 0
             )
@@ -353,7 +428,12 @@ class QuotationSerializer(serializers.ModelSerializer):
             str(
                 data.get(
                     "discount_amount",
-                    getattr(instance, "discount_amount", 0) or 0,
+                    getattr(
+                        instance,
+                        "discount_amount",
+                        0,
+                    )
+                    or 0,
                 )
                 or 0
             )
@@ -364,15 +444,35 @@ class QuotationSerializer(serializers.ModelSerializer):
             subtotal + vat_amount + shipping - discount,
         )
 
-        return subtotal, vat_amount, total
-
-    def _set_status_timestamps(self, data, instance=None):
-        status_value = data.get(
-            "status",
-            getattr(instance, "status", "DRAFT"),
+        return (
+            subtotal,
+            vat_amount,
+            total,
         )
 
-        previous_status = getattr(instance, "status", None) if instance else None
+    def _set_status_timestamps(
+        self,
+        data,
+        instance=None,
+    ):
+        status_value = data.get(
+            "status",
+            getattr(
+                instance,
+                "status",
+                "DRAFT",
+            ),
+        )
+
+        previous_status = (
+            getattr(
+                instance,
+                "status",
+                None,
+            )
+            if instance
+            else None
+        )
 
         if status_value == "SENT" and previous_status != "SENT":
             data["sent_at"] = timezone.now()
@@ -386,15 +486,25 @@ class QuotationSerializer(serializers.ModelSerializer):
         return data
 
     @transaction.atomic
-    def create(self, validated_data):
-        items = validated_data.pop("items", [])
+    def create(
+        self,
+        validated_data,
+    ):
+        items = validated_data.pop(
+            "items",
+            [],
+        )
 
         if not validated_data.get("quote_number"):
             validated_data["quote_number"] = self._generate_number(
                 validated_data["branch"]
             )
 
-        subtotal, vat_amount, total = self._calculate_totals(
+        (
+            subtotal,
+            vat_amount,
+            total,
+        ) = self._calculate_totals(
             items,
             validated_data,
         )
@@ -409,16 +519,46 @@ class QuotationSerializer(serializers.ModelSerializer):
 
         quotation = Quotation.objects.create(**validated_data)
 
-        self._save_items(quotation, items)
+        self._save_items(
+            quotation,
+            items,
+        )
 
         return quotation
 
     @transaction.atomic
-    def update(self, instance, validated_data):
-        items = validated_data.pop("items", None)
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        # Extra safety check
+        current_status = str(instance.status or "").upper()
+
+        if current_status in [
+            "CONVERTED",
+            "CANCELLED",
+        ]:
+            raise serializers.ValidationError(
+                {
+                    "status": (
+                        f"{instance.get_status_display()} "
+                        "quotations cannot be edited."
+                    )
+                }
+            )
+
+        items = validated_data.pop(
+            "items",
+            None,
+        )
 
         if items is not None:
-            subtotal, vat_amount, total = self._calculate_totals(
+            (
+                subtotal,
+                vat_amount,
+                total,
+            ) = self._calculate_totals(
                 items,
                 validated_data,
                 instance,
@@ -441,7 +581,10 @@ class QuotationSerializer(serializers.ModelSerializer):
         )
 
         if items is not None:
-            self._save_items(instance, items)
+            self._save_items(
+                instance,
+                items,
+            )
 
         return instance
 
@@ -497,14 +640,7 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
         if not stock:
             return 0
 
-        classification = (
-            str(item.get("stock_classification") or "REGULAR").strip().upper()
-        )
-
-        if classification == "RESTRICTED":
-            return Decimal(str(stock.available_restricted_quantity))
-
-        return Decimal(str(stock.available_regular_quantity))
+        return Decimal(str(stock.available_stock or 0))
 
 
 class SalesOrderSerializer(serializers.ModelSerializer):
@@ -937,8 +1073,16 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
     def _generate_number(self, branch):
         branch_code = (
-            getattr(branch, "branch_code", None)
-            or getattr(branch, "code", None)
+            getattr(
+                branch,
+                "branch_code",
+                None,
+            )
+            or getattr(
+                branch,
+                "code",
+                None,
+            )
             or "INV"
         )
 
@@ -957,96 +1101,176 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
+        # ---------------------------------------------
+        # Prevent editing fully-paid / void invoices
+        # ---------------------------------------------
+        if self.instance:
+            current_payment_status = str(self.instance.payment_status or "").upper()
+
+            if current_payment_status in [
+                "PAID",
+                "VOID",
+            ]:
+                raise serializers.ValidationError(
+                    {
+                        "payment_status": (
+                            f"{self.instance.get_payment_status_display()} "
+                            "invoices cannot be edited."
+                        )
+                    }
+                )
+
         branch = attrs.get(
             "branch",
-            getattr(self.instance, "branch", None),
+            getattr(
+                self.instance,
+                "branch",
+                None,
+            ),
         )
 
         customer = attrs.get(
             "customer",
-            getattr(self.instance, "customer", None),
+            getattr(
+                self.instance,
+                "customer",
+                None,
+            ),
         )
 
         invoice_date = attrs.get(
             "invoice_date",
-            getattr(self.instance, "invoice_date", None),
+            getattr(
+                self.instance,
+                "invoice_date",
+                None,
+            ),
         )
 
         due_date = attrs.get(
             "due_date",
-            getattr(self.instance, "due_date", None),
+            getattr(
+                self.instance,
+                "due_date",
+                None,
+            ),
         )
 
         sales_order = attrs.get(
             "sales_order",
-            getattr(self.instance, "sales_order", None),
+            getattr(
+                self.instance,
+                "sales_order",
+                None,
+            ),
         )
 
         paid_amount = attrs.get(
             "paid_amount",
-            getattr(self.instance, "paid_amount", Decimal("0")),
+            getattr(
+                self.instance,
+                "paid_amount",
+                Decimal("0"),
+            ),
         )
 
         items = attrs.get("items")
 
         if not branch:
-            raise serializers.ValidationError({"branch": "Branch is required."})
+            raise serializers.ValidationError({"branch": ("Branch is required.")})
 
         if not customer:
-            raise serializers.ValidationError({"customer": "Customer is required."})
+            raise serializers.ValidationError({"customer": ("Customer is required.")})
 
         if not invoice_date:
             raise serializers.ValidationError(
-                {"invoice_date": "Issue date is required."}
+                {"invoice_date": ("Issue date is required.")}
             )
 
         if not due_date:
-            raise serializers.ValidationError({"due_date": "Due date is required."})
+            raise serializers.ValidationError({"due_date": ("Due date is required.")})
 
         if due_date < invoice_date:
             raise serializers.ValidationError(
-                {"due_date": "Due date cannot be before issue date."}
+                {"due_date": ("Due date cannot be before " "issue date.")}
             )
 
         if sales_order:
             if sales_order.customer_id != customer.id:
                 raise serializers.ValidationError(
                     {
-                        "sales_order": "Sales Order customer does not match the invoice customer."
+                        "sales_order": (
+                            "Sales Order customer "
+                            "does not match the "
+                            "invoice customer."
+                        )
                     }
                 )
 
             if sales_order.branch_id != branch.id:
                 raise serializers.ValidationError(
                     {
-                        "sales_order": "Sales Order branch does not match the invoice branch."
+                        "sales_order": (
+                            "Sales Order branch "
+                            "does not match the "
+                            "invoice branch."
+                        )
                     }
                 )
 
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": "Add at least one invoice item."}
+                    {"items": ("Add at least one " "invoice item.")}
                 )
 
-            for index, item in enumerate(items, start=1):
+            for index, item in enumerate(
+                items,
+                start=1,
+            ):
                 if not item.get("product"):
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: product is required."}
+                        {"items": (f"Line {index}: " "product is required.")}
                     )
 
-                quantity = Decimal(str(item.get("quantity", 0) or 0))
+                quantity = Decimal(
+                    str(
+                        item.get(
+                            "quantity",
+                            0,
+                        )
+                        or 0
+                    )
+                )
 
-                unit_price = Decimal(str(item.get("unit_price", 0) or 0))
+                unit_price = Decimal(
+                    str(
+                        item.get(
+                            "unit_price",
+                            0,
+                        )
+                        or 0
+                    )
+                )
 
                 if quantity <= 0:
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: quantity must be greater than zero."}
+                        {
+                            "items": (
+                                f"Line {index}: "
+                                "quantity must be "
+                                "greater than zero."
+                            )
+                        }
                     )
 
                 if unit_price < 0:
                     raise serializers.ValidationError(
-                        {"items": f"Line {index}: unit price cannot be negative."}
+                        {
+                            "items": (
+                                f"Line {index}: " "unit price cannot " "be negative."
+                            )
+                        }
                     )
 
                 order_item = item.get("sales_order_item")
@@ -1065,13 +1289,18 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                     if quantity > remaining:
                         raise serializers.ValidationError(
                             {
-                                "items": f"Line {index}: only {remaining} unit(s) remain to invoice."
+                                "items": (
+                                    f"Line {index}: "
+                                    f"only {remaining} "
+                                    "unit(s) remain "
+                                    "to invoice."
+                                )
                             }
                         )
 
         if paid_amount is not None and paid_amount < 0:
             raise serializers.ValidationError(
-                {"paid_amount": "Paid amount cannot be negative."}
+                {"paid_amount": ("Paid amount cannot " "be negative.")}
             )
 
         return attrs
@@ -1087,6 +1316,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         for item in items:
             values = self._calculate_line(item)
+
             subtotal += values["subtotal"]
             vat_amount += values["vat_amount"]
 
@@ -1094,7 +1324,12 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             str(
                 data.get(
                     "shipping_amount",
-                    getattr(instance, "shipping_amount", 0) or 0,
+                    getattr(
+                        instance,
+                        "shipping_amount",
+                        0,
+                    )
+                    or 0,
                 )
                 or 0
             )
@@ -1104,7 +1339,12 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             str(
                 data.get(
                     "discount_amount",
-                    getattr(instance, "discount_amount", 0) or 0,
+                    getattr(
+                        instance,
+                        "discount_amount",
+                        0,
+                    )
+                    or 0,
                 )
                 or 0
             )
@@ -1119,7 +1359,12 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             str(
                 data.get(
                     "paid_amount",
-                    getattr(instance, "paid_amount", 0) or 0,
+                    getattr(
+                        instance,
+                        "paid_amount",
+                        0,
+                    )
+                    or 0,
                 )
                 or 0
             )
@@ -1127,7 +1372,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         if paid_amount > total:
             raise serializers.ValidationError(
-                {"paid_amount": "Paid amount cannot exceed invoice total."}
+                {"paid_amount": ("Paid amount cannot " "exceed invoice total.")}
             )
 
         balance = max(
@@ -1138,7 +1383,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         payment_status = (
             "PAID"
             if balance == 0
-            else "PARTIALLY_PAID" if paid_amount > 0 else "UNPAID"
+            else ("PARTIALLY_PAID" if paid_amount > 0 else "UNPAID")
         )
 
         money_precision = Decimal("0.01")
@@ -1151,13 +1396,25 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             payment_status,
         )
 
-    def _save_items(self, invoice, items):
+    def _save_items(
+        self,
+        invoice,
+        items,
+    ):
         invoice.items.all().delete()
 
         for item in items:
-            item.pop("id", None)
+            item.pop(
+                "id",
+                None,
+            )
+
             values = self._calculate_line(item)
-            item.pop("tax_inclusive", None)
+
+            item.pop(
+                "tax_inclusive",
+                None,
+            )
 
             SalesInvoiceItem.objects.create(
                 invoice=invoice,
@@ -1168,8 +1425,14 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             )
 
     @transaction.atomic
-    def create(self, validated_data):
-        items = validated_data.pop("items", [])
+    def create(
+        self,
+        validated_data,
+    ):
+        items = validated_data.pop(
+            "items",
+            [],
+        )
 
         if not validated_data.get("invoice_number"):
             validated_data["invoice_number"] = self._generate_number(
@@ -1201,16 +1464,41 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         invoice = SalesInvoice.objects.create(**validated_data)
 
-        self._save_items(invoice, items)
+        self._save_items(
+            invoice,
+            items,
+        )
 
         return invoice
 
     @transaction.atomic
-    def update(self, instance, validated_data):
-        if instance.payment_status == "VOID":
-            raise serializers.ValidationError("Void invoices cannot be edited.")
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        # ---------------------------------------------
+        # Extra backend protection for PAID/VOID
+        # ---------------------------------------------
+        current_payment_status = str(instance.payment_status or "").upper()
 
-        items = validated_data.pop("items", None)
+        if current_payment_status in [
+            "PAID",
+            "VOID",
+        ]:
+            raise serializers.ValidationError(
+                {
+                    "payment_status": (
+                        f"{instance.get_payment_status_display()} "
+                        "invoices cannot be edited."
+                    )
+                }
+            )
+
+        items = validated_data.pop(
+            "items",
+            None,
+        )
 
         if items is not None:
             (
@@ -1242,7 +1530,10 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         )
 
         if items is not None:
-            self._save_items(instance, items)
+            self._save_items(
+                instance,
+                items,
+            )
 
         return instance
 
@@ -1522,430 +1813,6 @@ class POSSaleSerializer(serializers.ModelSerializer):
         )
 
 
-class SalesCreditNoteItemSerializer(
-    SalesTaxLineSerializerMixin, serializers.ModelSerializer
-):
-    product_name = serializers.CharField(
-        source="product.product_name",
-        read_only=True,
-        allow_null=True,
-    )
-
-    variant_name = serializers.SerializerMethodField()
-
-    already_credited_quantity = serializers.SerializerMethodField()
-    available_quantity = serializers.SerializerMethodField()
-
-    class Meta:
-        model = SalesCreditNoteItem
-        exclude = ["credit_note"]
-
-        read_only_fields = [
-            "line_total",
-        ]
-
-    def get_variant_name(self, obj):
-        if not obj.variant:
-            return ""
-
-        return (
-            getattr(obj.variant, "variant_name", None)
-            or getattr(obj.variant, "name", None)
-            or str(obj.variant)
-        )
-
-    def get_already_credited_quantity(self, obj):
-        if not obj.invoice_item:
-            return 0
-
-        value = SalesCreditNoteItem.objects.filter(
-            invoice_item=obj.invoice_item,
-            credit_note__status="ISSUED",
-        ).exclude(credit_note=obj.credit_note,).aggregate(value=Sum("credit_quantity"))[
-            "value"
-        ] or Decimal(
-            "0"
-        )
-
-        return value
-
-    def get_available_quantity(self, obj):
-        return max(
-            Decimal("0"),
-            (obj.invoiced_quantity or Decimal("0"))
-            - Decimal(str(self.get_already_credited_quantity(obj))),
-        )
-
-
-class SalesCreditNoteSerializer(serializers.ModelSerializer):
-    items = SalesCreditNoteItemSerializer(
-        many=True,
-    )
-
-    customer_name = serializers.CharField(
-        source="customer.customer_name",
-        read_only=True,
-        allow_null=True,
-    )
-
-    branch_name = serializers.CharField(
-        source="branch.branch_name",
-        read_only=True,
-        allow_null=True,
-    )
-
-    invoice_number = serializers.CharField(
-        source="invoice.invoice_number",
-        read_only=True,
-        allow_null=True,
-    )
-
-    linked_return_number = serializers.SerializerMethodField()
-
-    class Meta:
-        model = SalesCreditNote
-        fields = "__all__"
-
-        read_only_fields = [
-            "credit_note_number",
-            "customer",
-            "branch",
-            "currency",
-            "subtotal",
-            "vat_amount",
-            "total_amount",
-            "issued_at",
-            "voided_at",
-            "created_at",
-            "updated_at",
-        ]
-
-    def get_linked_return_number(self, obj):
-        linked_return = (
-            obj.invoice.returns.order_by("-id").first() if obj.invoice else None
-        )
-
-        return linked_return.return_number if linked_return else ""
-
-    def _generate_number(self, branch):
-        branch_code = (
-            getattr(branch, "branch_code", None)
-            or getattr(branch, "code", None)
-            or "CN"
-        )
-
-        prefix = timezone.now().strftime(f"CN-{branch_code}-%Y%m")
-
-        count = SalesCreditNote.objects.filter(
-            credit_note_number__startswith=prefix,
-        ).count()
-
-        return f"{prefix}-{count + 1:04d}"
-
-    def _calculate_line(self, item):
-        invoice_item = item.get("invoice_item")
-
-        if invoice_item:
-            item = {
-                **item,
-                "unit_price": invoice_item.unit_price,
-                "vat_percentage": invoice_item.vat_percentage,
-                "tax_rate": invoice_item.tax_rate,
-                "tax_treatment": invoice_item.tax_treatment,
-                "tax_reason": invoice_item.tax_reason,
-                "stock_classification": invoice_item.stock_classification,
-                "tax_inclusive": bool(
-                    getattr(
-                        invoice_item.invoice,
-                        "tax_inclusive",
-                        False,
-                    )
-                ),
-            }
-
-        return calculate_serialized_sales_line(
-            item,
-            quantity_key="credit_quantity",
-        )
-
-    def validate(self, attrs):
-        invoice = attrs.get(
-            "invoice",
-            getattr(self.instance, "invoice", None),
-        )
-
-        branch = attrs.get(
-            "branch",
-            getattr(self.instance, "branch", None),
-        )
-
-        customer = attrs.get(
-            "customer",
-            getattr(self.instance, "customer", None),
-        )
-
-        credit_date = attrs.get(
-            "credit_date",
-            getattr(self.instance, "credit_date", None),
-        )
-
-        items = attrs.get("items")
-
-        if not invoice:
-            raise serializers.ValidationError(
-                {"invoice": "Related invoice is required."}
-            )
-
-        if not branch:
-            branch = invoice.branch
-            attrs["branch"] = branch
-
-        if not customer:
-            customer = invoice.customer
-            attrs["customer"] = customer
-
-        if invoice.branch_id != branch.id:
-            raise serializers.ValidationError(
-                {"branch": "Credit-note branch must match the invoice branch."}
-            )
-
-        if invoice.customer_id != customer.id:
-            raise serializers.ValidationError(
-                {"customer": "Credit-note customer must match the invoice customer."}
-            )
-
-        if invoice.payment_status == "VOID":
-            raise serializers.ValidationError(
-                {"invoice": "A void invoice cannot be credited."}
-            )
-
-        if not credit_date:
-            raise serializers.ValidationError(
-                {"credit_date": "Credit-note date is required."}
-            )
-
-        if items is not None:
-            if not items:
-                raise serializers.ValidationError(
-                    {"items": "Select at least one invoice item."}
-                )
-
-            for index, item in enumerate(items, start=1):
-                invoice_item = item.get("invoice_item")
-
-                if not invoice_item:
-                    raise serializers.ValidationError(
-                        {"items": f"Line {index}: invoice item is required."}
-                    )
-
-                if invoice_item.invoice_id != invoice.id:
-                    raise serializers.ValidationError(
-                        {
-                            "items": f"Line {index}: item does not belong to the selected invoice."
-                        }
-                    )
-
-                quantity = Decimal(str(item.get("credit_quantity", 0) or 0))
-
-                if quantity <= 0:
-                    raise serializers.ValidationError(
-                        {
-                            "items": f"Line {index}: credit quantity must be greater than zero."
-                        }
-                    )
-
-                already_credited = SalesCreditNoteItem.objects.filter(
-                    invoice_item=invoice_item,
-                    credit_note__status="ISSUED",
-                ).exclude(
-                    credit_note=self.instance,
-                ).aggregate(
-                    value=Sum("credit_quantity")
-                )[
-                    "value"
-                ] or Decimal(
-                    "0"
-                )
-
-                available = invoice_item.quantity - already_credited
-
-                if quantity > available:
-                    raise serializers.ValidationError(
-                        {
-                            "items": f"Line {index}: only {available} unit(s) remain creditable."
-                        }
-                    )
-
-        return attrs
-
-    def _calculate_totals(self, items):
-        subtotal = Decimal("0")
-        vat_amount = Decimal("0")
-
-        for item in items:
-            values = self._calculate_line(item)
-            subtotal += values["subtotal"]
-            vat_amount += values["vat_amount"]
-
-        return (
-            subtotal,
-            vat_amount,
-            subtotal + vat_amount,
-        )
-
-    def _save_items(self, credit_note, items):
-        credit_note.items.all().delete()
-
-        for item in items:
-            item.pop("id", None)
-            invoice_item = item.get("invoice_item")
-
-            item.setdefault(
-                "product",
-                invoice_item.product,
-            )
-
-            item.setdefault(
-                "variant",
-                invoice_item.variant,
-            )
-
-            item.setdefault(
-                "description",
-                invoice_item.description,
-            )
-
-            item.setdefault(
-                "invoiced_quantity",
-                invoice_item.quantity,
-            )
-
-            item.setdefault(
-                "unit_price",
-                invoice_item.unit_price,
-            )
-
-            item["vat_percentage"] = invoice_item.vat_percentage
-            item["tax_rate"] = invoice_item.tax_rate
-            item["tax_treatment"] = invoice_item.tax_treatment
-            item["tax_reason"] = invoice_item.tax_reason
-            item["stock_classification"] = invoice_item.stock_classification
-            item["tax_inclusive"] = bool(
-                getattr(
-                    invoice_item.invoice,
-                    "tax_inclusive",
-                    False,
-                )
-            )
-
-            values = self._calculate_line(item)
-            item.pop("tax_inclusive", None)
-
-            SalesCreditNoteItem.objects.create(
-                credit_note=credit_note,
-                taxable_amount=values["taxable_amount"],
-                tax_amount=values["tax_amount"],
-                line_total=values["line_total"],
-                **item,
-            )
-
-    def _apply_credit(self, credit_note):
-        invoice = credit_note.invoice
-
-        issued_total = invoice.credit_notes.filter(status="ISSUED").aggregate(
-            value=Sum("total_amount")
-        )["value"] or Decimal("0")
-
-        invoice.balance_due = max(
-            Decimal("0"),
-            invoice.total_amount - invoice.paid_amount - issued_total,
-        )
-
-        if invoice.balance_due == 0:
-            invoice.payment_status = "PAID" if invoice.paid_amount > 0 else "UNPAID"
-
-        invoice.save(
-            update_fields=[
-                "balance_due",
-                "payment_status",
-                "updated_at",
-            ]
-        )
-
-    @transaction.atomic
-    def create(self, validated_data):
-        items = validated_data.pop("items", [])
-
-        if not validated_data.get("credit_note_number"):
-            validated_data["credit_note_number"] = self._generate_number(
-                validated_data["branch"]
-            )
-
-        subtotal, vat_amount, total = self._calculate_totals(items)
-
-        validated_data.update(
-            subtotal=subtotal,
-            vat_amount=vat_amount,
-            total_amount=total,
-        )
-
-        if validated_data.get("status") == "ISSUED":
-            validated_data["issued_at"] = timezone.now()
-
-        credit_note = SalesCreditNote.objects.create(**validated_data)
-
-        self._save_items(
-            credit_note,
-            items,
-        )
-
-        if credit_note.status == "ISSUED":
-            self._apply_credit(credit_note)
-
-        return credit_note
-
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        if instance.status in [
-            "VOID",
-            "REFUNDED",
-        ]:
-            raise serializers.ValidationError(
-                "Void or fully refunded credit notes cannot be edited."
-            )
-
-        previous_status = instance.status
-        items = validated_data.pop("items", None)
-
-        if items is not None:
-            subtotal, vat_amount, total = self._calculate_totals(items)
-
-            validated_data.update(
-                subtotal=subtotal,
-                vat_amount=vat_amount,
-                total_amount=total,
-            )
-
-        if validated_data.get("status") == "ISSUED" and previous_status != "ISSUED":
-            validated_data["issued_at"] = timezone.now()
-
-        instance = super().update(
-            instance,
-            validated_data,
-        )
-
-        if items is not None:
-            self._save_items(
-                instance,
-                items,
-            )
-
-        if instance.status == "ISSUED" and previous_status != "ISSUED":
-            self._apply_credit(instance)
-
-        return instance
-
-
 class SalesReturnItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
         source="product.product_name",
@@ -1963,29 +1830,61 @@ class SalesReturnSerializer(serializers.ModelSerializer):
     items = SalesReturnItemSerializer(many=True)
 
     customer_name = serializers.CharField(
-        source="customer.customer_name",
-        read_only=True,
-        allow_null=True,
+        source="customer.customer_name", read_only=True, allow_null=True
     )
     order_number = serializers.CharField(
-        source="sales_order.order_number",
-        read_only=True,
-        allow_null=True,
+        source="sales_order.order_number", read_only=True, allow_null=True
     )
     invoice_number = serializers.CharField(
-        source="invoice.invoice_number",
-        read_only=True,
-        allow_null=True,
+        source="invoice.invoice_number", read_only=True, allow_null=True
     )
 
     class Meta:
         model = SalesReturn
         fields = "__all__"
+        read_only_fields = [
+            "return_number",
+            "subtotal",
+            "vat_amount",
+            "total_amount",
+            "submitted_at",
+            "approved_at",
+            "completed_at",
+            "approved_by",
+            "approver_name",
+            "created_at",
+            "updated_at",
+        ]
 
     def _generate_number(self):
         prefix = timezone.now().strftime("RTN-%Y%m")
         count = SalesReturn.objects.filter(return_number__startswith=prefix).count()
         return f"{prefix}-{count + 1:04d}"
+
+    def _recalculate_totals(self, sales_return):
+        subtotal = Decimal("0")
+
+        for item in sales_return.items.all():
+            quantity = Decimal(str(item.returned_quantity or 0))
+            price = Decimal(str(item.unit_price or 0))
+            line_total = quantity * price
+            if item.line_total != line_total:
+                item.line_total = line_total
+                item.save(update_fields=["line_total"])
+            subtotal += line_total
+
+        vat = subtotal * Decimal("0.05")
+        sales_return.subtotal = subtotal
+        sales_return.vat_amount = vat
+        sales_return.total_amount = subtotal + vat
+        sales_return.save(
+            update_fields=[
+                "subtotal",
+                "vat_amount",
+                "total_amount",
+                "updated_at",
+            ]
+        )
 
     def validate(self, attrs):
         order = attrs.get(
@@ -2005,6 +1904,12 @@ class SalesReturnSerializer(serializers.ModelSerializer):
         if not attrs.get("invoice") and order.invoices.exists():
             attrs["invoice"] = order.invoices.order_by("-id").first()
 
+        if self.instance and items is not None:
+            if self.instance.status not in ["DRAFT", "REJECTED"]:
+                raise serializers.ValidationError(
+                    {"status": ("Only Draft or Rejected returns can be edited.")}
+                )
+
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
@@ -2013,47 +1918,55 @@ class SalesReturnSerializer(serializers.ModelSerializer):
 
             for index, item in enumerate(items, start=1):
                 order_item = item.get("sales_order_item")
-
                 if not order_item:
                     raise serializers.ValidationError(
                         {"items": f"Line {index}: Sales Order item is required."}
                     )
+
                 if order_item.sales_order_id != order.id:
                     raise serializers.ValidationError(
                         {
-                            "items": f"Line {index}: item does not belong to the selected order."
+                            "items": (
+                                f"Line {index}: item does not belong to "
+                                "the selected order."
+                            )
                         }
                     )
 
                 quantity = Decimal(str(item.get("returned_quantity", 0) or 0))
-                already_returned = SalesReturnItem.objects.filter(
-                    sales_order_item=order_item,
-                ).exclude(
-                    sales_return__status__in=[
-                        "REJECTED",
-                        "CANCELLED",
-                    ]
-                ).exclude(
-                    sales_return=self.instance
-                ).aggregate(
+
+                returned_qs = SalesReturnItem.objects.filter(
+                    sales_order_item=order_item
+                ).exclude(sales_return__status__in=["REJECTED", "CANCELLED"])
+
+                if self.instance:
+                    returned_qs = returned_qs.exclude(sales_return=self.instance)
+
+                already_returned = returned_qs.aggregate(
                     value=Sum("returned_quantity")
-                )[
-                    "value"
-                ] or Decimal(
-                    "0"
+                )["value"] or Decimal("0")
+
+                remaining = Decimal(str(order_item.quantity or 0)) - Decimal(
+                    str(already_returned)
                 )
-                remaining = order_item.quantity - already_returned
 
                 if quantity <= 0:
                     raise serializers.ValidationError(
                         {
-                            "items": f"Line {index}: returned quantity must be greater than zero."
+                            "items": (
+                                f"Line {index}: returned quantity must be "
+                                "greater than zero."
+                            )
                         }
                     )
+
                 if quantity > remaining:
                     raise serializers.ValidationError(
                         {
-                            "items": f"Line {index}: only {remaining} unit(s) remain returnable."
+                            "items": (
+                                f"Line {index}: only {remaining} unit(s) "
+                                "remain returnable."
+                            )
                         }
                     )
 
@@ -2062,43 +1975,58 @@ class SalesReturnSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
-
-        if not validated_data.get("return_number"):
-            validated_data["return_number"] = self._generate_number()
+        validated_data["return_number"] = self._generate_number()
 
         sales_return = SalesReturn.objects.create(**validated_data)
-        subtotal = Decimal("0")
 
         for item in items:
             quantity = Decimal(str(item.get("returned_quantity", 0) or 0))
             price = Decimal(str(item.get("unit_price", 0) or 0))
-            line_total = quantity * price
-            subtotal += line_total
-
             SalesReturnItem.objects.create(
                 sales_return=sales_return,
-                line_total=line_total,
+                line_total=quantity * price,
                 **item,
             )
 
-        vat = subtotal * Decimal("0.05")
-        sales_return.subtotal = subtotal
-        sales_return.vat_amount = vat
-        sales_return.total_amount = subtotal + vat
-
         if sales_return.status == "PENDING_APPROVAL":
             sales_return.submitted_at = timezone.now()
+            sales_return.save(update_fields=["submitted_at", "updated_at"])
 
-        sales_return.save(
-            update_fields=[
-                "subtotal",
-                "vat_amount",
-                "total_amount",
-                "submitted_at",
-                "updated_at",
-            ]
-        )
+        self._recalculate_totals(sales_return)
         return sales_return
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items = validated_data.pop("items", None)
+
+        for field, value in validated_data.items():
+            if field in {
+                "return_number",
+                "submitted_at",
+                "approved_at",
+                "completed_at",
+                "approved_by",
+                "approver_name",
+            }:
+                continue
+            setattr(instance, field, value)
+
+        instance.save()
+
+        if items is not None:
+            instance.items.all().delete()
+
+            for item in items:
+                quantity = Decimal(str(item.get("returned_quantity", 0) or 0))
+                price = Decimal(str(item.get("unit_price", 0) or 0))
+                SalesReturnItem.objects.create(
+                    sales_return=instance,
+                    line_total=quantity * price,
+                    **item,
+                )
+
+        self._recalculate_totals(instance)
+        return instance
 
 
 class SalesPaymentSerializer(serializers.ModelSerializer):

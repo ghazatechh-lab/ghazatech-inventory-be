@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     "apps.service_repairs",
     "apps.notifications",
     "apps.audit_logs",
+    "apps.fleet",
     "apps.reports",
 ]
 

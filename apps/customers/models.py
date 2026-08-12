@@ -4,6 +4,14 @@ from apps.common.models import SoftDeleteModel, TimeStampedModel
 
 
 class Customer(TimeStampedModel, SoftDeleteModel):
+    branch = models.ForeignKey(
+        "branches.Branch",
+        on_delete=models.PROTECT,
+        related_name="customers",
+        null=True,
+        blank=True,
+    )
+
     CUSTOMER_TYPE_CHOICES = [
         ("BUSINESS", "Business"),
         ("INDIVIDUAL", "Individual"),
@@ -25,7 +33,6 @@ class Customer(TimeStampedModel, SoftDeleteModel):
 
     customer_code = models.CharField(
         max_length=50,
-        unique=True,
     )
 
     customer_type = models.CharField(
@@ -159,6 +166,12 @@ class Customer(TimeStampedModel, SoftDeleteModel):
 
     class Meta:
         ordering = ["customer_name", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "customer_code"],
+                name="unique_customer_code_per_branch",
+            )
+        ]
 
     def __str__(self):
         return self.customer_name

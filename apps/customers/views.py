@@ -1,6 +1,7 @@
 import csv
 from decimal import Decimal
 
+from django.db import models
 from django.db.models import Count, Max, Sum
 from django.http import HttpResponse
 from django.utils import timezone
@@ -28,6 +29,7 @@ class CustomerViewSet(ModelViewSet):
     ]
 
     filterset_fields = [
+        "branch",
         "is_active",
         "customer_type",
         "category",
@@ -48,16 +50,38 @@ class CustomerViewSet(ModelViewSet):
     def get_queryset(self):
         from apps.sales.models import SalesInvoice, SalesOrder
 
-        return Customer.objects.filter(is_deleted=False).annotate(
+        branch_id = self.request.query_params.get("branch")
+
+        queryset = Customer.objects.filter(is_deleted=False)
+
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+
+        return queryset.annotate(
             order_count=Count(
                 "salesorder",
+                filter=(
+                    models.Q(salesorder__branch_id=branch_id)
+                    if branch_id
+                    else models.Q()
+                ),
                 distinct=True,
             ),
             last_order_date=Max(
                 "salesorder__order_date",
+                filter=(
+                    models.Q(salesorder__branch_id=branch_id)
+                    if branch_id
+                    else models.Q()
+                ),
             ),
             balance_due=Sum(
                 "salesinvoice__balance_due",
+                filter=(
+                    models.Q(salesinvoice__branch_id=branch_id)
+                    if branch_id
+                    else models.Q()
+                ),
             ),
         )
 
@@ -92,6 +116,11 @@ class CustomerViewSet(ModelViewSet):
                     SalesInvoice.objects.filter(
                         customer__in=queryset,
                         balance_due__gt=0,
+                        **(
+                            {"branch_id": request.query_params.get("branch")}
+                            if request.query_params.get("branch")
+                            else {}
+                        ),
                     ).aggregate(value=Sum("balance_due"))["value"]
                     or 0
                 ),
@@ -157,7 +186,11 @@ class CustomerViewSet(ModelViewSet):
             entries = LedgerEntry.objects.filter(
                 customer=customer,
                 ledger_type="Customer",
-            ).order_by("-transaction_date", "-id")
+            )
+            branch_id = request.query_params.get("branch")
+            if branch_id and hasattr(LedgerEntry, "branch"):
+                entries = entries.filter(branch_id=branch_id)
+            entries = entries.order_by("-transaction_date", "-id")
 
             data = [
                 {
@@ -192,9 +225,11 @@ class CustomerViewSet(ModelViewSet):
         try:
             from apps.sales.models import SalesInvoice
 
-            invoices = SalesInvoice.objects.filter(customer=customer).order_by(
-                "-invoice_date", "-id"
-            )
+            invoices = SalesInvoice.objects.filter(customer=customer)
+            branch_id = request.query_params.get("branch")
+            if branch_id:
+                invoices = invoices.filter(branch_id=branch_id)
+            invoices = invoices.order_by("-invoice_date", "-id")
 
             data = [
                 {
@@ -233,6 +268,9 @@ class CustomerViewSet(ModelViewSet):
             from apps.sales.models import SalesInvoice
 
             invoices = SalesInvoice.objects.filter(customer=customer)
+            branch_id = request.query_params.get("branch")
+            if branch_id:
+                invoices = invoices.filter(branch_id=branch_id)
 
             for invoice in invoices:
                 total_invoice_amount += invoice.total_amount or Decimal("0.00")

@@ -67,6 +67,16 @@ class CustomerSerializer(serializers.ModelSerializer):
         return "OUTSTANDING" if balance > 0 else "ACTIVE"
 
     def validate(self, attrs):
+        branch = attrs.get(
+            "branch",
+            getattr(self.instance, "branch", None),
+        )
+
+        if branch is None:
+            raise serializers.ValidationError(
+                {"branch": "Branch is required for every customer."}
+            )
+
         customer_type = attrs.get(
             "customer_type",
             getattr(self.instance, "customer_type", "BUSINESS"),
@@ -84,9 +94,13 @@ class CustomerSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         if not validated_data.get("customer_code"):
-            last_customer = Customer.objects.order_by("-id").first()
+            branch = validated_data["branch"]
+            last_customer = (
+                Customer.objects.filter(branch=branch).order_by("-id").first()
+            )
             next_number = 1 if not last_customer else last_customer.id + 1
-            validated_data["customer_code"] = f"CUS-{next_number:05d}"
+            branch_code = getattr(branch, "branch_code", "BR") or "BR"
+            validated_data["customer_code"] = f"{branch_code}-CUS-{next_number:05d}"
 
         if validated_data.get("trn") and not validated_data.get("trn_number"):
             validated_data["trn_number"] = validated_data["trn"]

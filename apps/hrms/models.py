@@ -919,3 +919,110 @@ class PayrollEntry(TimeStampedModel):
 
     def __str__(self):
         return f"{self.employee.full_name} - {self.period}"
+
+
+class SalaryCertificate(TimeStampedModel):
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name="salary_certificates",
+    )
+
+    reference_number = models.CharField(
+        max_length=50,
+        unique=True,
+    )
+
+    certificate_date = models.DateField()
+
+    # Employee snapshot fields.
+    # These make old certificates remain unchanged even when
+    # the employee record or salary is updated later.
+    employee_name = models.CharField(
+        max_length=220,
+    )
+
+    employee_code = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+    )
+
+    identity_number = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
+    designation_name = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+
+    joining_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+
+    basic_salary = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    housing_allowance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    transport_other_allowance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    authorized_signatory = models.CharField(
+        max_length=150,
+    )
+
+    signatory_designation = models.CharField(
+        max_length=150,
+    )
+
+    purpose = models.CharField(
+        max_length=255,
+        blank=True,
+        default="Official purposes",
+    )
+
+    notes = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="issued_salary_certificates",
+    )
+
+    class Meta:
+        ordering = [
+            "-certificate_date",
+            "-id",
+        ]
+
+    @property
+    def total_monthly_salary(self):
+        return (
+            (self.basic_salary or 0)
+            + (self.housing_allowance or 0)
+            + (self.transport_other_allowance or 0)
+        )
+
+    def __str__(self):
+        return f"{self.reference_number} - " f"{self.employee_name}"

@@ -739,3 +739,231 @@ class PayrollRunSerializer(serializers.ModelSerializer):
             or obj.generated_by.username
             or obj.generated_by.email
         )
+
+
+class SalaryCertificateSerializer(serializers.ModelSerializer):
+    total_monthly_salary = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    branch_id = serializers.IntegerField(
+        source="employee.branch_id",
+        read_only=True,
+    )
+
+    branch_name = serializers.SerializerMethodField()
+
+    issued_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalaryCertificate
+        fields = "__all__"
+
+        read_only_fields = [
+            "reference_number",
+            "employee_name",
+            "employee_code",
+            "designation_name",
+            "joining_date",
+            "issued_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_branch_name(self, obj):
+        branch = getattr(
+            obj.employee,
+            "branch",
+            None,
+        )
+
+        if not branch:
+            return None
+
+        return (
+            getattr(
+                branch,
+                "branch_name",
+                None,
+            )
+            or getattr(
+                branch,
+                "name",
+                None,
+            )
+            or str(branch)
+        )
+
+    def get_issued_by_name(self, obj):
+        user = obj.issued_by
+
+        if not user:
+            return None
+
+        return (
+            getattr(
+                user,
+                "full_name",
+                None,
+            )
+            or getattr(
+                user,
+                "name",
+                None,
+            )
+            or getattr(
+                user,
+                "email",
+                None,
+            )
+            or str(user)
+        )
+
+    def validate_employee(self, employee):
+        allowed_statuses = {
+            "ACTIVE",
+            "PROBATION",
+            "ON_LEAVE",
+        }
+
+        if employee.employment_status not in allowed_statuses:
+            raise serializers.ValidationError(
+                "Salary certificates can only be issued "
+                "for currently employed employees."
+            )
+
+        return employee
+
+    def validate(self, attrs):
+        for field_name in [
+            "basic_salary",
+            "housing_allowance",
+            "transport_other_allowance",
+        ]:
+            value = Decimal(
+                str(
+                    attrs.get(
+                        field_name,
+                        getattr(
+                            self.instance,
+                            field_name,
+                            0,
+                        ),
+                    )
+                    or 0
+                )
+            )
+
+            if value < 0:
+                raise serializers.ValidationError(
+                    {field_name: ("Salary amount cannot be negative.")}
+                )
+
+        signatory = str(
+            attrs.get(
+                "authorized_signatory",
+                getattr(
+                    self.instance,
+                    "authorized_signatory",
+                    "",
+                ),
+            )
+            or ""
+        ).strip()
+
+        signatory_designation = str(
+            attrs.get(
+                "signatory_designation",
+                getattr(
+                    self.instance,
+                    "signatory_designation",
+                    "",
+                ),
+            )
+            or ""
+        ).strip()
+
+        if not signatory:
+            raise serializers.ValidationError(
+                {"authorized_signatory": ("Authorized signatory is required.")}
+            )
+
+        if not signatory_designation:
+            raise serializers.ValidationError(
+                {"signatory_designation": ("Signatory designation is required.")}
+            )
+
+        return attrs
+
+    def _generate_reference_number(self):
+        prefix = timezone.localdate().strftime("SC-%Y%m")
+
+        latest = (
+            SalaryCertificate.objects.filter(reference_number__startswith=prefix)
+            .order_by("-id")
+            .first()
+        )
+
+        next_number = 1
+
+        if latest:
+            try:
+                next_number = (
+                    int(
+                        latest.reference_number.rsplit(
+                            "-",
+                            1,
+                        )[-1]
+                    )
+                    + 1
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                next_number = (
+                    SalaryCertificate.objects.filter(
+                        reference_number__startswith=prefix
+                    ).count()
+                    + 1
+                )
+
+        return f"{prefix}-{next_number:04d}"
+
+    @transaction.atomic
+    def create(
+        self,
+        validated_data,
+    ):
+        employee = validated_data["employee"]
+
+        request = self.context.get("request")
+
+        supplied_identity = str(validated_data.get("identity_number") or "").strip()
+
+        identity_number = (
+            supplied_identity
+            or employee.passport_number
+            or employee.emirates_id_number
+            or ""
+        )
+
+        validated_data.update(
+            {
+                "reference_number": (self._generate_reference_number()),
+                "employee_name": (employee.full_name),
+                "employee_code": (employee.employee_code or ""),
+                "identity_number": (identity_number),
+                "designation_name": (
+                    employee.designation.name if employee.designation else ""
+                ),
+                "joining_date": (employee.joining_date),
+                "issued_by": (
+                    request.user if request and request.user.is_authenticated else None
+                ),
+            }
+        )
+
+        return super().create(validated_data)

@@ -106,18 +106,6 @@ def validate_tax_treatment(user, tax_treatment, reason=""):
     return normalized
 
 
-# Temporary compatibility wrapper for existing serializers/views that still
-# call the old function name with stock_classification. Classification is
-# intentionally ignored because inventory now maintains one quantity.
-def validate_tax_and_classification(
-    user,
-    tax_treatment,
-    stock_classification=None,
-    reason="",
-):
-    return validate_tax_treatment(user, tax_treatment, reason)
-
-
 @transaction.atomic
 def deduct_sales_item(
     *,

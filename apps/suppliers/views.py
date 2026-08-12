@@ -16,7 +16,6 @@ from .models import (
     SupplierDocument,
 )
 
-import logging
 
 
 from .serializers import (

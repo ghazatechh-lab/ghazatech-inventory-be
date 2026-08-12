@@ -1434,3 +1434,129 @@ class HRMSReportViewSet(BaseViewSet):
                 ]
             )
         return response
+
+
+class SalaryCertificateViewSet(BaseViewSet):
+    queryset = SalaryCertificate.objects.select_related(
+        "employee",
+        "employee__branch",
+        "employee__designation",
+        "issued_by",
+    ).order_by(
+        "-certificate_date",
+        "-id",
+    )
+
+    serializer_class = SalaryCertificateSerializer
+
+    search_fields = [
+        "reference_number",
+        "employee_name",
+        "employee_code",
+        "identity_number",
+        "designation_name",
+        "authorized_signatory",
+    ]
+
+    filterset_fields = [
+        "employee",
+        "certificate_date",
+    ]
+
+    ordering_fields = [
+        "reference_number",
+        "certificate_date",
+        "employee_name",
+        "created_at",
+    ]
+
+    # Certificates are immutable after issue.
+    # A correction should be issued as a new certificate.
+    http_method_names = [
+        "get",
+        "post",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        branch_id = self.request.query_params.get("branch")
+
+        if branch_id and str(branch_id).lower() != "all":
+            queryset = queryset.filter(employee__branch_id=branch_id)
+
+        return queryset
+
+
+# Add this method INSIDE your existing EmployeeViewSet class.
+
+
+@action(
+    detail=True,
+    methods=["get"],
+    url_path="salary-certificate-data",
+)
+def salary_certificate_data(
+    self,
+    request,
+    pk=None,
+):
+    employee = self.get_object()
+
+    if employee.employment_status not in [
+        "ACTIVE",
+        "PROBATION",
+        "ON_LEAVE",
+    ]:
+        return Response(
+            {
+                "detail": (
+                    "Salary certificates can only be "
+                    "issued for currently employed employees."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    basic_salary = Decimal(employee.basic_salary or 0)
+
+    allowances = Decimal(employee.allowances or 0)
+
+    # The current Employee model stores all allowances
+    # in one field. For the certificate we initially map
+    # that value to Transport / Other Allowance.
+    #
+    # HR can manually split the amount into Housing and
+    # Transport / Other before issuing the certificate.
+    housing_allowance = Decimal("0")
+
+    transport_other_allowance = allowances
+
+    return Response(
+        {
+            "employee": (employee.id),
+            "employee_name": (employee.full_name),
+            "employee_code": (employee.employee_code or ""),
+            "branch": (employee.branch_id),
+            "branch_name": (employee.branch.branch_name if employee.branch else ""),
+            "designation": (employee.designation_id),
+            "designation_name": (
+                employee.designation.name if employee.designation else ""
+            ),
+            "joining_date": (employee.joining_date),
+            "passport_number": (employee.passport_number or ""),
+            "emirates_id_number": (employee.emirates_id_number or ""),
+            "identity_number": (
+                employee.passport_number or employee.emirates_id_number or ""
+            ),
+            "basic_salary": (basic_salary),
+            "allowances": (allowances),
+            "housing_allowance": (housing_allowance),
+            "transport_other_allowance": (transport_other_allowance),
+            "total_monthly_salary": (
+                basic_salary + housing_allowance + transport_other_allowance
+            ),
+        }
+    )

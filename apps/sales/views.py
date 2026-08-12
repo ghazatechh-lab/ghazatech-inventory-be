@@ -12,7 +12,6 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
-from apps.common.sensitive_permissions import can_view_restricted
 
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
@@ -51,114 +50,51 @@ def _resolve_sales_branch(branch_value):
 
 
 def _sales_product_options(branch_id, user=None):
-    """
-    Return one sales option per ProductStock row, including exact Regular and
-    Restricted availability for the selected branch.
-
-    Restricted quantity is returned only to Admin or users who have permission
-    to view restricted stock.
-    """
+    """Return sellable product/variant options for one branch using single stock."""
     branch = _resolve_sales_branch(branch_id)
-
     if not branch:
         return []
 
-    restricted_allowed = can_view_restricted(user)
-
     stocks = (
-        ProductStock.objects.select_related(
-            "product",
-            "variant",
-            "branch",
-        )
-        .filter(
-            branch=branch,
-            product__is_active=True,
-        )
-        .order_by(
-            "product__product_name",
-            "variant_id",
-        )
+        ProductStock.objects.select_related("product", "variant", "branch")
+        .filter(branch=branch, product__is_active=True)
+        .order_by("product__product_name", "variant_id")
     )
 
     rows = []
-
     for stock in stocks:
         product = stock.product
-
         if getattr(product, "is_deleted", False):
             continue
 
-        regular_available = max(
-            0,
-            int(
-                getattr(
-                    stock,
-                    "available_regular_quantity",
-                    0,
-                )
-                or 0
-            ),
-        )
-
-        restricted_available = (
-            max(
-                0,
-                int(
-                    getattr(
-                        stock,
-                        "available_restricted_quantity",
-                        0,
-                    )
-                    or 0
-                ),
-            )
-            if restricted_allowed
-            else 0
-        )
-
-        total_available = regular_available + restricted_available
-
-        if total_available <= 0:
+        available = max(0, int(getattr(stock, "available_stock", 0) or 0))
+        if available <= 0:
             continue
 
         variant = stock.variant
         price_variant = variant
-
         if price_variant is None:
             price_variant = product.variants.filter(
-                is_base=True,
-                is_active=True,
+                is_base=True, is_active=True
             ).first()
-
         if price_variant is None:
             price_variant = (
-                product.variants.filter(
-                    is_active=True,
-                )
-                .order_by("id")
-                .first()
+                product.variants.filter(is_active=True).order_by("id").first()
             )
 
-        price = getattr(
-            price_variant,
-            "retail_price",
-            None,
-        )
-
+        price = getattr(price_variant, "retail_price", None)
         if price in (None, 0):
-            price = (
-                getattr(
-                    product,
-                    "selling_price",
-                    0,
-                )
-                or 0
-            )
+            price = getattr(product, "selling_price", 0) or 0
+
+        vat_rate = (
+            getattr(product, "vat_rate", None)
+            or getattr(product, "vat_percentage", None)
+            or 0
+        )
 
         rows.append(
             {
-                "option_key": (f"{product.id}:{stock.variant_id or ''}"),
+                "option_key": f"{product.id}:{stock.variant_id or ''}",
                 "stock_id": stock.id,
                 "branch_id": branch.id,
                 "branch_code": branch.branch_code,
@@ -167,75 +103,21 @@ def _sales_product_options(branch_id, user=None):
                 "variant_id": stock.variant_id,
                 "product_name": product.product_name,
                 "name": product.product_name,
-                "sku": getattr(
-                    product,
-                    "sku",
-                    "",
-                ),
-                "barcode": getattr(
-                    product,
-                    "barcode",
-                    "",
-                ),
-                "description": getattr(
-                    product,
-                    "description",
-                    "",
-                ),
+                "sku": getattr(product, "sku", ""),
+                "barcode": getattr(product, "barcode", ""),
+                "description": getattr(product, "description", ""),
                 "selling_price": price,
                 "retail_price": price,
                 "unit_price": price,
                 "price": price,
-                "regular_quantity": int(
-                    getattr(
-                        stock,
-                        "regular_quantity",
-                        0,
-                    )
-                    or 0
-                ),
-                "restricted_quantity": (
-                    int(
-                        getattr(
-                            stock,
-                            "restricted_quantity",
-                            0,
-                        )
-                        or 0
-                    )
-                    if restricted_allowed
-                    else 0
-                ),
-                "available_regular_quantity": (regular_available),
-                "available_restricted_quantity": (restricted_available),
-                "available_stock": (total_available),
-                "restricted_allowed": (restricted_allowed),
-                "variant_name": (str(variant) if variant else ""),
-                "vat_percentage": getattr(
-                    product,
-                    "vat_percentage",
-                    5,
-                )
-                or 5,
-                "vat_rate": getattr(
-                    product,
-                    "vat_percentage",
-                    5,
-                )
-                or 5,
-                "tax_treatment": getattr(
-                    product,
-                    "tax_treatment",
-                    "STANDARD_VAT",
-                )
-                or "STANDARD_VAT",
-                "vat_inclusive": bool(
-                    getattr(
-                        product,
-                        "vat_inclusive",
-                        False,
-                    )
-                ),
+                "current_stock": int(stock.current_stock or 0),
+                "reserved_stock": int(stock.reserved_stock or 0),
+                "available_stock": available,
+                "variant_name": str(variant) if variant else "",
+                "vat_percentage": vat_rate,
+                "vat_rate": vat_rate,
+                "tax_treatment": getattr(product, "tax_treatment", "VAT") or "VAT",
+                "vat_inclusive": bool(getattr(product, "vat_inclusive", False)),
             }
         )
 
@@ -349,9 +231,10 @@ class QuotationViewSet(Base):
                 ],
                 "customers": [
                     {"id": c.id, "customer_name": c.customer_name}
-                    for c in Customer.objects.filter(is_active=True).order_by(
-                        "customer_name"
-                    )
+                    for c in Customer.objects.filter(
+                        is_active=True,
+                        **({"branch_id": branch_id} if branch_id else {}),
+                    ).order_by("customer_name")
                 ],
                 "salespeople": _salespeople_options(),
                 "products": _sales_product_options(
@@ -712,6 +595,7 @@ class SalesOrderViewSet(Base):
 
         customers = Customer.objects.filter(
             is_active=True,
+            **({"branch_id": branch_id} if branch_id else {}),
         ).order_by("customer_name")
 
         salespeople = User.objects.filter(
@@ -720,6 +604,7 @@ class SalesOrderViewSet(Base):
 
         products = Product.objects.filter(
             is_active=True,
+            **({"branch_id": branch_id} if branch_id else {}),
         ).order_by("product_name")
 
         quotations = (
@@ -803,32 +688,9 @@ class SalesOrderViewSet(Base):
                         "product_id": stock.product_id,
                         "variant_id": stock.variant_id,
                         "branch_id": stock.branch_id,
-                        "available_regular_quantity": max(
-                            0,
-                            int(stock.available_regular_quantity or 0),
-                        ),
-                        "available_restricted_quantity": (
-                            max(
-                                0,
-                                int(stock.available_restricted_quantity or 0),
-                            )
-                            if can_view_restricted(request.user)
-                            else 0
-                        ),
-                        "available_stock": (
-                            max(
-                                0,
-                                int(stock.available_regular_quantity or 0),
-                            )
-                            + (
-                                max(
-                                    0,
-                                    int(stock.available_restricted_quantity or 0),
-                                )
-                                if can_view_restricted(request.user)
-                                else 0
-                            )
-                        ),
+                        "current_stock": int(stock.current_stock or 0),
+                        "reserved_stock": int(stock.reserved_stock or 0),
+                        "available_stock": max(0, int(stock.available_stock or 0)),
                     }
                     for stock in stocks
                 ],
@@ -1146,6 +1008,7 @@ class SalesInvoiceViewSet(Base):
 
         customers = Customer.objects.filter(
             is_active=True,
+            **({"branch_id": branch_id} if branch_id else {}),
         ).order_by("customer_name")
 
         salespeople = _salespeople_options()
@@ -1158,6 +1021,9 @@ class SalesInvoiceViewSet(Base):
 
         if "is_deleted" in product_field_names:
             product_filters["is_deleted"] = False
+
+        if branch_id:
+            product_filters["branch_id"] = branch_id
 
         products = Product.objects.filter(
             **product_filters,
@@ -1508,6 +1374,7 @@ class POSSaleViewSet(Base):
 
         customers = Customer.objects.filter(
             is_active=True,
+            **({"branch_id": branch_id} if branch_id else {}),
         ).order_by("customer_name")
 
         cashiers = User.objects.filter(
@@ -1522,6 +1389,9 @@ class POSSaleViewSet(Base):
 
         if "is_deleted" in product_field_names:
             product_filters["is_deleted"] = False
+
+        if branch_id:
+            product_filters["branch_id"] = branch_id
 
         products = Product.objects.filter(
             **product_filters,
@@ -1791,341 +1661,6 @@ class POSSaleViewSet(Base):
         return Response(self.get_serializer(sale).data)
 
 
-class SalesCreditNoteViewSet(Base):
-    queryset = SalesCreditNote.objects.select_related(
-        "customer",
-        "branch",
-        "invoice",
-    ).prefetch_related(
-        "items__product",
-        "items__variant",
-        "items__invoice_item",
-    )
-
-    serializer_class = SalesCreditNoteSerializer
-
-    search_fields = [
-        "credit_note_number",
-        "customer__customer_name",
-        "invoice__invoice_number",
-        "reason",
-        "status",
-    ]
-
-    filterset_fields = [
-        "branch",
-        "customer",
-        "invoice",
-        "reason",
-        "refund_method",
-        "status",
-    ]
-
-    ordering_fields = [
-        "credit_note_number",
-        "credit_date",
-        "total_amount",
-        "status",
-        "created_at",
-        "customer__customer_name",
-    ]
-
-    ordering = [
-        "-credit_date",
-        "-id",
-    ]
-
-    @action(
-        detail=False,
-        methods=["get"],
-        url_path="form-options",
-    )
-    def form_options(self, request):
-        branch_id = request.query_params.get("branch")
-
-        invoices = (
-            SalesInvoice.objects.select_related(
-                "customer",
-                "branch",
-            )
-            .exclude(
-                payment_status="VOID",
-            )
-            .order_by(
-                "-invoice_date",
-                "-id",
-            )
-        )
-
-        if branch_id:
-            invoices = invoices.filter(
-                branch_id=branch_id,
-            )
-
-        return Response(
-            {
-                "invoices": [
-                    {
-                        "id": invoice.id,
-                        "invoice_number": invoice.invoice_number,
-                        "customer_name": (
-                            invoice.customer.customer_name if invoice.customer else ""
-                        ),
-                        "branch_id": invoice.branch_id,
-                        "total_amount": invoice.total_amount,
-                        "balance_due": invoice.balance_due,
-                    }
-                    for invoice in invoices
-                ],
-            }
-        )
-
-    @action(
-        detail=False,
-        methods=["get"],
-        url_path=r"invoice-options/(?P<invoice_id>[^/.]+)",
-    )
-    def invoice_options(
-        self,
-        request,
-        invoice_id=None,
-    ):
-        invoice = (
-            SalesInvoice.objects.select_related(
-                "customer",
-                "branch",
-            )
-            .prefetch_related(
-                "items__product",
-                "items__variant",
-            )
-            .get(pk=invoice_id)
-        )
-
-        already_credited = invoice.credit_notes.filter(status="ISSUED").aggregate(
-            value=Sum("total_amount")
-        )["value"] or Decimal("0")
-
-        linked_return = invoice.returns.order_by("-id").first()
-
-        items = []
-
-        for item in invoice.items.all():
-            credited_quantity = SalesCreditNoteItem.objects.filter(
-                invoice_item=item,
-                credit_note__status="ISSUED",
-            ).aggregate(value=Sum("credit_quantity"))["value"] or Decimal("0")
-
-            available_quantity = max(
-                Decimal("0"),
-                item.quantity - credited_quantity,
-            )
-
-            items.append(
-                {
-                    "id": item.id,
-                    "product_id": item.product_id,
-                    "variant_id": item.variant_id,
-                    "product_name": (item.product.product_name if item.product else ""),
-                    "description": item.description,
-                    "invoiced_quantity": item.quantity,
-                    "already_credited_quantity": credited_quantity,
-                    "available_quantity": available_quantity,
-                    "unit_price": item.unit_price,
-                    "vat_percentage": item.vat_percentage,
-                }
-            )
-
-        return Response(
-            {
-                "invoice_id": invoice.id,
-                "invoice_number": invoice.invoice_number,
-                "customer_id": invoice.customer_id,
-                "customer_name": (
-                    invoice.customer.customer_name if invoice.customer else ""
-                ),
-                "branch_id": invoice.branch_id,
-                "invoice_total": invoice.total_amount,
-                "already_credited": already_credited,
-                "linked_return_number": (
-                    linked_return.return_number if linked_return else ""
-                ),
-                "items": items,
-            }
-        )
-
-    @action(
-        detail=False,
-        methods=["get"],
-    )
-    def summary(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
-
-        today = timezone.localdate()
-
-        issued_this_month = queryset.filter(
-            status="ISSUED",
-            issued_at__year=today.year,
-            issued_at__month=today.month,
-        )
-
-        linked_to_returns = queryset.filter(
-            invoice__returns__isnull=False,
-        ).distinct()
-
-        issued_with_duration = queryset.filter(
-            status="ISSUED",
-            issued_at__isnull=False,
-        )
-
-        durations = [
-            (credit_note.issued_at.date() - credit_note.created_at.date()).days
-            for credit_note in issued_with_duration
-        ]
-
-        return Response(
-            {
-                "open_credit_notes": queryset.filter(
-                    status="DRAFT",
-                ).count(),
-                "value_issued_mtd": issued_this_month.aggregate(
-                    value=Sum("total_amount")
-                )["value"]
-                or 0,
-                "linked_to_returns": linked_to_returns.count(),
-                "total_credit_notes": queryset.count(),
-                "avg_processing_days": (
-                    round(
-                        sum(durations) / len(durations),
-                        1,
-                    )
-                    if durations
-                    else 0
-                ),
-            }
-        )
-
-    @action(
-        detail=False,
-        methods=["get"],
-    )
-    def export(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
-
-        response = HttpResponse(
-            content_type="text/csv",
-        )
-
-        response["Content-Disposition"] = (
-            'attachment; filename="sales-credit-notes.csv"'
-        )
-
-        writer = csv.writer(response)
-
-        writer.writerow(
-            [
-                "Credit Note Number",
-                "Customer",
-                "Invoice",
-                "Credit Date",
-                "Reason",
-                "Refund Method",
-                "Subtotal",
-                "VAT",
-                "Total",
-                "Status",
-            ]
-        )
-
-        for credit_note in queryset:
-            writer.writerow(
-                [
-                    credit_note.credit_note_number,
-                    (
-                        credit_note.customer.customer_name
-                        if credit_note.customer
-                        else ""
-                    ),
-                    (credit_note.invoice.invoice_number if credit_note.invoice else ""),
-                    credit_note.credit_date or "",
-                    credit_note.get_reason_display(),
-                    credit_note.get_refund_method_display(),
-                    credit_note.subtotal or 0,
-                    credit_note.vat_amount or 0,
-                    credit_note.total_amount or 0,
-                    credit_note.get_status_display(),
-                ]
-            )
-
-        return response
-
-    @transaction.atomic
-    @action(
-        detail=True,
-        methods=["post"],
-    )
-    def issue(self, request, pk=None):
-        credit_note = self.get_object()
-
-        if credit_note.status != "DRAFT":
-            return Response(
-                {"detail": "Only draft credit notes can be issued."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        credit_note.status = "ISSUED"
-        credit_note.issued_at = timezone.now()
-
-        credit_note.save(
-            update_fields=[
-                "status",
-                "issued_at",
-                "updated_at",
-            ]
-        )
-
-        serializer = self.get_serializer(credit_note)
-
-        serializer._apply_credit(credit_note)
-
-        return Response(serializer.data)
-
-    @transaction.atomic
-    @action(
-        detail=True,
-        methods=["post"],
-    )
-    def void(self, request, pk=None):
-        credit_note = self.get_object()
-
-        if credit_note.status == "VOID":
-            return Response(self.get_serializer(credit_note).data)
-
-        if credit_note.status == "REFUNDED":
-            return Response(
-                {"detail": "Refunded credit notes cannot be voided."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        credit_note.status = "VOID"
-        credit_note.voided_at = timezone.now()
-        credit_note.void_reason = request.data.get(
-            "reason",
-            "",
-        )
-
-        credit_note.save(
-            update_fields=[
-                "status",
-                "voided_at",
-                "void_reason",
-                "updated_at",
-            ]
-        )
-
-        return Response(self.get_serializer(credit_note).data)
-
-
 class SalesPaymentViewSet(Base):
     queryset = SalesPayment.objects.select_related(
         "customer",
@@ -2389,13 +1924,11 @@ class SalesReturnViewSet(Base):
     @action(detail=False, methods=["get"], url_path="form-options")
     def form_options(self, request):
         branch_id = request.query_params.get("branch")
-
         orders = (
             SalesOrder.objects.select_related("customer", "branch")
             .exclude(status="CANCELLED")
             .order_by("-order_date", "-id")
         )
-
         if branch_id:
             orders = orders.filter(branch_id=branch_id)
 
@@ -2420,6 +1953,8 @@ class SalesReturnViewSet(Base):
         url_path=r"order-options/(?P<order_id>[^/.]+)",
     )
     def order_options(self, request, order_id=None):
+        return_id = request.query_params.get("return_id")
+
         order = (
             SalesOrder.objects.select_related("customer", "branch")
             .prefetch_related(
@@ -2429,24 +1964,21 @@ class SalesReturnViewSet(Base):
             )
             .get(pk=order_id)
         )
+
         invoice = order.invoices.order_by("-id").first()
         items = []
 
         for order_item in order.items.all():
-            already_returned = SalesReturnItem.objects.filter(
-                sales_order_item=order_item,
-            ).exclude(
-                sales_return__status__in=[
-                    "REJECTED",
-                    "CANCELLED",
-                ]
-            ).aggregate(
-                value=Sum("returned_quantity")
-            )[
+            returned_qs = SalesReturnItem.objects.filter(
+                sales_order_item=order_item
+            ).exclude(sales_return__status__in=["REJECTED", "CANCELLED"])
+
+            if return_id:
+                returned_qs = returned_qs.exclude(sales_return_id=return_id)
+
+            already_returned = returned_qs.aggregate(value=Sum("returned_quantity"))[
                 "value"
-            ] or Decimal(
-                "0"
-            )
+            ] or Decimal("0")
 
             items.append(
                 {
@@ -2467,6 +1999,10 @@ class SalesReturnViewSet(Base):
                 }
             )
 
+        returns_qs = order.returns.exclude(status__in=["REJECTED", "CANCELLED"])
+        if return_id:
+            returns_qs = returns_qs.exclude(pk=return_id)
+
         return Response(
             {
                 "order_id": order.id,
@@ -2478,16 +2014,153 @@ class SalesReturnViewSet(Base):
                 "branch_id": order.branch_id,
                 "order_total": order.total_amount,
                 "invoice_id": invoice.id if invoice else None,
-                "invoice_number": invoice.invoice_number if invoice else "",
+                "invoice_number": (invoice.invoice_number if invoice else ""),
                 "already_returned_value": (
-                    order.returns.exclude(
-                        status__in=["REJECTED", "CANCELLED"]
-                    ).aggregate(value=Sum("total_amount"))["value"]
-                    or 0
+                    returns_qs.aggregate(value=Sum("total_amount"))["value"] or 0
                 ),
                 "items": items,
             }
         )
+
+    def _workflow_response(self, instance, message):
+        return Response(
+            {
+                "success": True,
+                "message": message,
+                "data": self.get_serializer(instance).data,
+            }
+        )
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def submit(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status not in ["DRAFT", "REJECTED"]:
+            return Response(
+                {"detail": "Only Draft or Rejected returns can be submitted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not instance.items.exists():
+            return Response(
+                {"detail": "Add at least one item before submitting."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        instance.status = "PENDING_APPROVAL"
+        instance.submitted_at = timezone.now()
+        instance.approved_at = None
+        instance.approved_by = None
+        instance.approver_name = None
+        instance.save(
+            update_fields=[
+                "status",
+                "submitted_at",
+                "approved_at",
+                "approved_by",
+                "approver_name",
+                "updated_at",
+            ]
+        )
+        return self._workflow_response(
+            instance,
+            "Sales return submitted for approval.",
+        )
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status != "PENDING_APPROVAL":
+            return Response(
+                {"detail": "Only Pending Approval returns can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        instance.status = "APPROVED"
+        instance.approved_at = timezone.now()
+        instance.approved_by = request.user
+        instance.approver_name = (
+            getattr(request.user, "full_name", None)
+            or getattr(request.user, "name", None)
+            or getattr(request.user, "email", None)
+            or getattr(request.user, "username", None)
+            or str(request.user)
+        )
+        instance.save(
+            update_fields=[
+                "status",
+                "approved_at",
+                "approved_by",
+                "approver_name",
+                "updated_at",
+            ]
+        )
+        return self._workflow_response(instance, "Sales return approved.")
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status != "PENDING_APPROVAL":
+            return Response(
+                {"detail": "Only Pending Approval returns can be rejected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            return Response(
+                {"detail": "Rejection reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing_notes = str(instance.notes or "").strip()
+        rejection_note = f"Rejection reason: {reason}"
+        instance.notes = f"{existing_notes}\n{rejection_note}".strip()
+        instance.status = "REJECTED"
+        instance.approved_at = None
+        instance.approved_by = None
+        instance.approver_name = None
+        instance.save(
+            update_fields=[
+                "status",
+                "approved_at",
+                "approved_by",
+                "approver_name",
+                "notes",
+                "updated_at",
+            ]
+        )
+        return self._workflow_response(instance, "Sales return rejected.")
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def complete(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status != "APPROVED":
+            return Response(
+                {"detail": "Only Approved returns can be completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        instance.status = "COMPLETED"
+        instance.completed_at = timezone.now()
+        instance.save(update_fields=["status", "completed_at", "updated_at"])
+        return self._workflow_response(instance, "Sales return completed.")
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status in ["COMPLETED", "CANCELLED"]:
+            return Response(
+                {"detail": "This return cannot be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        instance.status = "CANCELLED"
+        instance.save(update_fields=["status", "updated_at"])
+        return self._workflow_response(instance, "Sales return cancelled.")
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -2505,11 +2178,7 @@ class SalesReturnViewSet(Base):
         return Response(
             {
                 "open_returns": queryset.filter(
-                    status__in=[
-                        "DRAFT",
-                        "PENDING_APPROVAL",
-                        "APPROVED",
-                    ]
+                    status__in=["DRAFT", "PENDING_APPROVAL", "APPROVED"]
                 ).count(),
                 "value_mtd": (
                     queryset.filter(
@@ -2525,10 +2194,7 @@ class SalesReturnViewSet(Base):
                 .distinct()
                 .count(),
                 "avg_resolution_days": (
-                    round(
-                        sum(resolution_days) / len(resolution_days),
-                        1,
-                    )
+                    round(sum(resolution_days) / len(resolution_days), 1)
                     if resolution_days
                     else 0
                 ),
@@ -2601,11 +2267,16 @@ class PriceListViewSet(Base):
 
     @action(detail=False, methods=["get"], url_path="form-options")
     def form_options(self, request):
+        branch_id = request.query_params.get("branch")
+
         customers = Customer.objects.filter(
             is_active=True,
+            **({"branch_id": branch_id} if branch_id else {}),
         ).order_by("customer_name")
 
         product_filters = {"is_active": True}
+        if branch_id:
+            product_filters["branch_id"] = branch_id
         product_fields = {field.name for field in Product._meta.get_fields()}
         if "is_deleted" in product_fields:
             product_filters["is_deleted"] = False
@@ -3024,9 +2695,13 @@ class SalesReportViewSet(Base):
         url_path="form-options",
     )
     def form_options(self, request):
+        branch_id = request.query_params.get("branch")
         customer_filters = {}
 
         customer_fields = {field.name for field in Customer._meta.get_fields()}
+
+        if branch_id and "branch" in customer_fields:
+            customer_filters["branch_id"] = branch_id
 
         if "is_active" in customer_fields:
             customer_filters["is_active"] = True
@@ -3493,10 +3168,7 @@ class DeliveryNoteViewSet(Base):
     @action(detail=False, methods=["get"], url_path="form-options")
     def form_options(self, request):
         branch_id = request.query_params.get("branch")
-        # A delivery note can only be created for an order that is confirmed and
-        # still has an outstanding quantity. Do not silently hide eligible orders
-        # because the global branch selector is pointing at another branch; the
-        # branch is populated from the chosen order on the form.
+        # Delivery-note options always follow the active global branch.
         orders = (
             SalesOrder.objects.select_related("customer", "branch")
             .prefetch_related("items")
@@ -3509,6 +3181,9 @@ class DeliveryNoteViewSet(Base):
             )
             .order_by("-order_date", "-id")
         )
+        if branch_id:
+            orders = orders.filter(branch_id=branch_id)
+
         orders = [
             order
             for order in orders
@@ -3540,11 +3215,13 @@ class DeliveryNoteViewSet(Base):
         detail=False, methods=["get"], url_path=r"order-options/(?P<order_id>[^/.]+)"
     )
     def order_options(self, request, order_id=None):
-        order = (
-            SalesOrder.objects.select_related("customer", "branch")
-            .prefetch_related("items__product", "items__variant")
-            .get(pk=order_id)
-        )
+        order_queryset = SalesOrder.objects.select_related(
+            "customer", "branch"
+        ).prefetch_related("items__product", "items__variant")
+        branch_id = request.query_params.get("branch")
+        if branch_id:
+            order_queryset = order_queryset.filter(branch_id=branch_id)
+        order = order_queryset.get(pk=order_id)
         return Response(
             {
                 "sales_order_id": order.id,
