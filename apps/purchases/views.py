@@ -20,8 +20,6 @@ from apps.inventory.models import ProductStock, StockMovement
 from apps.branches.models import Branch
 from apps.inventory.models import Rack
 from apps.inventory.services import adjust_stock
-from apps.shipments.models import Shipment, ShipmentTrackingLog
-from apps.shipments.serializers import ShipmentSerializer
 import logging
 
 logger = logging.getLogger(__name__)
@@ -294,15 +292,12 @@ class GRNViewSet(Base):
         "purchase_order__items__product",
         "purchase_order__items__variant",
     )
-
     serializer_class = GRNSerializer
-
     parser_classes = [
         MultiPartParser,
         FormParser,
         JSONParser,
     ]
-
     filterset_fields = [
         "branch",
         "supplier",
@@ -310,13 +305,11 @@ class GRNViewSet(Base):
         "is_confirmed",
         "purchase_order",
     ]
-
     search_fields = [
         "grn_number",
         "purchase_order__po_number",
         "supplier__supplier_name",
     ]
-
     ordering_fields = [
         "grn_number",
         "received_date",
@@ -330,33 +323,25 @@ class GRNViewSet(Base):
         if "payload" in request.data:
             try:
                 return json.loads(request.data["payload"])
-            except (
-                TypeError,
-                ValueError,
-                json.JSONDecodeError,
-            ) as exc:
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise serializers.ValidationError(
                     {"payload": "Invalid GRN payload."}
                 ) from exc
 
         return request.data
 
-    def _save_attachments(
-        self,
-        grn,
-        request,
-    ):
+    def _save_attachments(self, grn, request):
         for file in request.FILES.getlist("attachments"):
             extension = Path(file.name).suffix.lower()
 
             if extension not in ALLOWED_EXTENSIONS:
                 raise serializers.ValidationError(
-                    {"attachments": (f"{file.name}: " "unsupported file type.")}
+                    {"attachments": (f"{file.name}: unsupported file type.")}
                 )
 
             if file.size > MAX_FILE_SIZE:
                 raise serializers.ValidationError(
-                    {"attachments": (f"{file.name}: " "file exceeds 10 MB.")}
+                    {"attachments": (f"{file.name}: file exceeds 10 MB.")}
                 )
 
             GRNAttachment.objects.create(
@@ -364,23 +349,17 @@ class GRNViewSet(Base):
                 file=file,
                 original_name=file.name,
                 file_size=file.size,
-                content_type=(file.content_type or ""),
+                content_type=file.content_type or "",
                 uploaded_by=(request.user if request.user.is_authenticated else None),
             )
 
-    def _confirmed_received_by_order(
-        self,
-        order_ids,
-    ):
+    def _confirmed_received_by_order(self, order_ids):
         """
-        Build one receipt map for all displayed POs
-        using confirmed GRNs only.
+        Build one receipt map for all displayed POs using confirmed GRNs only.
 
-        PurchaseOrderItem.received_quantity is ignored
-        because GRN confirmation is the source of truth
-        for received stock.
+        This intentionally ignores PurchaseOrderItem.received_quantity because
+        older shipment flows may have modified that field before a GRN existed.
         """
-
         rows = (
             GoodsReceivedItem.objects.filter(
                 grn__purchase_order_id__in=order_ids,
@@ -403,297 +382,27 @@ class GRNViewSet(Base):
             for row in rows
         }
 
-    def _shipment_items_from_grn(
-        self,
-        grn,
-    ):
-        """
-        Convert GRN lines into ShipmentItem payloads.
-
-        This only mirrors receipt information into
-        the shipment log. It does NOT create stock
-        movements. Stock remains controlled by GRN
-        confirmation.
-        """
-
-        shipment_items = []
-
-        for item in grn.items.select_related(
-            "product",
-            "variant",
-            "rack",
-        ).all():
-
-            rejected_quantity = int(
-                getattr(
-                    item,
-                    "damaged_quantity",
-                    0,
-                )
-                or getattr(
-                    item,
-                    "rejected_quantity",
-                    0,
-                )
-                or 0
-            )
-
-            received_quantity = int(
-                getattr(
-                    item,
-                    "received_quantity",
-                    0,
-                )
-                or 0
-            )
-
-            accepted_quantity = int(
-                getattr(
-                    item,
-                    "accepted_quantity",
-                    0,
-                )
-                or 0
-            )
-
-            expected_quantity = int(
-                getattr(
-                    item,
-                    "ordered_quantity",
-                    0,
-                )
-                or received_quantity
-                or 0
-            )
-
-            shipment_items.append(
-                {
-                    "product": item.product_id,
-                    "variant": item.variant_id,
-                    "condition": ("DAMAGED" if rejected_quantity > 0 else "NEW"),
-                    "expected_quantity": expected_quantity,
-                    "received_quantity": received_quantity,
-                    "accepted_quantity": accepted_quantity,
-                    "rejected_quantity": rejected_quantity,
-                    "unit_cost": (
-                        getattr(
-                            item,
-                            "unit_cost",
-                            0,
-                        )
-                        or getattr(
-                            item,
-                            "unit_price",
-                            0,
-                        )
-                        or 0
-                    ),
-                    "vat_percentage": (
-                        getattr(
-                            item,
-                            "vat_percentage",
-                            5,
-                        )
-                        or 5
-                    ),
-                    "rack": item.rack_id,
-                    "batch_number": (
-                        getattr(
-                            item,
-                            "batch_number",
-                            "",
-                        )
-                        or ""
-                    ),
-                    "serial_number": (
-                        getattr(
-                            item,
-                            "serial_number",
-                            "",
-                        )
-                        or ""
-                    ),
-                    "remarks": (
-                        getattr(
-                            item,
-                            "remarks",
-                            "",
-                        )
-                        or ""
-                    ),
-                }
-            )
-
-        return shipment_items
-
-    def _shipment_payload_from_grn(
-        self,
-        grn,
-    ):
-        order = grn.purchase_order
-
-        return {
-            "shipment_type": "PURCHASE",
-            "purchase_order": order.id,
-            "supplier": grn.supplier_id,
-            "branch": grn.branch_id,
-            "warehouse": (
-                getattr(
-                    grn,
-                    "warehouse_location",
-                    "",
-                )
-                or ""
-            ),
-            "shipment_date": grn.received_date,
-            "received_date": grn.received_date,
-            "received_by": grn.received_by_id,
-            "shipment_method": "Purchase Receipt",
-            "expected_date": getattr(
-                order,
-                "expected_delivery_date",
-                None,
-            ),
-            "status": "DRAFT",
-            "qc_status": "PENDING",
-            "notes": ("Automatically created from GRN " f"{grn.grn_number}."),
-            "items": self._shipment_items_from_grn(grn),
-        }
-
-    def _ensure_shipment_for_grn(
-        self,
-        grn,
-        request=None,
-    ):
-        """
-        Automatically create a shipment log for the GRN.
-
-        One PURCHASE shipment is maintained for the
-        linked Purchase Order.
-
-        If the shipment is still DRAFT, GRN changes
-        synchronize its items and receipt information.
-
-        Confirmed/received shipment records are never
-        overwritten by later GRN edits.
-        """
-
-        order = grn.purchase_order
-
-        shipment = (
-            Shipment.objects.select_for_update()
-            .filter(
-                purchase_order=order,
-                shipment_type="PURCHASE",
-            )
-            .order_by("id")
-            .first()
-        )
-
-        payload = self._shipment_payload_from_grn(grn)
-
-        if shipment is None:
-            serializer = ShipmentSerializer(
-                data=payload,
-                context={
-                    "request": request,
-                },
-            )
-
-            serializer.is_valid(raise_exception=True)
-
-            shipment = serializer.save()
-
-            ShipmentTrackingLog.objects.create(
-                shipment=shipment,
-                status="DRAFT",
-                location=(
-                    getattr(
-                        grn,
-                        "warehouse_location",
-                        "",
-                    )
-                    or ""
-                ),
-                remarks=(
-                    "Shipment log automatically "
-                    f"created from GRN "
-                    f"{grn.grn_number}."
-                ),
-                updated_by=(
-                    request.user
-                    if (request and request.user.is_authenticated)
-                    else None
-                ),
-            )
-
-            return shipment
-
-        if shipment.status == "DRAFT":
-            serializer = ShipmentSerializer(
-                shipment,
-                data=payload,
-                partial=True,
-                context={
-                    "request": request,
-                },
-            )
-
-            serializer.is_valid(raise_exception=True)
-
-            shipment = serializer.save()
-
-        return shipment
-
     @transaction.atomic
-    def create(
-        self,
-        request,
-        *args,
-        **kwargs,
-    ):
+    def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=self._request_payload(request))
-
         serializer.is_valid(raise_exception=True)
-
         grn = serializer.save()
-
-        self._save_attachments(
-            grn,
-            request,
-        )
-
-        # Automatically create Shipment log
-        # immediately when GRN is created.
-        self._ensure_shipment_for_grn(
-            grn,
-            request=request,
-        )
+        self._save_attachments(grn, request)
 
         output = self.get_serializer(grn)
-
         return Response(
             output.data,
             status=status.HTTP_201_CREATED,
         )
 
     @transaction.atomic
-    def update(
-        self,
-        request,
-        *args,
-        **kwargs,
-    ):
-        partial = kwargs.pop(
-            "partial",
-            False,
-        )
-
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
         instance = self.get_object()
 
         if instance.approved_at:
             raise serializers.ValidationError(
-                {"status": ("Approved Supplier Bills " "cannot be edited.")}
+                {"status": "Approved Supplier Bills cannot be edited."}
             )
 
         serializer = self.get_serializer(
@@ -701,21 +410,9 @@ class GRNViewSet(Base):
             data=self._request_payload(request),
             partial=partial,
         )
-
         serializer.is_valid(raise_exception=True)
-
         grn = serializer.save()
-
-        self._save_attachments(
-            grn,
-            request,
-        )
-
-        # Keep Draft shipment synchronized with GRN.
-        self._ensure_shipment_for_grn(
-            grn,
-            request=request,
-        )
+        self._save_attachments(grn, request)
 
         return Response(self.get_serializer(grn).data)
 
@@ -724,10 +421,7 @@ class GRNViewSet(Base):
         methods=["get"],
         url_path="form-options",
     )
-    def form_options(
-        self,
-        request,
-    ):
+    def form_options(self, request):
         branch_id = request.query_params.get("branch")
 
         orders = (
@@ -746,21 +440,13 @@ class GRNViewSet(Base):
                     "PARTIALLY_RECEIVED",
                 ]
             )
-            .order_by(
-                "-order_date",
-                "-id",
-            )
+            .order_by("-order_date", "-id")
         )
 
-        if branch_id not in (
-            None,
-            "",
-            "all",
-        ):
+        if branch_id not in (None, "", "all"):
             orders = orders.filter(branch_id=branch_id)
 
         orders = list(orders)
-
         confirmed_received = self._confirmed_received_by_order(
             [order.id for order in orders]
         )
@@ -769,23 +455,14 @@ class GRNViewSet(Base):
 
         racks = Rack.objects.filter(is_active=True).select_related("branch")
 
-        if branch_id not in (
-            None,
-            "",
-            "all",
-        ):
+        if branch_id not in (None, "", "all"):
             racks = racks.filter(branch_id=branch_id)
 
         receivers = User.objects.filter(is_active=True).order_by(
-            "first_name",
-            "username",
+            "first_name", "username"
         )
 
-        if branch_id not in (
-            None,
-            "",
-            "all",
-        ):
+        if branch_id not in (None, "", "all"):
             receivers = receivers.filter(
                 Q(branch_id=branch_id) | Q(branch__isnull=True)
             )
@@ -797,7 +474,6 @@ class GRNViewSet(Base):
 
             for item in order.items.all():
                 ordered = int(item.quantity or 0)
-
                 received = confirmed_received.get(
                     (
                         order.id,
@@ -806,11 +482,7 @@ class GRNViewSet(Base):
                     ),
                     0,
                 )
-
-                remaining = max(
-                    0,
-                    ordered - received,
-                )
+                remaining = max(0, ordered - received)
 
                 if ordered <= 0 or remaining <= 0:
                     continue
@@ -821,19 +493,11 @@ class GRNViewSet(Base):
                         "po_item_id": item.id,
                         "product_id": item.product_id,
                         "variant_id": item.variant_id,
-                        "product_name": item.product.product_name,
+                        "product_name": (item.product.product_name),
                         "sku": (
-                            getattr(
-                                item.variant,
-                                "sku",
-                                "",
-                            )
+                            getattr(item.variant, "sku", "")
                             if item.variant
-                            else getattr(
-                                item.product,
-                                "sku",
-                                "",
-                            )
+                            else getattr(item.product, "sku", "")
                         ),
                         "quantity": ordered,
                         "ordered_quantity": ordered,
@@ -847,16 +511,14 @@ class GRNViewSet(Base):
             if not order_items:
                 continue
 
-            shipment = (
-                order.shipments.filter(shipment_type="PURCHASE").order_by("id").first()
-            )
+            shipment = order.shipments.first() if hasattr(order, "shipments") else None
 
             order_options.append(
                 {
                     "id": order.id,
                     "po_number": order.po_number,
                     "supplier_id": order.supplier_id,
-                    "supplier_name": order.supplier.supplier_name,
+                    "supplier_name": (order.supplier.supplier_name),
                     "branch_id": order.branch_id,
                     "branch_name": order.branch.branch_name,
                     "branch_code": order.branch.branch_code,
@@ -866,9 +528,7 @@ class GRNViewSet(Base):
                         "AED",
                     ),
                     "total_amount": order.total_amount,
-                    "shipment_id": (shipment.id if shipment else None),
                     "shipment_number": (shipment.shipment_number if shipment else ""),
-                    "shipment_status": (shipment.status if shipment else ""),
                     "items": order_items,
                 }
             )
@@ -915,21 +575,10 @@ class GRNViewSet(Base):
         methods=["post"],
     )
     @transaction.atomic
-    def confirm(
-        self,
-        request,
-        pk=None,
-    ):
+    def confirm(self, request, pk=None):
         grn = GoodsReceivedNote.objects.select_for_update().get(pk=self.get_object().pk)
 
         if grn.is_confirmed:
-            # Guarantee older confirmed GRNs also
-            # have their shipment log.
-            self._ensure_shipment_for_grn(
-                grn,
-                request=request,
-            )
-
             return Response(
                 self.get_serializer(grn).data,
                 status=status.HTTP_200_OK,
@@ -941,13 +590,12 @@ class GRNViewSet(Base):
             request=request,
         )
 
-        # Keep this state update only if
-        # confirm_grn does not already persist it.
+        # Keep this state update here only if confirm_grn does not already
+        # persist these fields.
         if not confirmed.is_confirmed:
             confirmed.status = "CONFIRMED"
             confirmed.is_confirmed = True
             confirmed.confirmed_at = timezone.now()
-
             confirmed.save(
                 update_fields=[
                     "status",
@@ -957,133 +605,8 @@ class GRNViewSet(Base):
                 ]
             )
 
-        # Make absolutely sure the linked shipment
-        # exists after GRN confirmation.
-        self._ensure_shipment_for_grn(
-            confirmed,
-            request=request,
-        )
-
         return Response(
             self.get_serializer(confirmed).data,
-            status=status.HTTP_200_OK,
-        )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="confirm-shipment",
-    )
-    @transaction.atomic
-    def confirm_shipment(
-        self,
-        request,
-        pk=None,
-    ):
-        """
-        Confirm the Shipment linked to this GRN.
-
-        Important:
-        This action DOES NOT post stock.
-        Stock was already posted by GRN confirmation.
-        """
-
-        # Lock ONLY the GRN row.
-        grn = GoodsReceivedNote.objects.select_for_update(of=("self",)).get(
-            pk=self.get_object().pk
-        )
-
-        if not grn.is_confirmed:
-            raise serializers.ValidationError(
-                {"shipment": "Confirm the GRN before confirming its shipment."}
-            )
-
-        shipment = self._ensure_shipment_for_grn(
-            grn,
-            request=request,
-        )
-
-        # Lock ONLY shipment row.
-        shipment = Shipment.objects.select_for_update(of=("self",)).get(pk=shipment.pk)
-
-        if shipment.status in [
-            "RECEIVED",
-            "COMPLETED",
-            "DELIVERED",
-        ]:
-            return Response(
-                ShipmentSerializer(
-                    shipment,
-                    context={
-                        "request": request,
-                    },
-                ).data,
-                status=status.HTTP_200_OK,
-            )
-
-        rejected_quantity = sum(
-            int(
-                getattr(
-                    item,
-                    "damaged_quantity",
-                    0,
-                )
-                or getattr(
-                    item,
-                    "rejected_quantity",
-                    0,
-                )
-                or 0
-            )
-            for item in grn.items.all()
-        )
-
-        shipment.status = "RECEIVED"
-
-        shipment.qc_status = (
-            "PASSED_WITH_REJECTIONS" if rejected_quantity > 0 else "PASSED"
-        )
-
-        shipment.received_date = grn.received_date or timezone.localdate()
-
-        shipment.received_by = grn.received_by or request.user
-
-        shipment.warehouse = (
-            getattr(
-                grn,
-                "warehouse_location",
-                "",
-            )
-            or shipment.warehouse
-            or ""
-        )
-
-        shipment.save(
-            update_fields=[
-                "status",
-                "qc_status",
-                "received_date",
-                "received_by",
-                "warehouse",
-                "updated_at",
-            ]
-        )
-
-        ShipmentTrackingLog.objects.create(
-            shipment=shipment,
-            status="RECEIVED",
-            location=(shipment.warehouse or ""),
-            remarks=("Shipment confirmed from GRN " f"{grn.grn_number}."),
-            updated_by=(request.user if request.user.is_authenticated else None),
-        )
-
-        return Response(
-            ShipmentSerializer(
-                shipment,
-                context={
-                    "request": request,
-                },
-            ).data,
             status=status.HTTP_200_OK,
         )
 

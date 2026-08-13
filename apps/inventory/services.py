@@ -72,18 +72,12 @@ def adjust_stock(
     source_document_number="",
     **_ignored,
 ):
+    """Apply a signed quantity to a unified ProductStock balance.
+
+    Positive quantities increase current_stock and negative quantities reduce
+    it. The stock row keeps one physical quantity and one reserved quantity;
+    regular/restricted classifications are no longer supported.
     """
-    Apply a signed quantity to a unified ProductStock balance.
-
-    Positive quantities increase current_stock.
-    Negative quantities reduce current_stock.
-
-    IMPORTANT:
-    ProductStock locking intentionally uses _base_manager and
-    select_for_update(of=("self",)) so nullable relations such as
-    variant are not included in a PostgreSQL FOR UPDATE outer join.
-    """
-
     if variant and variant.product_id != product.id:
         raise ValueError("The selected variant does not belong to the product.")
 
@@ -97,65 +91,31 @@ def adjust_stock(
 
     normalized_warehouse = str(warehouse or "").strip()
 
-    variant_id = variant.id if variant else None
-
-    # ---------------------------------------------------------
-    # FIND + LOCK EXISTING STOCK ROW
-    # ---------------------------------------------------------
-    #
-    # Do NOT use:
-    #
-    # ProductStock.objects.select_for_update().get_or_create(...)
-    #
-    # The default manager may contain select_related() joins.
-    # Since variant is nullable, PostgreSQL can reject FOR UPDATE
-    # against the nullable side of that outer join.
-    #
-    stock = (
-        ProductStock._base_manager.select_for_update(of=("self",))
-        .filter(
-            product_id=product.id,
-            branch_id=branch.id,
-            variant_id=variant_id,
-            warehouse=normalized_warehouse,
-        )
-        .first()
+    stock, _created = ProductStock.objects.select_for_update().get_or_create(
+        product=product,
+        branch=branch,
+        variant=variant,
+        warehouse=normalized_warehouse,
+        defaults={
+            "reorder_level": product.reorder_level,
+            "current_stock": 0,
+            "reserved_stock": 0,
+        },
     )
 
-    # ---------------------------------------------------------
-    # CREATE STOCK ROW WHEN IT DOES NOT EXIST
-    # ---------------------------------------------------------
-    if stock is None:
-        stock = ProductStock._base_manager.create(
-            product_id=product.id,
-            branch_id=branch.id,
-            variant_id=variant_id,
-            warehouse=normalized_warehouse,
-            reorder_level=(product.reorder_level or 0),
-            current_stock=0,
-            reserved_stock=0,
-        )
-
-        # Re-fetch and lock the newly created row.
-        stock = ProductStock._base_manager.select_for_update(of=("self",)).get(
-            pk=stock.pk
-        )
-
-    # ---------------------------------------------------------
-    # STOCK BALANCE
-    # ---------------------------------------------------------
     previous_balance = int(stock.current_stock or 0)
-
     new_balance = previous_balance + quantity
 
+    # ProductStock is intentionally non-negative. Keep allow_negative in the
+    # signature for older callers, but never persist an invalid negative stock.
     if new_balance < 0:
         raise ValueError(
             f"Insufficient stock for {product.sku}. "
             f"Available stock: {stock.available_stock}."
         )
 
-    # Physical deduction must not leave reserved quantity
-    # greater than current quantity.
+    # A physical deduction must not leave reserved stock above current stock.
+    # The calling sales/transfer flow should release its reservation first.
     if new_balance < int(stock.reserved_stock or 0) and not allow_negative:
         raise ValueError(
             f"Insufficient available stock for {product.sku}. "
@@ -163,30 +123,21 @@ def adjust_stock(
         )
 
     stock.current_stock = new_balance
+    stock.reorder_level = product.reorder_level
 
-    stock.reorder_level = product.reorder_level or 0
-
-    # ---------------------------------------------------------
-    # TAX
-    # ---------------------------------------------------------
     treatment, percentage = normalize_tax(
         product,
         vat_treatment=vat_treatment,
         vat_percentage=vat_percentage,
     )
 
+    # Inclusive pricing only applies to standard VAT. Zero VAT and Non-VAT
+    # always have a zero tax amount and are treated as non-inclusive.
     inclusive = (
-        bool(
-            getattr(
-                product,
-                "vat_inclusive",
-                False,
-            )
-        )
+        bool(getattr(product, "vat_inclusive", False))
         if vat_inclusive is None
         else bool(vat_inclusive)
     )
-
     if treatment != VAT:
         inclusive = False
 
@@ -199,56 +150,35 @@ def adjust_stock(
         vat_percentage=percentage,
         tax_treatment=_common_tax_treatment(treatment),
         vat_inclusive=inclusive,
-        recoverable=(bool(vat_recoverable) if treatment == VAT else False),
+        recoverable=bool(vat_recoverable) if treatment == VAT else False,
     )
 
-    # ---------------------------------------------------------
-    # WEIGHTED AVERAGE COST
-    # ---------------------------------------------------------
+    # Recalculate weighted-average carrying cost only for positive receipts
+    # having an explicit unit cost. Outgoing movements retain carrying cost.
     if quantity > 0 and unit_cost is not None:
-        old_quantity = max(
-            0,
-            previous_balance,
-        )
-
+        old_quantity = max(0, previous_balance)
         old_value = Decimal(old_quantity) * Decimal(stock.average_unit_cost or 0)
-
         incoming_value = Decimal(quantity) * valuation["capitalized_unit_cost"]
-
-        total_quantity = max(
-            0,
-            stock.current_stock,
-        )
+        total_quantity = max(0, stock.current_stock)
 
         stock.average_unit_cost = quantize_unit(
             (old_value + incoming_value) / Decimal(total_quantity)
             if total_quantity
             else valuation["capitalized_unit_cost"]
         )
-
         stock.average_unit_cost_excluding_vat = valuation["unit_cost_excluding_vat"]
-
         stock.recoverable_vat_per_unit = valuation["recoverable_vat_per_unit"]
-
         stock.capitalized_vat_per_unit = valuation["capitalized_vat_per_unit"]
-
         stock.last_purchase_cost_excluding_vat = valuation["unit_cost_excluding_vat"]
-
         stock.last_purchase_cost = quantize_unit(
             valuation["unit_cost_excluding_vat"] + valuation["vat_per_unit"]
         )
-
         stock.last_tax_treatment = treatment
-
         stock.last_vat_percentage = percentage
-
         stock.valuation_updated_at = timezone.now()
 
     stock.save()
 
-    # ---------------------------------------------------------
-    # STOCK MOVEMENT
-    # ---------------------------------------------------------
     movement = StockMovement.objects.create(
         movement_number=generate_stock_number(),
         product=product,
@@ -274,7 +204,7 @@ def adjust_stock(
         non_recoverable_vat_amount=quantize_money(
             abs(Decimal(quantity)) * valuation["capitalized_vat_per_unit"]
         ),
-        capitalized_unit_cost=(stock.average_unit_cost),
+        capitalized_unit_cost=stock.average_unit_cost,
         net_value_change=quantize_money(Decimal(quantity) * stock.average_unit_cost),
         gross_value_change=quantize_money(
             Decimal(quantity)
@@ -287,18 +217,9 @@ def adjust_stock(
         source_document_number=(source_document_number or str(reference_id or "")),
         tax_invoice_number=tax_invoice_number,
         tax_invoice_date=tax_invoice_date,
-        is_vat_relevant=(
-            treatment
-            in {
-                VAT,
-                ZERO_VAT,
-            }
-        ),
+        is_vat_relevant=treatment in {VAT, ZERO_VAT},
     )
 
-    # ---------------------------------------------------------
-    # LOW STOCK NOTIFICATION
-    # ---------------------------------------------------------
     if stock.available_stock < 10:
         notify_branch(
             branch,
