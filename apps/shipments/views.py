@@ -209,10 +209,10 @@ class ShipmentViewSet(
                 "items__product__brand",
                 "items__variant",
             )
-            .exclude(
+            .filter(
                 status__in=[
-                    "RECEIVED",
-                    "CANCELLED",
+                    "APPROVED",
+                    "PARTIALLY_RECEIVED",
                 ],
             )
             .order_by(

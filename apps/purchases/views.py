@@ -438,8 +438,14 @@ class GRNViewSet(Base):
                 status__in=[
                     "APPROVED",
                     "PARTIALLY_RECEIVED",
-                ]
+                ],
+                # Only show PO after shipment is confirmed/received.
+                shipments__status__in=[
+                    "RECEIVED",
+                    "COMPLETED",
+                ],
             )
+            .distinct()
             .order_by("-order_date", "-id")
         )
 
@@ -447,6 +453,7 @@ class GRNViewSet(Base):
             orders = orders.filter(branch_id=branch_id)
 
         orders = list(orders)
+
         confirmed_received = self._confirmed_received_by_order(
             [order.id for order in orders]
         )
@@ -459,7 +466,8 @@ class GRNViewSet(Base):
             racks = racks.filter(branch_id=branch_id)
 
         receivers = User.objects.filter(is_active=True).order_by(
-            "first_name", "username"
+            "first_name",
+            "username",
         )
 
         if branch_id not in (None, "", "all"):
@@ -474,6 +482,7 @@ class GRNViewSet(Base):
 
             for item in order.items.all():
                 ordered = int(item.quantity or 0)
+
                 received = confirmed_received.get(
                     (
                         order.id,
@@ -482,7 +491,11 @@ class GRNViewSet(Base):
                     ),
                     0,
                 )
-                remaining = max(0, ordered - received)
+
+                remaining = max(
+                    0,
+                    ordered - received,
+                )
 
                 if ordered <= 0 or remaining <= 0:
                     continue
@@ -493,7 +506,7 @@ class GRNViewSet(Base):
                         "po_item_id": item.id,
                         "product_id": item.product_id,
                         "variant_id": item.variant_id,
-                        "product_name": (item.product.product_name),
+                        "product_name": item.product.product_name,
                         "sku": (
                             getattr(item.variant, "sku", "")
                             if item.variant
@@ -511,14 +524,26 @@ class GRNViewSet(Base):
             if not order_items:
                 continue
 
-            shipment = order.shipments.first() if hasattr(order, "shipments") else None
+            shipment = (
+                order.shipments.filter(
+                    status__in=[
+                        "RECEIVED",
+                        "COMPLETED",
+                    ]
+                )
+                .order_by(
+                    "-received_date",
+                    "-id",
+                )
+                .first()
+            )
 
             order_options.append(
                 {
                     "id": order.id,
                     "po_number": order.po_number,
                     "supplier_id": order.supplier_id,
-                    "supplier_name": (order.supplier.supplier_name),
+                    "supplier_name": order.supplier.supplier_name,
                     "branch_id": order.branch_id,
                     "branch_name": order.branch.branch_name,
                     "branch_code": order.branch.branch_code,
@@ -555,18 +580,18 @@ class GRNViewSet(Base):
                     {
                         "id": rack.id,
                         "rack_code": rack.rack_code,
-                        "rack_name": getattr(
-                            rack,
-                            "rack_name",
-                            "",
-                        ),
+                        "rack_name": rack.rack_name,
                         "branch_id": rack.branch_id,
                     }
                     for rack in racks
                 ],
-                "quality_statuses": choices_as_options(
-                    GoodsReceivedItem.QUALITY_CHOICES
-                ),
+                "quality_statuses": [
+                    {
+                        "value": value,
+                        "label": label,
+                    }
+                    for value, label in GoodsReceivedItem.QUALITY_CHOICES
+                ],
             }
         )
 
@@ -813,7 +838,20 @@ class SupplierBillViewSet(Base):
                 "items__product",
                 "items__variant",
             )
-            .filter(is_confirmed=True)
+            .filter(
+                is_confirmed=True,
+                status="CONFIRMED",
+                purchase_order__status__in=[
+                    "APPROVED",
+                    "PARTIALLY_RECEIVED",
+                    "RECEIVED",
+                ],
+            )
+            .exclude(
+                items__accepted_quantity__gt=0,
+                items__quality_status__in=["PARTIAL_ACCEPT", "QC_REJECTED"],
+            )
+            .distinct()
             .order_by("-received_date", "-id")
         )
 

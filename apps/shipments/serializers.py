@@ -316,6 +316,17 @@ class ShipmentSerializer(serializers.ModelSerializer):
         errors = {}
 
         if purchase_order:
+            # New shipments may only be created after the purchase order has
+            # completed approval. PARTIALLY_RECEIVED remains eligible so the
+            # remaining quantity can arrive in a later shipment.
+            if self.instance is None and purchase_order.status not in {
+                "APPROVED",
+                "PARTIALLY_RECEIVED",
+            }:
+                errors["purchase_order"] = (
+                    "Shipment can only be created for an approved purchase order."
+                )
+
             if supplier and purchase_order.supplier_id != supplier.id:
                 errors["supplier"] = "Supplier must match the selected purchase order."
             if branch and purchase_order.branch_id != branch.id:
