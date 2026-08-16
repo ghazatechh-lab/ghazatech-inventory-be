@@ -575,7 +575,11 @@ class ShipmentViewSet(
             "RECEIVED",
             "COMPLETED",
         ]:
-            shipment.received_by = request.user
+            # Preserve the receiver selected in Shipment Log.
+            # Fall back to the logged-in user only for legacy shipments
+            # where Received By was never selected.
+            if not shipment.received_by_id:
+                shipment.received_by = request.user
 
         shipment.save()
 

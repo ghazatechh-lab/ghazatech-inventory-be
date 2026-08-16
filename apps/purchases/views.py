@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from decimal import Decimal
 from urllib import request
+from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from django.contrib.auth import get_user_model
@@ -16,11 +17,6 @@ from .services import confirm_grn
 from apps.common.response import ok
 from apps.suppliers.models import Supplier
 from apps.finance.models import BankAccount, CashRegister
-from apps.finance.accounting import (
-    post_purchase_expense,
-    post_supplier_bill,
-    post_supplier_payment,
-)
 from apps.inventory.models import ProductStock, StockMovement
 from apps.branches.models import Branch
 from apps.inventory.models import Rack
@@ -324,16 +320,95 @@ class GRNViewSet(Base):
         "branch__branch_name",
     ]
 
+    def _received_purchase_shipment(self, purchase_order_id):
+        """
+        Return the latest confirmed purchase-receipt shipment for the PO.
+
+        GRN received_by must always be inherited from Shipment.received_by.
+        """
+        if not purchase_order_id:
+            return None
+
+        from apps.shipments.models import Shipment
+
+        return (
+            Shipment.objects.select_related(
+                "received_by",
+                "purchase_order",
+                "supplier",
+                "branch",
+            )
+            .filter(
+                purchase_order_id=purchase_order_id,
+                shipment_type="PURCHASE",
+                status__in=[
+                    "RECEIVED",
+                    "COMPLETED",
+                ],
+                qc_status__in=[
+                    "PASSED",
+                    "PASSED_WITH_REJECTIONS",
+                ],
+            )
+            .order_by(
+                "-received_date",
+                "-id",
+            )
+            .first()
+        )
+
     def _request_payload(self, request):
         if "payload" in request.data:
             try:
-                return json.loads(request.data["payload"])
+                payload = json.loads(request.data["payload"])
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise serializers.ValidationError(
                     {"payload": "Invalid GRN payload."}
                 ) from exc
+        else:
+            payload = request.data.copy()
 
-        return request.data
+        if hasattr(payload, "dict"):
+            payload = payload.dict()
+        else:
+            payload = dict(payload)
+
+        try:
+            purchase_order_id = int(payload.get("purchase_order"))
+        except (TypeError, ValueError):
+            purchase_order_id = None
+
+        if purchase_order_id:
+            shipment = self._received_purchase_shipment(purchase_order_id)
+
+            if shipment is None:
+                raise serializers.ValidationError(
+                    {
+                        "purchase_order": (
+                            "The selected purchase order does not have a "
+                            "confirmed purchase shipment with QC passed."
+                        )
+                    }
+                )
+
+            if not shipment.received_by_id:
+                raise serializers.ValidationError(
+                    {
+                        "received_by": (
+                            "The linked shipment does not have Received By. "
+                            "Open Shipment Log and select the receiver first."
+                        )
+                    }
+                )
+
+            # GoodsReceivedNote.received_by is a User FK.
+            # Always inherit the same User selected in Shipment Log.
+            payload["received_by"] = shipment.received_by_id
+
+            if not payload.get("received_date") and shipment.received_date:
+                payload["received_date"] = shipment.received_date.isoformat()
+
+        return payload
 
     def _save_attachments(self, grn, request):
         for file in request.FILES.getlist("attachments"):
@@ -405,9 +480,9 @@ class GRNViewSet(Base):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
 
-        if instance.approved_at:
+        if instance.is_confirmed:
             raise serializers.ValidationError(
-                {"status": "Approved Supplier Bills cannot be edited."}
+                {"status": "Confirmed GRNs cannot be edited."}
             )
 
         serializer = self.get_serializer(
@@ -448,9 +523,14 @@ class GRNViewSet(Base):
                 # purchase shipment has been received/confirmed. Draft,
                 # pending, in-transit, delivered-but-not-received, and
                 # cancelled shipments must never expose the PO here.
+                shipments__shipment_type="PURCHASE",
                 shipments__status__in=[
                     "RECEIVED",
                     "COMPLETED",
+                ],
+                shipments__qc_status__in=[
+                    "PASSED",
+                    "PASSED_WITH_REJECTIONS",
                 ],
             )
             .distinct()
@@ -525,13 +605,12 @@ class GRNViewSet(Base):
             if not order_items:
                 continue
 
-            shipment = (
-                order.shipments.filter(status__in=["RECEIVED", "COMPLETED"])
-                .order_by("-received_date", "-id")
-                .first()
-                if hasattr(order, "shipments")
-                else None
-            )
+            shipment = self._received_purchase_shipment(order.id)
+
+            # Never expose a PO to GRN unless the shipment is confirmed,
+            # QC passed, and has a valid User selected in Received By.
+            if shipment is None or not shipment.received_by_id:
+                continue
 
             order_options.append(
                 {
@@ -548,7 +627,15 @@ class GRNViewSet(Base):
                         "AED",
                     ),
                     "total_amount": order.total_amount,
-                    "shipment_number": (shipment.shipment_number if shipment else ""),
+                    "shipment_id": shipment.id,
+                    "shipment_number": shipment.shipment_number,
+                    "shipment_status": shipment.status,
+                    "shipment_qc_status": shipment.qc_status,
+                    "shipment_received_by_id": shipment.received_by_id,
+                    "shipment_received_by_name": (
+                        user_name(shipment.received_by) if shipment.received_by else ""
+                    ),
+                    "shipment_received_date": shipment.received_date,
                     "items": order_items,
                 }
             )
@@ -568,8 +655,19 @@ class GRNViewSet(Base):
                     {
                         "id": user.id,
                         "display_name": user_name(user),
+                        "email": getattr(user, "email", ""),
+                        "role_name": getattr(
+                            getattr(user, "role", None),
+                            "name",
+                            "",
+                        ),
+                        "branch_id": getattr(
+                            user,
+                            "branch_id",
+                            None,
+                        ),
                     }
-                    for user in receivers
+                    for user in receivers.distinct()
                 ],
                 "racks": [
                     {
@@ -805,17 +903,6 @@ class SupplierBillViewSet(Base):
         self._save_attachments(bill, request)
         return Response(self.get_serializer(bill).data)
 
-    def destroy(self, request, *args, **kwargs):
-        bill = self.get_object()
-        if bill.approved_at:
-            return Response(
-                {
-                    "detail": "Approved Supplier Bills cannot be deleted because they are posted to accounting."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return super().destroy(request, *args, **kwargs)
-
     @action(
         detail=False,
         methods=["get"],
@@ -872,17 +959,8 @@ class SupplierBillViewSet(Base):
         # valid references. Once a PO is selected, its branch is populated in
         # the bill automatically.
         if branch_id and not include_all_branches:
+            purchase_orders = purchase_orders.filter(branch_id=branch_id)
             grns = grns.filter(branch_id=branch_id)
-
-        # A Purchase Order is selectable for a Supplier Bill only when it has
-        # at least one confirmed, QC-eligible GRN returned above. Do not expose
-        # every APPROVED / RECEIVED PO in the Supplier Bill form.
-        eligible_po_ids = grns.values_list(
-            "purchase_order_id",
-            flat=True,
-        )
-
-        purchase_orders = purchase_orders.filter(id__in=eligible_po_ids).distinct()
 
         po_options = [
             {
@@ -1271,10 +1349,6 @@ class SupplierBillViewSet(Base):
 
         bill.save(update_fields=list(dict.fromkeys(update_fields)))
 
-        # Approval is the accounting recognition point for a supplier bill.
-        # Dr Inventory / Input VAT, Cr Accounts Payable.
-        post_supplier_bill(bill, user=current_user)
-
         serializer_class = self.get_serializer_class()
 
         return Response(
@@ -1468,34 +1542,9 @@ class SupplierPaymentViewSet(Base):
 
         self._save_attachments(payment, request)
 
-        # Supplier payment accounting: Dr Accounts Payable, Cr Cash / Bank.
-        post_supplier_payment(
-            payment,
-            user=(request.user if request.user.is_authenticated else None),
-        )
-
         return Response(
             self.get_serializer(payment).data,
             status=status.HTTP_201_CREATED,
-        )
-
-    def update(self, request, *args, **kwargs):
-        return Response(
-            {
-                "detail": "Posted Supplier Payments cannot be edited. Use a reversal/correcting payment."
-            },
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    def partial_update(self, request, *args, **kwargs):
-        return self.update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        return Response(
-            {
-                "detail": "Posted Supplier Payments cannot be deleted because they are part of the accounting audit trail."
-            },
-            status=status.HTTP_400_BAD_REQUEST,
         )
 
     @action(
@@ -3526,14 +3575,6 @@ class PurchaseExpenseViewSet(Base):
             request,
         )
 
-        # A PAID expense has an immediate accounting effect. Pending/approved
-        # expenses are not posted until they are actually paid.
-        if str(expense.status or "").upper() == "PAID":
-            post_purchase_expense(
-                expense,
-                user=(request.user if request.user.is_authenticated else None),
-            )
-
         return Response(
             self.get_serializer(expense).data,
             status=status.HTTP_201_CREATED,
@@ -3570,12 +3611,6 @@ class PurchaseExpenseViewSet(Base):
             expense,
             request,
         )
-
-        if str(expense.status or "").upper() == "PAID":
-            post_purchase_expense(
-                expense,
-                user=(request.user if request.user.is_authenticated else None),
-            )
 
         return Response(self.get_serializer(expense).data)
 
