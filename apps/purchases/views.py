@@ -909,23 +909,36 @@ class SupplierBillViewSet(Base):
         url_path="form-options",
     )
     def form_options(self, request):
-        branch_id = request.query_params.get("branch")
-        include_all_branches = str(
-            request.query_params.get("include_all_branches", "")
-        ).lower() in {"1", "true", "yes"}
+        """
+        Supplier Bill can only use Purchase Orders that have at least one
+        confirmed GRN item with remaining unbilled quantity.
 
-        purchase_orders = (
-            PurchaseOrder.objects.select_related("supplier", "branch")
-            .prefetch_related("items")
-            .filter(
-                status__in=[
-                    "APPROVED",
-                    "PARTIALLY_RECEIVED",
-                    "RECEIVED",
-                ]
-            )
-            .order_by("-order_date", "-id")
+        This prevents:
+        - every approved PO appearing in Supplier Bill
+        - already fully billed GRNs appearing again
+        - frontend losing valid POs because `status` was missing
+        """
+        branch_id = request.query_params.get("branch")
+        bill_id = request.query_params.get("bill_id")
+
+        billed_query = SupplierBillItem.objects.exclude(
+            bill__status="CANCELLED",
         )
+
+        # While editing a bill, do not count its own quantities as already
+        # billed. This keeps its current GRN/PO selectable.
+        if bill_id not in (None, "", "null"):
+            billed_query = billed_query.exclude(
+                bill_id=bill_id,
+            )
+
+        billed_rows = billed_query.values("grn_item_id").annotate(
+            total=Sum("bill_quantity")
+        )
+
+        billed_by_grn_item = {
+            row["grn_item_id"]: int(row["total"] or 0) for row in billed_rows
+        }
 
         grns = (
             GoodsReceivedNote.objects.select_related(
@@ -936,6 +949,7 @@ class SupplierBillViewSet(Base):
             .prefetch_related(
                 "items__product",
                 "items__variant",
+                "purchase_order__items",
             )
             .filter(
                 is_confirmed=True,
@@ -946,75 +960,100 @@ class SupplierBillViewSet(Base):
                     "RECEIVED",
                 ],
             )
-            .exclude(
-                items__accepted_quantity__gt=0,
-                items__quality_status__in=["PARTIAL_ACCEPT", "QC_REJECTED"],
-            )
-            .distinct()
             .order_by("-received_date", "-id")
         )
 
-        # Supplier Bills follow a PO-first workflow. By default the form may
-        # request all eligible POs so a global branch override does not hide
-        # valid references. Once a PO is selected, its branch is populated in
-        # the bill automatically.
-        if branch_id and not include_all_branches:
-            purchase_orders = purchase_orders.filter(branch_id=branch_id)
-            grns = grns.filter(branch_id=branch_id)
-
-        po_options = [
-            {
-                "id": po.id,
-                "po_number": po.po_number,
-                "supplier_id": po.supplier_id,
-                "supplier_name": po.supplier.supplier_name,
-                "branch_id": po.branch_id,
-                "branch_name": po.branch.branch_name,
-                "currency": getattr(po, "currency", "AED"),
-                "total_amount": po.total_amount,
-                "item_count": po.items.count(),
-            }
-            for po in purchase_orders
-        ]
+        if branch_id not in (None, "", "all"):
+            grns = grns.filter(
+                branch_id=branch_id,
+            )
 
         grn_options = []
+        eligible_po_ids = set()
 
         for grn in grns:
-            payment_terms = getattr(
-                grn.supplier,
-                "payment_terms_days",
-                0,
-            )
-
-            credit_limit = getattr(
-                grn.supplier,
-                "credit_limit",
-                0,
-            )
-
-            outstanding = getattr(
-                grn.supplier,
-                "opening_balance",
-                0,
-            )
-
-            accepted_value = sum(
+            po_item_map = {
                 (
-                    item.accepted_quantity
-                    * getattr(
-                        item.product,
-                        "purchase_price",
-                        0,
+                    item.product_id,
+                    item.variant_id,
+                ): item
+                for item in grn.purchase_order.items.all()
+            }
+
+            option_items = []
+
+            for item in grn.items.all():
+                accepted_quantity = int(
+                    item.accepted_quantity or item.received_quantity or 0
+                )
+
+                already_billed = billed_by_grn_item.get(
+                    item.id,
+                    0,
+                )
+
+                available_quantity = max(
+                    0,
+                    accepted_quantity - already_billed,
+                )
+
+                if available_quantity <= 0:
+                    continue
+
+                po_item = po_item_map.get(
+                    (
+                        item.product_id,
+                        item.variant_id,
                     )
                 )
-                for item in grn.items.all()
-            )
+
+                option_items.append(
+                    {
+                        "id": item.id,
+                        "product_id": item.product_id,
+                        "variant_id": item.variant_id,
+                        "product_name": item.product.product_name,
+                        "sku": (
+                            getattr(item.variant, "sku", "")
+                            if item.variant
+                            else getattr(item.product, "sku", "")
+                        ),
+                        "variant_name": (
+                            getattr(item.variant, "display_name", None)
+                            or getattr(item.variant, "variant_name", None)
+                            or (str(item.variant) if item.variant else "")
+                        ),
+                        "accepted_quantity": accepted_quantity,
+                        "already_billed_quantity": already_billed,
+                        "available_bill_quantity": available_quantity,
+                        "unit_cost": (po_item.unit_price if po_item else 0),
+                        "vat_percentage": (
+                            getattr(
+                                po_item,
+                                "vat_percentage",
+                                5,
+                            )
+                            if po_item
+                            else 5
+                        ),
+                    }
+                )
+
+            # Do not expose fully billed GRNs.
+            if not option_items:
+                continue
+
+            eligible_po_ids.add(grn.purchase_order_id)
 
             grn_options.append(
                 {
                     "id": grn.id,
                     "grn_number": grn.grn_number,
+                    "status": grn.status,
+                    "is_confirmed": grn.is_confirmed,
+                    "received_date": grn.received_date,
                     "purchase_order_id": grn.purchase_order_id,
+                    "po_number": grn.purchase_order.po_number,
                     "supplier_id": grn.supplier_id,
                     "supplier_name": grn.supplier.supplier_name,
                     "branch_id": grn.branch_id,
@@ -1024,59 +1063,89 @@ class SupplierBillViewSet(Base):
                         "currency",
                         "AED",
                     ),
-                    "payment_terms_days": payment_terms,
-                    "supplier_credit_limit": credit_limit,
-                    "supplier_outstanding": outstanding,
-                    "total_accepted_quantity": sum(
-                        item.accepted_quantity for item in grn.items.all()
+                    "payment_terms_days": getattr(
+                        grn.supplier,
+                        "payment_terms_days",
+                        0,
                     ),
-                    "receipt_status": (
-                        "FULL_RECEIPT"
-                        if grn.purchase_order.status == "RECEIVED"
-                        else "PARTIAL_RECEIPT"
-                    ),
-                    "accepted_value": accepted_value,
-                    "items": [
-                        {
-                            "id": item.id,
-                            "product_id": item.product_id,
-                            "variant_id": item.variant_id,
-                            "product_name": item.product.product_name,
-                            "sku": (
-                                getattr(item.variant, "sku", "")
-                                if item.variant
-                                else getattr(item.product, "sku", "")
-                            ),
-                            "accepted_quantity": item.accepted_quantity,
-                            "unit_cost": next(
-                                (
-                                    po_item.unit_price
-                                    for po_item in grn.purchase_order.items.all()
-                                    if po_item.product_id == item.product_id
-                                    and po_item.variant_id == item.variant_id
-                                ),
-                                0,
-                            ),
-                            "vat_percentage": next(
-                                (
-                                    getattr(po_item, "vat_percentage", 5)
-                                    for po_item in grn.purchase_order.items.all()
-                                    if po_item.product_id == item.product_id
-                                    and po_item.variant_id == item.variant_id
-                                ),
-                                5,
-                            ),
-                        }
-                        for item in grn.items.all()
-                        if item.accepted_quantity > 0
-                    ],
+                    "items": option_items,
                 }
+            )
+
+        purchase_orders = (
+            PurchaseOrder.objects.select_related(
+                "supplier",
+                "branch",
+            )
+            .filter(
+                id__in=eligible_po_ids,
+                status__in=[
+                    "APPROVED",
+                    "PARTIALLY_RECEIVED",
+                    "RECEIVED",
+                ],
+            )
+            .order_by("-order_date", "-id")
+        )
+
+        # Respect the selected branch here as well.
+        if branch_id not in (None, "", "all"):
+            purchase_orders = purchase_orders.filter(
+                branch_id=branch_id,
             )
 
         return Response(
             {
-                "purchase_orders": po_options,
+                "purchase_orders": [
+                    {
+                        "id": po.id,
+                        "po_number": po.po_number,
+                        # IMPORTANT:
+                        # SupplierBillFormPage uses status to determine
+                        # whether a PO is selectable.
+                        "status": po.status,
+                        "supplier_id": po.supplier_id,
+                        "supplier_name": po.supplier.supplier_name,
+                        "branch_id": po.branch_id,
+                        "branch_name": po.branch.branch_name,
+                        "branch_code": po.branch.branch_code,
+                        "currency": getattr(
+                            po,
+                            "currency",
+                            "AED",
+                        ),
+                        "payment_terms_days": getattr(
+                            po.supplier,
+                            "payment_terms_days",
+                            0,
+                        ),
+                        "total_amount": po.total_amount,
+                    }
+                    for po in purchase_orders
+                ],
                 "grns": grn_options,
+                "branches": [
+                    {
+                        "id": branch.id,
+                        "branch_code": branch.branch_code,
+                        "branch_name": branch.branch_name,
+                    }
+                    for branch in Branch.objects.filter(is_active=True).order_by(
+                        "branch_code"
+                    )
+                ],
+                "suppliers": [
+                    {
+                        "id": supplier.id,
+                        "supplier_name": supplier.supplier_name,
+                        "supplier_code": supplier.supplier_code,
+                        "payment_terms_days": supplier.payment_terms_days,
+                        "branch_id": supplier.branch_id,
+                    }
+                    for supplier in Supplier.objects.filter(is_active=True).order_by(
+                        "supplier_name"
+                    )
+                ],
             }
         )
 
