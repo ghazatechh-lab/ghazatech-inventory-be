@@ -967,3 +967,208 @@ class SalaryCertificateSerializer(serializers.ModelSerializer):
         )
 
         return super().create(validated_data)
+
+
+class EmployeeLetterSerializer(serializers.ModelSerializer):
+    branch_id = serializers.IntegerField(
+        source="employee.branch_id",
+        read_only=True,
+    )
+    branch_name = serializers.SerializerMethodField()
+    issued_by_name = serializers.SerializerMethodField()
+    letter_type_display = serializers.CharField(
+        source="get_letter_type_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = EmployeeLetter
+        fields = "__all__"
+        read_only_fields = [
+            "reference_number",
+            "employee_name",
+            "employee_code",
+            "designation_name",
+            "department_name",
+            "joining_date",
+            "issued_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_branch_name(self, obj):
+        branch = getattr(obj.employee, "branch", None)
+        if not branch:
+            return None
+        return (
+            getattr(branch, "branch_name", None)
+            or getattr(branch, "name", None)
+            or str(branch)
+        )
+
+    def get_issued_by_name(self, obj):
+        user = obj.issued_by
+        if not user:
+            return None
+        return (
+            getattr(user, "full_name", None)
+            or getattr(user, "name", None)
+            or getattr(user, "email", None)
+            or getattr(user, "username", None)
+            or str(user)
+        )
+
+    def validate(self, attrs):
+        letter_type = attrs.get(
+            "letter_type",
+            getattr(self.instance, "letter_type", None),
+        )
+        employee = attrs.get(
+            "employee",
+            getattr(self.instance, "employee", None),
+        )
+
+        signatory = str(
+            attrs.get(
+                "authorized_signatory",
+                getattr(self.instance, "authorized_signatory", ""),
+            )
+            or ""
+        ).strip()
+
+        signatory_designation = str(
+            attrs.get(
+                "signatory_designation",
+                getattr(self.instance, "signatory_designation", ""),
+            )
+            or ""
+        ).strip()
+
+        if not signatory:
+            raise serializers.ValidationError(
+                {"authorized_signatory": "Authorized signatory is required."}
+            )
+
+        if not signatory_designation:
+            raise serializers.ValidationError(
+                {"signatory_designation": "Signatory designation is required."}
+            )
+
+        if letter_type == "WARNING":
+            reason = str(
+                attrs.get(
+                    "reason",
+                    getattr(self.instance, "reason", ""),
+                )
+                or ""
+            ).strip()
+
+            if not reason:
+                raise serializers.ValidationError(
+                    {"reason": "Reason is required for a warning letter."}
+                )
+
+            allowed_statuses = {
+                "ACTIVE",
+                "PROBATION",
+                "ON_LEAVE",
+            }
+
+            if employee and employee.employment_status not in allowed_statuses:
+                raise serializers.ValidationError(
+                    {
+                        "employee": (
+                            "Warning letters can only be issued to a "
+                            "currently employed employee."
+                        )
+                    }
+                )
+
+        if letter_type == "EXPERIENCE":
+            last_working_date = attrs.get(
+                "last_working_date",
+                getattr(self.instance, "last_working_date", None),
+            )
+
+            if not last_working_date:
+                raise serializers.ValidationError(
+                    {
+                        "last_working_date": (
+                            "Last working date is required for an " "experience letter."
+                        )
+                    }
+                )
+
+            if employee and employee.joining_date:
+                if last_working_date < employee.joining_date:
+                    raise serializers.ValidationError(
+                        {
+                            "last_working_date": (
+                                "Last working date cannot be before "
+                                "the employee joining date."
+                            )
+                        }
+                    )
+
+        return attrs
+
+    def _generate_reference_number(self, letter_type):
+        prefix_code = "WL" if letter_type == "WARNING" else "EL"
+        prefix = timezone.localdate().strftime(f"{prefix_code}-%Y%m")
+
+        latest = (
+            EmployeeLetter.objects.filter(reference_number__startswith=prefix)
+            .order_by("-id")
+            .first()
+        )
+
+        next_number = 1
+
+        if latest:
+            try:
+                next_number = int(latest.reference_number.rsplit("-", 1)[-1]) + 1
+            except (TypeError, ValueError):
+                next_number = (
+                    EmployeeLetter.objects.filter(
+                        reference_number__startswith=prefix
+                    ).count()
+                    + 1
+                )
+
+        return f"{prefix}-{next_number:04d}"
+
+    @transaction.atomic
+    def create(self, validated_data):
+        employee = validated_data["employee"]
+        letter_type = validated_data["letter_type"]
+        request = self.context.get("request")
+
+        validated_data.update(
+            {
+                "reference_number": self._generate_reference_number(letter_type),
+                "employee_name": employee.full_name,
+                "employee_code": employee.employee_code or "",
+                "designation_name": (
+                    employee.designation.name if employee.designation else ""
+                ),
+                "department_name": (
+                    employee.department.name if employee.department else ""
+                ),
+                "joining_date": employee.joining_date,
+                "issued_by": (
+                    request.user if request and request.user.is_authenticated else None
+                ),
+            }
+        )
+
+        if letter_type == "WARNING":
+            validated_data["last_working_date"] = None
+            validated_data["experience_summary"] = ""
+            validated_data["conduct_note"] = ""
+
+        if letter_type == "EXPERIENCE":
+            validated_data["subject"] = ""
+            validated_data["reason"] = ""
+            validated_data["details"] = ""
+
+        return super().create(validated_data)

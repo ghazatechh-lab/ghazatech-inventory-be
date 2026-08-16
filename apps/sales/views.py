@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -16,7 +16,13 @@ from apps.common.logging import LoggedModelViewSet as ModelViewSet
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
 from apps.hrms.models import Employee
-from apps.finance.models import BankAccount, CashRegister
+from apps.finance.models import BankAccount, CashRegister, JournalEntry
+from apps.finance.accounting import (
+    post_sales_invoice,
+    repost_sales_invoice,
+    reverse_sales_invoice,
+    post_sales_payment,
+)
 from apps.customers.models import Customer
 from apps.branches.models import Branch
 from apps.accounts.models import User
@@ -602,10 +608,10 @@ class SalesOrderViewSet(Base):
             is_active=True,
         ).order_by("first_name", "username")
 
-        products = Product.objects.filter(
-            is_active=True,
-            **({"branch_id": branch_id} if branch_id else {}),
-        ).order_by("product_name")
+        products = _sales_product_options(
+            branch_id,
+            request.user,
+        )
 
         quotations = (
             Quotation.objects.select_related("customer", "branch")
@@ -648,6 +654,8 @@ class SalesOrderViewSet(Base):
                     {
                         "id": customer.id,
                         "customer_name": customer.customer_name,
+                        "phone": getattr(customer, "phone", "") or "",
+                        "email": getattr(customer, "email", "") or "",
                     }
                     for customer in customers
                 ],
@@ -658,17 +666,9 @@ class SalesOrderViewSet(Base):
                     }
                     for user in salespeople
                 ],
-                "products": [
-                    {
-                        "id": product.id,
-                        "product_name": product.product_name,
-                        "name": product.product_name,
-                        "sku": getattr(product, "sku", ""),
-                        "description": getattr(product, "description", ""),
-                        "selling_price": getattr(product, "selling_price", 0),
-                    }
-                    for product in products
-                ],
+                # Uses the same sales product payload as Quotation:
+                # branch stock + ProductVariant.retail_price + VAT metadata.
+                "products": products,
                 "quotations": [
                     {
                         "id": quotation.id,
@@ -958,6 +958,24 @@ class SalesInvoiceViewSet(Base):
     )
 
     serializer_class = SalesInvoiceSerializer
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        invoice = serializer.save()
+        post_sales_invoice(
+            invoice,
+            user=(self.request.user if self.request.user.is_authenticated else None),
+        )
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        invoice = serializer.save()
+        # Unpaid invoice amendments are auditable: reverse the previous system
+        # journal and post the new totals instead of silently editing the GL.
+        repost_sales_invoice(
+            invoice,
+            user=(self.request.user if self.request.user.is_authenticated else None),
+        )
 
     search_fields = [
         "invoice_number",
@@ -1250,6 +1268,20 @@ class SalesInvoiceViewSet(Base):
 
         return response
 
+    def destroy(self, request, *args, **kwargs):
+        invoice = self.get_object()
+        if JournalEntry.objects.filter(
+            source="SYSTEM",
+            reference=f"SALES_INVOICE:{invoice.pk}",
+        ).exists():
+            return Response(
+                {
+                    "detail": "Posted Sales Invoices cannot be deleted. Void the invoice to create an accounting reversal."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     @action(
         detail=True,
         methods=["post"],
@@ -1313,6 +1345,11 @@ class SalesInvoiceViewSet(Base):
                 "voided_at",
                 "updated_at",
             ]
+        )
+
+        reverse_sales_invoice(
+            invoice,
+            user=(request.user if request.user.is_authenticated else None),
         )
 
         return Response(
@@ -1670,6 +1707,47 @@ class SalesPaymentViewSet(Base):
         "cash_register",
     )
     serializer_class = SalesPaymentSerializer
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        payment = serializer.save()
+        if str(payment.status or "").upper() == "PAID":
+            post_sales_payment(
+                payment,
+                user=(
+                    self.request.user if self.request.user.is_authenticated else None
+                ),
+            )
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        previous_status = str(serializer.instance.status or "").upper()
+        if previous_status == "PAID":
+            raise serializers.ValidationError(
+                {
+                    "status": "Cleared Sales Payments cannot be edited. Reverse the payment instead."
+                }
+            )
+        payment = serializer.save()
+        if str(payment.status or "").upper() == "PAID":
+            post_sales_payment(
+                payment,
+                user=(
+                    self.request.user if self.request.user.is_authenticated else None
+                ),
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        payment = self.get_object()
+        if str(payment.status or "").upper() == "PAID":
+            return Response(
+                {
+                    "detail": "Cleared Sales Payments cannot be deleted because they are posted to accounting."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     search_fields = [
         "payment_number",
         "customer__customer_name",

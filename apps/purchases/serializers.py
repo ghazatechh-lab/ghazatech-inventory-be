@@ -701,34 +701,25 @@ class GRNItemSerializer(serializers.ModelSerializer):
 
 
 class GRNSerializer(serializers.ModelSerializer):
-    # Generated automatically by the backend.
-    # The frontend must not be required to submit a GRN number.
+    # Generated automatically by the backend. The frontend must not be
+    # required to submit a GRN number.
     grn_number = serializers.CharField(
         read_only=True,
     )
-
     items = GRNItemSerializer(many=True)
-
-    attachments = GRNAttachmentSerializer(
-        many=True,
-        read_only=True,
-    )
-
+    attachments = GRNAttachmentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(
         source="supplier.supplier_name",
         read_only=True,
     )
-
     po_number = serializers.CharField(
         source="purchase_order.po_number",
         read_only=True,
     )
-
     branch_name = serializers.CharField(
         source="branch.branch_name",
         read_only=True,
     )
-
     received_by_name = serializers.SerializerMethodField()
     total_received_quantity = serializers.SerializerMethodField()
     total_accepted_quantity = serializers.SerializerMethodField()
@@ -738,7 +729,6 @@ class GRNSerializer(serializers.ModelSerializer):
     class Meta:
         model = GoodsReceivedNote
         fields = "__all__"
-
         read_only_fields = [
             "grn_number",
             "is_confirmed",
@@ -750,29 +740,14 @@ class GRNSerializer(serializers.ModelSerializer):
     def get_received_by_name(self, obj):
         if not obj.received_by:
             return ""
-
         full_name = ""
-
         if hasattr(obj.received_by, "get_full_name"):
             full_name = (obj.received_by.get_full_name() or "").strip()
-
         return (
             full_name
-            or getattr(
-                obj.received_by,
-                "display_name",
-                "",
-            )
-            or getattr(
-                obj.received_by,
-                "username",
-                "",
-            )
-            or getattr(
-                obj.received_by,
-                "email",
-                "",
-            )
+            or getattr(obj.received_by, "display_name", "")
+            or getattr(obj.received_by, "username", "")
+            or getattr(obj.received_by, "email", "")
         )
 
     def get_total_received_quantity(self, obj):
@@ -786,189 +761,116 @@ class GRNSerializer(serializers.ModelSerializer):
 
     def get_receipt_status(self, obj):
         po_items = {
-            (
-                item.product_id,
-                item.variant_id,
-            ): item
+            (item.product_id, item.variant_id): item
             for item in obj.purchase_order.items.all()
         }
 
         for item in obj.items.all():
-            po_item = po_items.get(
-                (
-                    item.product_id,
-                    item.variant_id,
-                )
-            )
-
+            po_item = po_items.get((item.product_id, item.variant_id))
             if po_item and po_item.received_quantity < po_item.quantity:
                 return "PARTIAL_RECEIPT"
 
         return "FULL_RECEIPT"
 
-    def _has_grn_ready_shipment(self, purchase_order):
-        """
-        A GRN can only be created after at least one shipment
-        for the PO has completed delivery/confirmation and QC.
-        """
-
-        return purchase_order.shipments.filter(
-            status__in=[
-                "DELIVERED",
-                "RECEIVED",
-                "COMPLETED",
-            ],
-            qc_status__in=[
-                "PASSED",
-                "PASSED_WITH_REJECTIONS",
-            ],
-        ).exists()
-
     def validate(self, attrs):
         purchase_order = attrs.get(
             "purchase_order",
-            getattr(
-                self.instance,
-                "purchase_order",
-                None,
-            ),
+            getattr(self.instance, "purchase_order", None),
         )
-
         supplier = attrs.get(
             "supplier",
-            getattr(
-                self.instance,
-                "supplier",
-                None,
-            ),
+            getattr(self.instance, "supplier", None),
         )
-
         branch = attrs.get(
             "branch",
-            getattr(
-                self.instance,
-                "branch",
-                None,
-            ),
+            getattr(self.instance, "branch", None),
         )
 
         if purchase_order:
-            # Allow POs that have passed approval.
-            #
-            # RECEIVED is included because old/previous flows may
-            # already have moved the PO to RECEIVED. Remaining-item
-            # validation below prevents receiving the same quantity
-            # twice.
-            allowed_po_statuses = {
-                "APPROVED",
-                "PARTIALLY_RECEIVED",
-                "RECEIVED",
-            }
-
-            if purchase_order.status not in allowed_po_statuses:
+            if purchase_order.status not in {"APPROVED", "PARTIALLY_RECEIVED"}:
                 raise serializers.ValidationError(
                     {
                         "purchase_order": (
-                            "GRN can only be created for a "
-                            "purchase order that has been approved."
+                            "GRN can only be created for an approved purchase order."
                         )
                     }
                 )
 
-            # Shipment must be delivered/confirmed AND QC passed.
-            if not self._has_grn_ready_shipment(purchase_order):
+            # Do not allow the GRN API to be bypassed by manually posting a PO
+            # id. The linked PO must have a shipment that has actually been
+            # received/confirmed first.
+            has_confirmed_shipment = purchase_order.shipments.filter(
+                status__in=["RECEIVED", "COMPLETED"]
+            ).exists()
+            if not has_confirmed_shipment:
                 raise serializers.ValidationError(
                     {
                         "purchase_order": (
-                            "The purchase order must have a "
-                            "delivered shipment with passed QC "
-                            "before creating a GRN."
+                            "Confirm/receive the purchase shipment before creating a GRN."
                         )
                     }
                 )
 
             if supplier and purchase_order.supplier_id != supplier.id:
                 raise serializers.ValidationError(
-                    {"supplier": ("Supplier must match the " "purchase order.")}
+                    {"supplier": "Supplier must match the purchase order."}
                 )
-
             if branch and purchase_order.branch_id != branch.id:
                 raise serializers.ValidationError(
-                    {"branch": ("Receiving branch must match " "the purchase order.")}
+                    {"branch": "Receiving branch must match the purchase order."}
                 )
 
         return attrs
 
     def _generate_number(self):
         prefix = timezone.now().strftime("GRN-%Y%m")
-
         count = GoodsReceivedNote.objects.filter(
             grn_number__startswith=prefix,
         ).count()
-
         return f"{prefix}-{count + 1:04d}"
 
-    def _validate_items_against_po(
-        self,
-        purchase_order,
-        items,
-    ):
+    def _validate_items_against_po(self, purchase_order, items):
         po_items = {
-            (
-                item.product_id,
-                item.variant_id,
-            ): item
+            (item.product_id, item.variant_id): item
             for item in purchase_order.items.all()
         }
 
         for item in items:
-            variant = item.get("variant")
-
             key = (
                 item["product"].id,
-                variant.id if variant else None,
+                item.get("variant").id if item.get("variant") else None,
             )
-
             po_item = po_items.get(key)
 
             if not po_item:
                 raise serializers.ValidationError(
-                    {"items": ("A received item is not part " "of the linked PO.")}
+                    {"items": "A received item is not part of the linked PO."}
                 )
 
-            remaining = max(
-                0,
-                po_item.quantity - po_item.received_quantity,
-            )
-
-            if item["received_quantity"] <= 0:
-                raise serializers.ValidationError(
-                    {
-                        "items": (
-                            f"Received quantity for "
-                            f"{po_item.product} must be "
-                            f"greater than zero."
-                        )
-                    }
-                )
+            remaining = max(0, po_item.quantity - po_item.received_quantity)
 
             if item["received_quantity"] > remaining:
                 raise serializers.ValidationError(
                     {
-                        "items": (
-                            f"Received quantity for "
-                            f"{po_item.product} exceeds "
-                            f"the remaining PO quantity "
-                            f"({remaining})."
-                        )
+                        "items": f"Received quantity for {po_item.product} exceeds the remaining PO quantity."
                     }
                 )
 
     def _save_items(self, grn, items):
         """
-        Save nested GRN items directly after DRF validation.
-        """
+        Save GRN items that have already passed nested serializer validation.
 
+        DRF converts product, variant, and other related primary keys into
+        model instances during GRNSerializer validation. Re-validating those
+        model instances through GRNItemSerializer(data=item) makes
+        PrimaryKeyRelatedField interpret the model objects as submitted IDs,
+        resulting in errors such as:
+
+        - Select a valid product.
+        - Select a valid variant.
+
+        Save the validated dictionaries directly instead.
+        """
         grn.items.all().delete()
 
         for raw_item in items:
@@ -984,91 +886,40 @@ class GRNSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        items = validated_data.pop(
-            "items",
-            [],
-        )
+        items = validated_data.pop("items", [])
 
         if not items:
             raise serializers.ValidationError(
-                {"items": ("At least one GRN item is required.")}
+                {"items": "At least one GRN item is required."}
             )
 
         purchase_order = validated_data["purchase_order"]
-
-        # Additional protection before creating record.
-        if not self._has_grn_ready_shipment(purchase_order):
-            raise serializers.ValidationError(
-                {
-                    "purchase_order": (
-                        "Shipment must be delivered and "
-                        "QC passed before creating a GRN."
-                    )
-                }
-            )
-
-        self._validate_items_against_po(
-            purchase_order,
-            items,
-        )
+        self._validate_items_against_po(purchase_order, items)
 
         if not validated_data.get("grn_number"):
             validated_data["grn_number"] = self._generate_number()
 
         grn = GoodsReceivedNote.objects.create(**validated_data)
-
-        self._save_items(
-            grn,
-            items,
-        )
-
+        self._save_items(grn, items)
         return grn
 
     @transaction.atomic
-    def update(
-        self,
-        instance,
-        validated_data,
-    ):
+    def update(self, instance, validated_data):
         if instance.is_confirmed:
             raise serializers.ValidationError("A confirmed GRN cannot be edited.")
 
-        items = validated_data.pop(
-            "items",
-            None,
-        )
-
-        purchase_order = validated_data.get(
-            "purchase_order",
-            instance.purchase_order,
-        )
-
-        if not self._has_grn_ready_shipment(purchase_order):
-            raise serializers.ValidationError(
-                {
-                    "purchase_order": (
-                        "Shipment must be delivered and "
-                        "QC passed before updating this GRN."
-                    )
-                }
-            )
+        items = validated_data.pop("items", None)
 
         if items is not None:
             self._validate_items_against_po(
-                purchase_order,
+                validated_data.get("purchase_order", instance.purchase_order),
                 items,
             )
 
-        instance = super().update(
-            instance,
-            validated_data,
-        )
+        instance = super().update(instance, validated_data)
 
         if items is not None:
-            self._save_items(
-                instance,
-                items,
-            )
+            self._save_items(instance, items)
 
         return instance
 
@@ -4198,6 +4049,13 @@ class PurchaseExpenseSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
+        if self.instance and str(self.instance.status or "").upper() == "PAID":
+            raise serializers.ValidationError(
+                {
+                    "status": "Paid expenses cannot be edited. Create a correcting entry instead."
+                }
+            )
+
         amount = attrs.get("amount", getattr(self.instance, "amount", 0))
         method = attrs.get(
             "payment_method", getattr(self.instance, "payment_method", None)
@@ -4208,7 +4066,7 @@ class PurchaseExpenseSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"amount": "Amount must be greater than zero."}
             )
-        if method == "BANK_TRANSFER" and not bank:
+        if method in ["BANK_TRANSFER", "CHEQUE", "CARD"] and not bank:
             raise serializers.ValidationError(
                 {"bank_account": "Bank account is required."}
             )

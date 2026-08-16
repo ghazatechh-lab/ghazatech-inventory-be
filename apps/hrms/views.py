@@ -1789,18 +1789,29 @@ class HRMSReportViewSet(BaseViewSet):
     @action(detail=False, methods=["get"])
     def summary(self, request):
         today = timezone.localdate()
+        branch_id = request.query_params.get("branch")
+
+        employees = Employee.objects.filter(is_active=True)
+        attendance = Attendance.objects.filter(
+            date=today,
+            status="PRESENT",
+        )
+        leaves = LeaveRequest.objects.filter(status="PENDING")
+        payroll = PayrollEntry.objects.filter(period=today.strftime("%Y-%m"))
+
+        if branch_id:
+            employees = employees.filter(branch_id=branch_id)
+            attendance = attendance.filter(branch_id=branch_id)
+            leaves = leaves.filter(branch_id=branch_id)
+            payroll = payroll.filter(branch_id=branch_id)
+
         return Response(
             {
-                "employees": Employee.objects.filter(is_active=True).count(),
-                "present_today": Attendance.objects.filter(
-                    date=today, status="PRESENT"
-                ).count(),
-                "pending_leaves": LeaveRequest.objects.filter(status="PENDING").count(),
+                "employees": employees.count(),
+                "present_today": attendance.count(),
+                "pending_leaves": leaves.count(),
                 "payroll_net": (
-                    PayrollEntry.objects.filter(
-                        period=today.strftime("%Y-%m")
-                    ).aggregate(value=Sum("net_salary"))["value"]
-                    or 0
+                    payroll.aggregate(value=Sum("net_salary"))["value"] or 0
                 ),
             }
         )
@@ -1862,6 +1873,10 @@ class HRMSReportViewSet(BaseViewSet):
             )
             if branch_id:
                 queryset = queryset.filter(branch_id=branch_id)
+            if start_date:
+                queryset = queryset.filter(to_date__gte=start_date)
+            if end_date:
+                queryset = queryset.filter(from_date__lte=end_date)
             writer.writerow(
                 [
                     "Employee Code",
@@ -1893,6 +1908,10 @@ class HRMSReportViewSet(BaseViewSet):
             queryset = PayrollEntry.objects.select_related("employee", "branch")
             if branch_id:
                 queryset = queryset.filter(branch_id=branch_id)
+            if start_date:
+                queryset = queryset.filter(payroll_date__gte=start_date)
+            if end_date:
+                queryset = queryset.filter(payroll_date__lte=end_date)
             writer.writerow(
                 [
                     "Employee Code",
@@ -1925,6 +1944,10 @@ class HRMSReportViewSet(BaseViewSet):
         )
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
+        if start_date:
+            queryset = queryset.filter(joining_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(joining_date__lte=end_date)
 
         writer.writerow(
             [
@@ -2100,3 +2123,56 @@ def salary_certificate_data(
             ),
         }
     )
+
+
+class EmployeeLetterViewSet(BaseViewSet):
+    queryset = EmployeeLetter.objects.select_related(
+        "employee",
+        "employee__branch",
+        "employee__designation",
+        "employee__department",
+        "issued_by",
+    ).order_by("-letter_date", "-id")
+
+    serializer_class = EmployeeLetterSerializer
+
+    search_fields = [
+        "reference_number",
+        "employee_name",
+        "employee_code",
+        "designation_name",
+        "department_name",
+        "subject",
+        "reason",
+    ]
+
+    filterset_fields = [
+        "employee",
+        "letter_type",
+        "letter_date",
+    ]
+
+    ordering_fields = [
+        "reference_number",
+        "letter_date",
+        "employee_name",
+        "created_at",
+    ]
+
+    # Issued HR letters are immutable. Corrections should be re-issued.
+    http_method_names = [
+        "get",
+        "post",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        branch_id = self.request.query_params.get("branch")
+
+        if branch_id and str(branch_id).lower() != "all":
+            queryset = queryset.filter(employee__branch_id=branch_id)
+
+        return queryset

@@ -1035,6 +1035,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             "subtotal",
             "vat_amount",
             "total_amount",
+            "paid_amount",
             "balance_due",
             "payment_status",
             "issued_at",
@@ -1481,6 +1482,16 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         # Extra backend protection for PAID/VOID
         # ---------------------------------------------
         current_payment_status = str(instance.payment_status or "").upper()
+
+        if Decimal(str(instance.paid_amount or 0)) > Decimal("0.00"):
+            raise serializers.ValidationError(
+                {
+                    "payment_status": (
+                        "An invoice with recorded payments cannot be edited. "
+                        "Reverse the payment first, then amend the invoice."
+                    )
+                }
+            )
 
         if current_payment_status in [
             "PAID",
@@ -2100,6 +2111,38 @@ class SalesPaymentSerializer(serializers.ModelSerializer):
                 }
             )
 
+        payment_method = str(
+            attrs.get("payment_method", getattr(self.instance, "payment_method", ""))
+            or ""
+        ).upper()
+        bank_account = attrs.get(
+            "bank_account", getattr(self.instance, "bank_account", None)
+        )
+        cash_register = attrs.get(
+            "cash_register", getattr(self.instance, "cash_register", None)
+        )
+
+        if payment_method == "CASH":
+            if not cash_register:
+                raise serializers.ValidationError(
+                    {"cash_register": "Cash Register is required for cash payments."}
+                )
+            attrs["bank_account"] = None
+        elif payment_method in {"BANK_TRANSFER", "CARD", "CHEQUE"}:
+            if not bank_account:
+                raise serializers.ValidationError(
+                    {
+                        "bank_account": "Bank Account is required for this payment method."
+                    }
+                )
+            attrs["cash_register"] = None
+        elif payment_method == "OTHER" and not (bank_account or cash_register):
+            raise serializers.ValidationError(
+                {
+                    "payment_method": "Select a Bank Account or Cash Register for Other payments."
+                }
+            )
+
         attrs["customer"] = invoice.customer
         attrs["branch"] = invoice.branch
         attrs["currency"] = invoice.currency
@@ -2110,38 +2153,47 @@ class SalesPaymentSerializer(serializers.ModelSerializer):
         return attrs
 
     def _update_invoice(self, invoice):
-        total_paid = invoice.payments.filter(status="PAID").aggregate(
-            value=Sum("amount")
-        )["value"] or Decimal("0")
-        credited = invoice.credit_notes.filter(status="ISSUED").aggregate(
-            value=Sum("total_amount")
-        )["value"] or Decimal("0")
+        total_paid = SalesPayment.objects.filter(
+            invoice=invoice,
+            status="PAID",
+        ).aggregate(value=Sum("amount"))["value"] or Decimal("0")
 
         invoice.paid_amount = total_paid
+
         invoice.balance_due = max(
             Decimal("0"),
-            (invoice.total_amount or Decimal("0")) - total_paid - credited,
+            Decimal(invoice.total_amount or 0) - total_paid,
         )
 
-        if invoice.balance_due == 0:
+        if invoice.balance_due <= Decimal("0"):
             invoice.payment_status = "PAID"
-            invoice.paid_at = timezone.now()
-        elif total_paid > 0:
+
+            if hasattr(invoice, "paid_at"):
+                invoice.paid_at = timezone.now()
+
+        elif total_paid > Decimal("0"):
             invoice.payment_status = "PARTIALLY_PAID"
-            invoice.paid_at = None
+
+            if hasattr(invoice, "paid_at"):
+                invoice.paid_at = None
+
         else:
             invoice.payment_status = "UNPAID"
-            invoice.paid_at = None
 
-        invoice.save(
-            update_fields=[
-                "paid_amount",
-                "balance_due",
-                "payment_status",
-                "paid_at",
-                "updated_at",
-            ]
-        )
+            if hasattr(invoice, "paid_at"):
+                invoice.paid_at = None
+
+        update_fields = [
+            "paid_amount",
+            "balance_due",
+            "payment_status",
+            "updated_at",
+        ]
+
+        if hasattr(invoice, "paid_at"):
+            update_fields.append("paid_at")
+
+        invoice.save(update_fields=update_fields)
 
     @transaction.atomic
     def create(self, validated_data):

@@ -1026,3 +1026,67 @@ class SalaryCertificate(TimeStampedModel):
 
     def __str__(self):
         return f"{self.reference_number} - " f"{self.employee_name}"
+
+
+class EmployeeLetter(TimeStampedModel):
+    LETTER_TYPE_CHOICES = [
+        ("WARNING", "Warning Letter"),
+        ("EXPERIENCE", "Experience Letter"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name="employee_letters",
+    )
+
+    letter_type = models.CharField(
+        max_length=30,
+        choices=LETTER_TYPE_CHOICES,
+    )
+
+    reference_number = models.CharField(
+        max_length=50,
+        unique=True,
+    )
+
+    letter_date = models.DateField()
+
+    # Snapshot fields keep old letters unchanged when employee master changes.
+    employee_name = models.CharField(max_length=220)
+    employee_code = models.CharField(max_length=50, blank=True, default="")
+    designation_name = models.CharField(max_length=150, blank=True, default="")
+    department_name = models.CharField(max_length=150, blank=True, default="")
+    joining_date = models.DateField(null=True, blank=True)
+
+    # Warning-letter fields.
+    subject = models.CharField(max_length=255, blank=True, default="")
+    reason = models.TextField(blank=True, default="")
+    details = models.TextField(blank=True, default="")
+
+    # Experience-letter fields.
+    last_working_date = models.DateField(null=True, blank=True)
+    experience_summary = models.TextField(blank=True, default="")
+    conduct_note = models.TextField(
+        blank=True,
+        default="During the employment period, the employee carried out assigned duties and responsibilities.",
+    )
+
+    authorized_signatory = models.CharField(max_length=150)
+    signatory_designation = models.CharField(max_length=150)
+
+    notes = models.TextField(blank=True, default="")
+
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="issued_employee_letters",
+    )
+
+    class Meta:
+        ordering = ["-letter_date", "-id"]
+
+    def __str__(self):
+        return f"{self.reference_number}- {self.employee_name}"

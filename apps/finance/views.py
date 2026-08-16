@@ -118,6 +118,45 @@ class CashRegisterViewSet(GenericViewSet):
     serializer_class = CashRegisterSerializer
     filterset_fields = ["branch", "status", "register_date"]
 
+    def destroy(self, request, *args, **kwargs):
+        register = self.get_object()
+
+        # A cash register is an accounting record. Once it has been referenced
+        # by any transaction, keep it for audit/history instead of allowing it
+        # to be deleted. This explicitly covers relations that use SET_NULL as
+        # well as the SupplierPayment relation that already uses PROTECT.
+        from apps.purchases.models import PurchaseExpense, SupplierPayment
+        from apps.sales.models import SalesPayment
+
+        usage = {
+            "supplier payments": SupplierPayment.objects.filter(
+                cash_register=register
+            ).count(),
+            "purchase expenses": PurchaseExpense.objects.filter(
+                cash_register=register
+            ).count(),
+            "sales payments": SalesPayment.objects.filter(
+                cash_register=register
+            ).count(),
+        }
+        used_by = [f"{count} {label}" for label, count in usage.items() if count]
+
+        if used_by:
+            return Response(
+                {
+                    "detail": (
+                        "This cash register cannot be deleted because it has "
+                        "already been used in " + ", ".join(used_by) + ". "
+                        "Keep the register for accounting history and close it "
+                        "instead."
+                    ),
+                    "usage": usage,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return super().destroy(request, *args, **kwargs)
+
 
 class BankAccountViewSet(GenericViewSet):
     queryset = BankAccount.objects.select_related(

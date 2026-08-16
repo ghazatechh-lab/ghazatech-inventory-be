@@ -16,6 +16,11 @@ from .services import confirm_grn
 from apps.common.response import ok
 from apps.suppliers.models import Supplier
 from apps.finance.models import BankAccount, CashRegister
+from apps.finance.accounting import (
+    post_purchase_expense,
+    post_supplier_bill,
+    post_supplier_payment,
+)
 from apps.inventory.models import ProductStock, StockMovement
 from apps.branches.models import Branch
 from apps.inventory.models import Rack
@@ -439,7 +444,10 @@ class GRNViewSet(Base):
                     "APPROVED",
                     "PARTIALLY_RECEIVED",
                 ],
-                # Only show PO after shipment is confirmed/received.
+                # A PO becomes eligible for GRN only after at least one
+                # purchase shipment has been received/confirmed. Draft,
+                # pending, in-transit, delivered-but-not-received, and
+                # cancelled shipments must never expose the PO here.
                 shipments__status__in=[
                     "RECEIVED",
                     "COMPLETED",
@@ -453,7 +461,6 @@ class GRNViewSet(Base):
             orders = orders.filter(branch_id=branch_id)
 
         orders = list(orders)
-
         confirmed_received = self._confirmed_received_by_order(
             [order.id for order in orders]
         )
@@ -466,8 +473,7 @@ class GRNViewSet(Base):
             racks = racks.filter(branch_id=branch_id)
 
         receivers = User.objects.filter(is_active=True).order_by(
-            "first_name",
-            "username",
+            "first_name", "username"
         )
 
         if branch_id not in (None, "", "all"):
@@ -482,7 +488,6 @@ class GRNViewSet(Base):
 
             for item in order.items.all():
                 ordered = int(item.quantity or 0)
-
                 received = confirmed_received.get(
                     (
                         order.id,
@@ -491,11 +496,7 @@ class GRNViewSet(Base):
                     ),
                     0,
                 )
-
-                remaining = max(
-                    0,
-                    ordered - received,
-                )
+                remaining = max(0, ordered - received)
 
                 if ordered <= 0 or remaining <= 0:
                     continue
@@ -506,7 +507,7 @@ class GRNViewSet(Base):
                         "po_item_id": item.id,
                         "product_id": item.product_id,
                         "variant_id": item.variant_id,
-                        "product_name": item.product.product_name,
+                        "product_name": (item.product.product_name),
                         "sku": (
                             getattr(item.variant, "sku", "")
                             if item.variant
@@ -525,17 +526,11 @@ class GRNViewSet(Base):
                 continue
 
             shipment = (
-                order.shipments.filter(
-                    status__in=[
-                        "RECEIVED",
-                        "COMPLETED",
-                    ]
-                )
-                .order_by(
-                    "-received_date",
-                    "-id",
-                )
+                order.shipments.filter(status__in=["RECEIVED", "COMPLETED"])
+                .order_by("-received_date", "-id")
                 .first()
+                if hasattr(order, "shipments")
+                else None
             )
 
             order_options.append(
@@ -543,7 +538,7 @@ class GRNViewSet(Base):
                     "id": order.id,
                     "po_number": order.po_number,
                     "supplier_id": order.supplier_id,
-                    "supplier_name": order.supplier.supplier_name,
+                    "supplier_name": (order.supplier.supplier_name),
                     "branch_id": order.branch_id,
                     "branch_name": order.branch.branch_name,
                     "branch_code": order.branch.branch_code,
@@ -580,18 +575,18 @@ class GRNViewSet(Base):
                     {
                         "id": rack.id,
                         "rack_code": rack.rack_code,
-                        "rack_name": rack.rack_name,
+                        "rack_name": getattr(
+                            rack,
+                            "rack_name",
+                            "",
+                        ),
                         "branch_id": rack.branch_id,
                     }
                     for rack in racks
                 ],
-                "quality_statuses": [
-                    {
-                        "value": value,
-                        "label": label,
-                    }
-                    for value, label in GoodsReceivedItem.QUALITY_CHOICES
-                ],
+                "quality_statuses": choices_as_options(
+                    GoodsReceivedItem.QUALITY_CHOICES
+                ),
             }
         )
 
@@ -710,6 +705,9 @@ class SupplierBillViewSet(Base):
         status_value = self.request.query_params.get("status")
         purchase_order_id = self.request.query_params.get("purchase_order")
         grn_id = self.request.query_params.get("grn")
+        exclude_paid = str(
+            self.request.query_params.get("exclude_paid", "")
+        ).lower() in {"1", "true", "yes"}
 
         if supplier_id not in (None, "", "all"):
             queryset = queryset.filter(supplier_id=supplier_id)
@@ -727,6 +725,9 @@ class SupplierBillViewSet(Base):
 
         if grn_id not in (None, "", "all"):
             queryset = queryset.filter(grn_id=grn_id)
+
+        if exclude_paid:
+            queryset = queryset.exclude(status="PAID")
 
         return queryset.distinct()
 
@@ -804,6 +805,17 @@ class SupplierBillViewSet(Base):
         self._save_attachments(bill, request)
         return Response(self.get_serializer(bill).data)
 
+    def destroy(self, request, *args, **kwargs):
+        bill = self.get_object()
+        if bill.approved_at:
+            return Response(
+                {
+                    "detail": "Approved Supplier Bills cannot be deleted because they are posted to accounting."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     @action(
         detail=False,
         methods=["get"],
@@ -860,8 +872,17 @@ class SupplierBillViewSet(Base):
         # valid references. Once a PO is selected, its branch is populated in
         # the bill automatically.
         if branch_id and not include_all_branches:
-            purchase_orders = purchase_orders.filter(branch_id=branch_id)
             grns = grns.filter(branch_id=branch_id)
+
+        # A Purchase Order is selectable for a Supplier Bill only when it has
+        # at least one confirmed, QC-eligible GRN returned above. Do not expose
+        # every APPROVED / RECEIVED PO in the Supplier Bill form.
+        eligible_po_ids = grns.values_list(
+            "purchase_order_id",
+            flat=True,
+        )
+
+        purchase_orders = purchase_orders.filter(id__in=eligible_po_ids).distinct()
 
         po_options = [
             {
@@ -1250,6 +1271,10 @@ class SupplierBillViewSet(Base):
 
         bill.save(update_fields=list(dict.fromkeys(update_fields)))
 
+        # Approval is the accounting recognition point for a supplier bill.
+        # Dr Inventory / Input VAT, Cr Accounts Payable.
+        post_supplier_bill(bill, user=current_user)
+
         serializer_class = self.get_serializer_class()
 
         return Response(
@@ -1443,9 +1468,34 @@ class SupplierPaymentViewSet(Base):
 
         self._save_attachments(payment, request)
 
+        # Supplier payment accounting: Dr Accounts Payable, Cr Cash / Bank.
+        post_supplier_payment(
+            payment,
+            user=(request.user if request.user.is_authenticated else None),
+        )
+
         return Response(
             self.get_serializer(payment).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    def update(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": "Posted Supplier Payments cannot be edited. Use a reversal/correcting payment."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        return self.update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": "Posted Supplier Payments cannot be deleted because they are part of the accounting audit trail."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     @action(
@@ -3476,6 +3526,14 @@ class PurchaseExpenseViewSet(Base):
             request,
         )
 
+        # A PAID expense has an immediate accounting effect. Pending/approved
+        # expenses are not posted until they are actually paid.
+        if str(expense.status or "").upper() == "PAID":
+            post_purchase_expense(
+                expense,
+                user=(request.user if request.user.is_authenticated else None),
+            )
+
         return Response(
             self.get_serializer(expense).data,
             status=status.HTTP_201_CREATED,
@@ -3512,6 +3570,12 @@ class PurchaseExpenseViewSet(Base):
             expense,
             request,
         )
+
+        if str(expense.status or "").upper() == "PAID":
+            post_purchase_expense(
+                expense,
+                user=(request.user if request.user.is_authenticated else None),
+            )
 
         return Response(self.get_serializer(expense).data)
 

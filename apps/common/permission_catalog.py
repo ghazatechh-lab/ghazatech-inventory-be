@@ -10,6 +10,43 @@ PERMISSION_GROUPS = [
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # BRANCH ACCESS
+    # ------------------------------------------------------------------
+    # These permissions are intentionally two-part:
+    #   branches.switch
+    #   branches.view_all
+    #
+    # `code_prefix` is handled by all_permission_codes() below.
+    {
+        "module": "branches",
+        "label": "Branch Access",
+        "resources": [
+            {
+                "resource": "active_branch",
+                "label": "Active Branch",
+                "code_prefix": "branches",
+                "actions": ["switch", "view_all"],
+                "action_labels": {
+                    "switch": "Change Active Branch",
+                    "view_all": "View All Branches",
+                },
+                "action_descriptions": {
+                    "switch": (
+                        "Allow the user to change the active working branch "
+                        "from the application header."
+                    ),
+                    "view_all": (
+                        "Allow the user to select All Branches and view "
+                        "combined branch-scoped records."
+                    ),
+                },
+            },
+        ],
+    },
+    # ------------------------------------------------------------------
+    # INVENTORY
+    # ------------------------------------------------------------------
     {
         "module": "inventory",
         "label": "Inventory",
@@ -20,11 +57,6 @@ PERMISSION_GROUPS = [
                 "actions": ["view", "create", "edit", "delete"],
             },
             {
-                "resource": "brands",
-                "label": "Brands",
-                "actions": ["view", "create", "edit", "delete"],
-            },
-            {
                 "resource": "racks",
                 "label": "Racks",
                 "actions": ["view", "create", "edit", "delete"],
@@ -32,7 +64,14 @@ PERMISSION_GROUPS = [
             {
                 "resource": "products",
                 "label": "Products",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "import",
+                    "export",
+                ],
             },
             {
                 "resource": "stock",
@@ -47,44 +86,41 @@ PERMISSION_GROUPS = [
             {
                 "resource": "adjustments",
                 "label": "Stock Adjustments",
-                "actions": ["view", "create", "approve"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "cancel",
+                ],
             },
             {
                 "resource": "transfers",
                 "label": "Stock Transfers",
-                "actions": ["view", "create", "edit", "approve", "cancel"],
-            },
-            {
-                "resource": "stock_classification",
-                "label": "Stock Classification",
-                "actions": ["view", "assign", "change"],
-            },
-            {
-                "resource": "restricted_stock",
-                "label": "Restricted Stock",
                 "actions": [
                     "view",
-                    "manage",
-                    "sell",
-                    "purchase",
-                    "transfer",
-                    "adjust",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "cancel",
+                    "dispatch",
+                    "receive",
+                    "print",
+                    "export",
                 ],
             },
             {
-                "resource": "non_restricted_stock",
-                "label": "Non-Restricted Stock",
-                "actions": [
-                    "view",
-                    "manage",
-                    "sell",
-                    "purchase",
-                    "transfer",
-                    "adjust",
-                ],
+                "resource": "low_stock",
+                "label": "Low Stock",
+                "actions": ["view", "export"],
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # PURCHASES
+    # ------------------------------------------------------------------
     {
         "module": "purchase",
         "label": "Purchase",
@@ -92,7 +128,13 @@ PERMISSION_GROUPS = [
             {
                 "resource": "suppliers",
                 "label": "Suppliers",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "purchase_orders",
@@ -109,6 +151,21 @@ PERMISSION_GROUPS = [
                 ],
             },
             {
+                "resource": "shipments",
+                "label": "Purchase Shipments",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "confirm",
+                    "receive",
+                    "qc",
+                    "print",
+                    "export",
+                ],
+            },
+            {
                 "resource": "grn",
                 "label": "Goods Received Notes",
                 "actions": [
@@ -117,6 +174,7 @@ PERMISSION_GROUPS = [
                     "edit",
                     "delete",
                     "approve",
+                    "confirm",
                     "print",
                     "export",
                 ],
@@ -130,6 +188,7 @@ PERMISSION_GROUPS = [
                     "edit",
                     "delete",
                     "approve",
+                    "cancel",
                     "print",
                     "export",
                 ],
@@ -156,6 +215,7 @@ PERMISSION_GROUPS = [
                     "edit",
                     "delete",
                     "approve",
+                    "cancel",
                     "print",
                     "export",
                 ],
@@ -174,48 +234,23 @@ PERMISSION_GROUPS = [
                 ],
             },
             {
-                "resource": "shipments",
-                "label": "Shipments",
-                "actions": ["view", "create", "edit", "delete"],
-            },
-        ],
-    },
-    {
-        "module": "purchases",
-        "label": "Purchase Special Access",
-        "resources": [
-            {
-                "resource": "stock_purchase",
-                "label": "Stock Purchase Controls",
-                "actions": [
-                    "regular",
-                    "restricted",
-                    "non_restricted",
-                    "vat",
-                    "non_vat",
-                ],
-            },
-            {
-                "resource": "vat",
-                "label": "Purchase VAT",
+                "resource": "expenses",
+                "label": "Purchase Expenses",
                 "actions": [
                     "view",
-                    "manage",
-                    "override_rate",
-                    "use_zero_rated",
-                    "use_exempt",
-                    "use_out_of_scope",
-                    "use_reverse_charge",
-                    "view_reason",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "print",
+                    "export",
                 ],
-            },
-            {
-                "resource": "non_vat",
-                "label": "Purchase Non-VAT",
-                "actions": ["view", "use", "manage"],
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # SALES
+    # ------------------------------------------------------------------
     {
         "module": "sales",
         "label": "Sales",
@@ -223,7 +258,13 @@ PERMISSION_GROUPS = [
             {
                 "resource": "customers",
                 "label": "Customers",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "quotations",
@@ -240,8 +281,88 @@ PERMISSION_GROUPS = [
                 ],
             },
             {
+                "resource": "sales_orders",
+                "label": "Sales Orders",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "cancel",
+                    "convert",
+                    "print",
+                    "export",
+                ],
+            },
+            {
+                "resource": "delivery_notes",
+                "label": "Delivery Notes",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "deliver",
+                    "cancel",
+                    "print",
+                    "export",
+                ],
+            },
+            {
                 "resource": "invoices",
                 "label": "Invoices",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "cancel",
+                    "record_payment",
+                    "print",
+                    "export",
+                ],
+            },
+            {
+                "resource": "pos",
+                "label": "Direct Sale / POS",
+                "actions": [
+                    "view",
+                    "create",
+                    "print",
+                ],
+            },
+            {
+                "resource": "service",
+                "label": "Service & Repair",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "assign",
+                    "complete",
+                    "create_invoice",
+                    "print",
+                    "export",
+                ],
+            },
+            {
+                "resource": "sales_payments",
+                "label": "Sales Payments",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "print",
+                    "export",
+                ],
+            },
+            {
+                "resource": "sales_returns",
+                "label": "Sales Returns",
                 "actions": [
                     "view",
                     "create",
@@ -254,16 +375,6 @@ PERMISSION_GROUPS = [
                 ],
             },
             {
-                "resource": "pos",
-                "label": "Direct Sale / POS",
-                "actions": ["view", "create", "print"],
-            },
-            {
-                "resource": "sales_payments",
-                "label": "Sales Payments",
-                "actions": ["view", "create", "edit", "delete", "print", "export"],
-            },
-            {
                 "resource": "credit_notes",
                 "label": "Credit Notes",
                 "actions": [
@@ -272,7 +383,19 @@ PERMISSION_GROUPS = [
                     "edit",
                     "delete",
                     "approve",
+                    "cancel",
                     "print",
+                    "export",
+                ],
+            },
+            {
+                "resource": "price_lists",
+                "label": "Price Lists & Discounts",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
                     "export",
                 ],
             },
@@ -280,36 +403,19 @@ PERMISSION_GROUPS = [
                 "resource": "selling",
                 "label": "Selling Controls",
                 "actions": [
-                    "regular",
-                    "restricted",
-                    "non_restricted",
-                    "vat",
-                    "non_vat",
                     "discount",
                     "price_override",
                 ],
-            },
-            {
-                "resource": "vat",
-                "label": "Sales VAT",
-                "actions": [
-                    "view",
-                    "manage",
-                    "override_rate",
-                    "use_zero_rated",
-                    "use_exempt",
-                    "use_out_of_scope",
-                    "use_reverse_charge",
-                    "view_reason",
-                ],
-            },
-            {
-                "resource": "non_vat",
-                "label": "Sales Non-VAT",
-                "actions": ["view", "use", "manage"],
+                "action_labels": {
+                    "discount": "Apply Sales Discount",
+                    "price_override": "Override Selling Price",
+                },
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # ACCOUNTING
+    # ------------------------------------------------------------------
     {
         "module": "accounting",
         "label": "Accounting",
@@ -322,7 +428,13 @@ PERMISSION_GROUPS = [
             {
                 "resource": "chart_of_accounts",
                 "label": "Chart of Accounts",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "journal_entries",
@@ -333,6 +445,8 @@ PERMISSION_GROUPS = [
                     "edit",
                     "delete",
                     "approve",
+                    "post",
+                    "reverse",
                     "export",
                     "print",
                 ],
@@ -355,40 +469,84 @@ PERMISSION_GROUPS = [
             {
                 "resource": "bank_cash",
                 "label": "Bank & Cash",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
+            },
+            {
+                "resource": "cash_registers",
+                "label": "Cash Registers",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "close",
+                    "export",
+                ],
             },
             {
                 "resource": "fixed_assets",
                 "label": "Fixed Assets",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "tax",
                 "label": "VAT / Tax",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "budgeting",
                 "label": "Budgeting",
-                "actions": ["view", "create", "edit", "delete", "approve", "export"],
-            },
-            {
-                "resource": "financial_reports",
-                "label": "Financial Reports",
-                "actions": ["view", "export", "print"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "approve",
+                    "export",
+                ],
             },
             {
                 "resource": "period_close",
                 "label": "Period Close",
-                "actions": ["view", "create", "edit", "close"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "close",
+                ],
             },
             {
                 "resource": "branch_consolidation",
                 "label": "Branch Consolidation",
-                "actions": ["view", "export", "print"],
+                "actions": [
+                    "view",
+                    "export",
+                    "print",
+                ],
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # HRMS
+    # ------------------------------------------------------------------
     {
         "module": "hrms",
         "label": "HRMS",
@@ -396,12 +554,44 @@ PERMISSION_GROUPS = [
             {
                 "resource": "employees",
                 "label": "Employees",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
+            },
+            {
+                "resource": "departments",
+                "label": "Departments",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                ],
+            },
+            {
+                "resource": "designations",
+                "label": "Designations",
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                ],
             },
             {
                 "resource": "attendance",
                 "label": "Attendance",
-                "actions": ["view", "create", "edit", "delete", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "export",
+                ],
             },
             {
                 "resource": "leaves",
@@ -419,31 +609,87 @@ PERMISSION_GROUPS = [
             {
                 "resource": "payroll",
                 "label": "Payroll",
-                "actions": ["view", "create", "approve", "process", "print", "export"],
+                "actions": [
+                    "view",
+                    "create",
+                    "approve",
+                    "process",
+                    "print",
+                    "export",
+                ],
             },
             {
                 "resource": "salary_history",
                 "label": "Salary History",
-                "actions": ["view", "create", "edit"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                ],
+            },
+            {
+                "resource": "certificates_letters",
+                "label": "Certificates & Letters",
+                "actions": [
+                    "view",
+                    "create",
+                    "print",
+                    "export",
+                ],
             },
             {
                 "resource": "document_expiry",
                 "label": "Document Expiry",
-                "actions": ["view", "export"],
+                "actions": [
+                    "view",
+                    "export",
+                ],
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # REPORTS
+    # ------------------------------------------------------------------
+    # Financial Reports intentionally live here, not under Accounting.
     {
         "module": "reports",
         "label": "Reports",
         "resources": [
             {
-                "resource": "reports",
-                "label": "All Reports",
+                "resource": "dashboard",
+                "label": "Reports Dashboard",
+                "actions": ["view", "export", "print"],
+            },
+            {
+                "resource": "sales",
+                "label": "Sales Reports",
+                "actions": ["view", "export", "print"],
+            },
+            {
+                "resource": "purchase",
+                "label": "Purchase Reports",
+                "actions": ["view", "export", "print"],
+            },
+            {
+                "resource": "inventory",
+                "label": "Inventory Reports",
+                "actions": ["view", "export", "print"],
+            },
+            {
+                "resource": "hrms",
+                "label": "HRMS Reports",
+                "actions": ["view", "export", "print"],
+            },
+            {
+                "resource": "finance",
+                "label": "Finance Reports",
                 "actions": ["view", "export", "print"],
             },
         ],
     },
+    # ------------------------------------------------------------------
+    # SETTINGS & SECURITY
+    # ------------------------------------------------------------------
     {
         "module": "settings",
         "label": "Settings & Security",
@@ -451,37 +697,125 @@ PERMISSION_GROUPS = [
             {
                 "resource": "branches",
                 "label": "Branches",
-                "actions": ["view", "create", "edit", "delete"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                ],
             },
             {
                 "resource": "users",
                 "label": "Users",
-                "actions": ["view", "create", "edit", "delete", "activate"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                    "activate",
+                ],
             },
             {
                 "resource": "roles",
                 "label": "Roles & Permissions",
-                "actions": ["view", "create", "edit", "delete"],
+                "actions": [
+                    "view",
+                    "create",
+                    "edit",
+                    "delete",
+                ],
             },
             {
                 "resource": "audit_logs",
                 "label": "Audit Logs",
-                "actions": ["view", "export"],
+                "actions": [
+                    "view",
+                    "export",
+                ],
             },
             {
                 "resource": "settings",
                 "label": "System Settings",
-                "actions": ["view", "edit"],
+                "actions": [
+                    "view",
+                    "edit",
+                ],
             },
         ],
     },
 ]
 
 
+def permission_code(group, resource, action):
+    """
+    Return the canonical permission code.
+
+    Most permissions use:
+        module.resource.action
+
+    Special permissions such as branch switching can define:
+        "code_prefix": "branches"
+
+    which produces:
+        branches.switch
+        branches.view_all
+    """
+    code_prefix = resource.get("code_prefix")
+
+    if code_prefix:
+        return f"{code_prefix}.{action}"
+
+    return f"{group['module']}." f"{resource['resource']}." f"{action}"
+
+
 def all_permission_codes():
     return [
-        f"{group['module']}.{resource['resource']}.{action}"
+        permission_code(group, resource, action)
         for group in PERMISSION_GROUPS
         for resource in group["resources"]
         for action in resource["actions"]
     ]
+
+
+def permission_catalog():
+    """
+    Return a flattened permission catalog.
+
+    This is useful for serializers, permission-sync commands, role forms,
+    and API responses that need both the permission code and human labels.
+    """
+    rows = []
+
+    for group in PERMISSION_GROUPS:
+        for resource in group["resources"]:
+            action_labels = resource.get("action_labels", {})
+            action_descriptions = resource.get(
+                "action_descriptions",
+                {},
+            )
+
+            for action in resource["actions"]:
+                rows.append(
+                    {
+                        "code": permission_code(
+                            group,
+                            resource,
+                            action,
+                        ),
+                        "module": group["module"],
+                        "module_label": group["label"],
+                        "resource": resource["resource"],
+                        "resource_label": resource["label"],
+                        "action": action,
+                        "action_label": action_labels.get(
+                            action,
+                            action.replace("_", " ").title(),
+                        ),
+                        "description": action_descriptions.get(
+                            action,
+                            "",
+                        ),
+                    }
+                )
+
+    return rows
