@@ -4,82 +4,22 @@ from django.db.models import Q
 from rest_framework import serializers
 
 from apps.hrms.models import Employee
+
 from .models import Role
 from .permission_catalog import (
     PERMISSION_GROUPS,
     all_permission_codes,
 )
 
-SPECIAL_ACCESS_PERMISSION_CODES = {
-    "sales.selling.regular",
-    "sales.selling.restricted",
-    "sales.selling.non_restricted",
-    "sales.selling.vat",
-    "sales.selling.non_vat",
-    "sales.selling.discount",
-    "sales.selling.price_override",
-    "sales.vat.view",
-    "sales.vat.manage",
-    "sales.vat.override_rate",
-    "sales.vat.use_zero_rated",
-    "sales.vat.use_exempt",
-    "sales.vat.use_out_of_scope",
-    "sales.vat.use_reverse_charge",
-    "sales.vat.view_reason",
-    "sales.non_vat.view",
-    "sales.non_vat.use",
-    "sales.non_vat.manage",
-    "inventory.stock_classification.view",
-    "inventory.stock_classification.assign",
-    "inventory.stock_classification.change",
-    "inventory.restricted_stock.view",
-    "inventory.restricted_stock.manage",
-    "inventory.restricted_stock.sell",
-    "inventory.restricted_stock.purchase",
-    "inventory.restricted_stock.transfer",
-    "inventory.restricted_stock.adjust",
-    "inventory.non_restricted_stock.view",
-    "inventory.non_restricted_stock.manage",
-    "inventory.non_restricted_stock.sell",
-    "inventory.non_restricted_stock.purchase",
-    "inventory.non_restricted_stock.transfer",
-    "inventory.non_restricted_stock.adjust",
-    "purchases.stock_purchase.regular",
-    "purchases.stock_purchase.restricted",
-    "purchases.stock_purchase.non_restricted",
-    "purchases.stock_purchase.vat",
-    "purchases.stock_purchase.non_vat",
-    "purchases.vat.view",
-    "purchases.vat.manage",
-    "purchases.vat.override_rate",
-    "purchases.vat.use_zero_rated",
-    "purchases.vat.use_exempt",
-    "purchases.vat.use_out_of_scope",
-    "purchases.vat.use_reverse_charge",
-    "purchases.vat.view_reason",
-    "purchases.non_vat.view",
-    "purchases.non_vat.use",
-    "purchases.non_vat.manage",
-}
-
-
 LEGACY_PERMISSION_ALIASES = {
     "dashboard.view": "dashboard.dashboard.view",
-    "finance.view": "finance.*",
+    "finance.view": "accounting.*",
     "hrms.view": "hrms.*",
     "inventory.view": "inventory.*",
     "reports.view": "reports.*",
     "reports.export": "reports.*",
     "sales.view": "sales.*",
-    "branches.branches.view_all": "branches.view_all",
-    "branches.branch_access.view_all": "branches.view_all",
-    # Regular stock and non-restricted stock are the same concept.
-    "sales.selling.non_restricted": "sales.selling.regular",
-    "purchases.stock_purchase.non_restricted": "purchases.stock_purchase.regular",
 }
-
-
-OBSOLETE_PERMISSION_PREFIXES = ("inventory.non_restricted_stock.",)
 
 
 MODULE_WILDCARD_PERMISSIONS = {
@@ -97,14 +37,33 @@ MODULE_WILDCARD_PERMISSIONS = {
 }
 
 
+OBSOLETE_PERMISSION_PREFIXES = (
+    "inventory.stock_classification.",
+    "inventory.restricted_stock.",
+    "inventory.non_restricted_stock.",
+    "sales.vat.",
+    "sales.non_vat.",
+    "purchases.vat.",
+    "purchases.non_vat.",
+)
+
+
+OBSOLETE_PERMISSION_CODES = {
+    "sales.selling.regular",
+    "sales.selling.restricted",
+    "sales.selling.non_restricted",
+    "sales.selling.vat",
+    "sales.selling.non_vat",
+    "purchases.stock_purchase.regular",
+    "purchases.stock_purchase.restricted",
+    "purchases.stock_purchase.non_restricted",
+    "purchases.stock_purchase.vat",
+    "purchases.stock_purchase.non_vat",
+}
+
+
 def normalize_permission_code(code):
     normalized = str(code or "").strip()
-
-    if normalized == "*":
-        return normalized
-
-    if normalized.startswith(OBSOLETE_PERMISSION_PREFIXES):
-        return None
 
     return LEGACY_PERMISSION_ALIASES.get(
         normalized,
@@ -112,39 +71,59 @@ def normalize_permission_code(code):
     )
 
 
-def get_valid_permission_codes():
-    """
-    Return every permission accepted by the role form.
+def is_obsolete_permission(code):
+    normalized = normalize_permission_code(code)
 
-    The accounts permission catalogue remains the main source.
-    Special-access codes are included directly so role saving does
-    not fail when the frontend shows VAT, Non-VAT, selling, or
-    stock-classification permissions.
-    """
+    return normalized in OBSOLETE_PERMISSION_CODES or normalized.startswith(
+        OBSOLETE_PERMISSION_PREFIXES
+    )
+
+
+def get_valid_permission_codes():
     valid = set(all_permission_codes())
-    valid.update(SPECIAL_ACCESS_PERMISSION_CODES)
     valid.update(MODULE_WILDCARD_PERMISSIONS)
 
-    try:
-        from apps.common.permission_catalog import (
-            iter_permission_codes,
-        )
-
-        valid.update(iter_permission_codes())
-    except (
-        ImportError,
-        AttributeError,
-    ):
-        pass
-
     return sorted(valid)
+
+
+def normalize_user_permissions(value):
+    value = value or []
+
+    if not isinstance(
+        value,
+        (
+            list,
+            tuple,
+            set,
+        ),
+    ):
+        raise serializers.ValidationError("Permissions must be a list.")
+
+    normalized = sorted(
+        {
+            normalize_permission_code(permission)
+            for permission in value
+            if str(permission).strip() and not is_obsolete_permission(permission)
+        }
+    )
+
+    valid = set(get_valid_permission_codes())
+
+    invalid = sorted(set(normalized) - valid)
+
+    if invalid:
+        raise serializers.ValidationError("Unknown permissions: " + ", ".join(invalid))
+
+    return normalized
 
 
 User = get_user_model()
 
 
 class RoleSerializer(serializers.ModelSerializer):
-    user_count = serializers.IntegerField(read_only=True)
+    user_count = serializers.IntegerField(
+        read_only=True,
+    )
 
     class Meta:
         model = Role
@@ -153,7 +132,6 @@ class RoleSerializer(serializers.ModelSerializer):
             "name",
             "code",
             "description",
-            "permissions",
             "is_active",
             "user_count",
         ]
@@ -161,71 +139,18 @@ class RoleSerializer(serializers.ModelSerializer):
     def validate_code(self, value):
         return str(value).strip().upper().replace(" ", "_")
 
-    def validate_permissions(self, value):
-        value = value or []
-
-        if not isinstance(
-            value,
-            (
-                list,
-                tuple,
-                set,
-            ),
-        ):
-            raise serializers.ValidationError("Permissions must be a list.")
-
-        normalized = sorted(
-            {
-                normalized_code
-                for permission in value
-                if str(permission).strip()
-                for normalized_code in [normalize_permission_code(permission)]
-                if normalized_code
-            }
-        )
-
-        valid = set(get_valid_permission_codes())
-
-        invalid = sorted(set(normalized) - valid)
-
-        if invalid:
-            raise serializers.ValidationError(
-                "Unknown permissions: " + ", ".join(invalid)
-            )
-
-        return normalized
-
-    def validate(self, attrs):
-        code = attrs.get(
-            "code",
-            getattr(
-                self.instance,
-                "code",
-                "",
-            ),
-        )
-
-        if code == "ADMIN":
-            attrs["permissions"] = get_valid_permission_codes()
-
-        return attrs
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-
-        if instance.code == "ADMIN":
-            data["permissions"] = get_valid_permission_codes()
-
-        return data
-
 
 class EmployeeUserOptionSerializer(serializers.ModelSerializer):
-    full_name = serializers.CharField(read_only=True)
+    full_name = serializers.CharField(
+        read_only=True,
+    )
+
     branch_name = serializers.CharField(
         source="branch.branch_name",
         read_only=True,
         allow_null=True,
     )
+
     user_id = serializers.IntegerField(
         source="user.id",
         read_only=True,
@@ -252,21 +177,32 @@ class UserSerializer(serializers.ModelSerializer):
         allow_blank=False,
         min_length=8,
     )
+
     role_name = serializers.CharField(
         source="role.name",
         read_only=True,
         allow_null=True,
     )
+
     role_code = serializers.SerializerMethodField()
     role_detail = serializers.SerializerMethodField()
     branch_detail = serializers.SerializerMethodField()
     employee_detail = serializers.SerializerMethodField()
+
     employee_code = serializers.CharField(
         source="employee.employee_code",
         read_only=True,
         allow_null=True,
     )
-    permissions = serializers.SerializerMethodField()
+
+    # USER-LEVEL permissions: writable.
+    permissions = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+    )
+
+    effective_permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -288,18 +224,22 @@ class UserSerializer(serializers.ModelSerializer):
             "branch",
             "branch_detail",
             "permissions",
+            "effective_permissions",
             "is_active",
             "is_staff",
             "is_superuser",
             "created_at",
             "updated_at",
         ]
+
         read_only_fields = [
             "is_staff",
             "is_superuser",
+            "effective_permissions",
             "created_at",
             "updated_at",
         ]
+
         extra_kwargs = {
             "employee": {
                 "required": False,
@@ -344,8 +284,8 @@ class UserSerializer(serializers.ModelSerializer):
 
         return {
             "id": obj.branch.id,
-            "branch_code": (obj.branch.branch_code),
-            "branch_name": (obj.branch.branch_name),
+            "branch_code": obj.branch.branch_code,
+            "branch_name": obj.branch.branch_name,
         }
 
     def get_employee_detail(self, obj):
@@ -354,13 +294,16 @@ class UserSerializer(serializers.ModelSerializer):
 
         return {
             "id": obj.employee.id,
-            "employee_code": (obj.employee.employee_code),
-            "full_name": (obj.employee.full_name),
-            "branch": (obj.employee.branch_id),
+            "employee_code": obj.employee.employee_code,
+            "full_name": obj.employee.full_name,
+            "branch": obj.employee.branch_id,
         }
 
-    def get_permissions(self, obj):
+    def get_effective_permissions(self, obj):
         return obj.permission_codes
+
+    def validate_permissions(self, value):
+        return normalize_user_permissions(value)
 
     def validate(self, attrs):
         role = attrs.get(
@@ -371,6 +314,7 @@ class UserSerializer(serializers.ModelSerializer):
                 None,
             ),
         )
+
         employee = attrs.get(
             "employee",
             getattr(
@@ -386,10 +330,14 @@ class UserSerializer(serializers.ModelSerializer):
             )
 
         if employee:
-            conflict = User.objects.filter(employee=employee)
+            conflict = User.objects.filter(
+                employee=employee,
+            )
 
             if self.instance:
-                conflict = conflict.exclude(pk=self.instance.pk)
+                conflict = conflict.exclude(
+                    pk=self.instance.pk,
+                )
 
             if conflict.exists():
                 raise serializers.ValidationError(
@@ -415,8 +363,10 @@ class UserSerializer(serializers.ModelSerializer):
             if not attrs.get("full_name"):
                 attrs["full_name"] = employee.full_name
 
+        # ADMIN is still unrestricted, but permission storage is kept clean.
         if role and role.code == "ADMIN":
             attrs["employee"] = None
+            attrs["permissions"] = []
 
         return attrs
 
@@ -448,11 +398,7 @@ class UserSerializer(serializers.ModelSerializer):
         )
 
         for field, value in validated_data.items():
-            setattr(
-                instance,
-                field,
-                value,
-            )
+            setattr(instance, field, value)
 
         if password:
             instance.set_password(password)
@@ -467,14 +413,17 @@ class LoginSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
     )
+
     email = serializers.CharField(
         required=False,
         allow_blank=True,
     )
+
     username = serializers.CharField(
         required=False,
         allow_blank=True,
     )
+
     password = serializers.CharField(
         write_only=True,
         required=True,
@@ -500,7 +449,7 @@ class LoginSerializer(serializers.Serializer):
         ).first()
 
         if not user or not user.check_password(password):
-            raise serializers.ValidationError({"message": ("Invalid credentials")})
+            raise serializers.ValidationError({"message": "Invalid credentials"})
 
         if not user.is_active:
             raise serializers.ValidationError({"message": ("User account is inactive")})
@@ -512,7 +461,9 @@ class LoginSerializer(serializers.Serializer):
 
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField()
-    new_password = serializers.CharField(min_length=8)
+    new_password = serializers.CharField(
+        min_length=8,
+    )
 
     def validate_old_password(
         self,

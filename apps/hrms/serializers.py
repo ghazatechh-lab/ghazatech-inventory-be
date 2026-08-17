@@ -1020,39 +1020,39 @@ class SalaryCertificateSerializer(serializers.ModelSerializer):
                     {field_name: ("Salary amount cannot be negative.")}
                 )
 
-        signatory = str(
-            attrs.get(
-                "authorized_signatory",
-                getattr(
-                    self.instance,
-                    "authorized_signatory",
-                    "",
-                ),
-            )
-            or ""
-        ).strip()
+        # signatory = str(
+        #     attrs.get(
+        #         "authorized_signatory",
+        #         getattr(
+        #             self.instance,
+        #             "authorized_signatory",
+        #             "",
+        #         ),
+        #     )
+        #     or ""
+        # ).strip()
 
-        signatory_designation = str(
-            attrs.get(
-                "signatory_designation",
-                getattr(
-                    self.instance,
-                    "signatory_designation",
-                    "",
-                ),
-            )
-            or ""
-        ).strip()
+        # signatory_designation = str(
+        #     attrs.get(
+        #         "signatory_designation",
+        #         getattr(
+        #             self.instance,
+        #             "signatory_designation",
+        #             "",
+        #         ),
+        #     )
+        #     or ""
+        # ).strip()
 
-        if not signatory:
-            raise serializers.ValidationError(
-                {"authorized_signatory": ("Authorized signatory is required.")}
-            )
+        # if not signatory:
+        #     raise serializers.ValidationError(
+        #         {"authorized_signatory": ("Authorized signatory is required.")}
+        #     )
 
-        if not signatory_designation:
-            raise serializers.ValidationError(
-                {"signatory_designation": ("Signatory designation is required.")}
-            )
+        # if not signatory_designation:
+        #     raise serializers.ValidationError(
+        #         {"signatory_designation": ("Signatory designation is required.")}
+        #     )
 
         return attrs
 
@@ -1187,31 +1187,31 @@ class EmployeeLetterSerializer(serializers.ModelSerializer):
             getattr(self.instance, "employee", None),
         )
 
-        signatory = str(
-            attrs.get(
-                "authorized_signatory",
-                getattr(self.instance, "authorized_signatory", ""),
-            )
-            or ""
-        ).strip()
+        # signatory = str(
+        #     attrs.get(
+        #         "authorized_signatory",
+        #         getattr(self.instance, "authorized_signatory", ""),
+        #     )
+        #     or ""
+        # ).strip()
 
-        signatory_designation = str(
-            attrs.get(
-                "signatory_designation",
-                getattr(self.instance, "signatory_designation", ""),
-            )
-            or ""
-        ).strip()
+        # signatory_designation = str(
+        #     attrs.get(
+        #         "signatory_designation",
+        #         getattr(self.instance, "signatory_designation", ""),
+        #     )
+        #     or ""
+        # ).strip()
 
-        if not signatory:
-            raise serializers.ValidationError(
-                {"authorized_signatory": "Authorized signatory is required."}
-            )
+        # if not signatory:
+        #     raise serializers.ValidationError(
+        #         {"authorized_signatory": "Authorized signatory is required."}
+        #     )
 
-        if not signatory_designation:
-            raise serializers.ValidationError(
-                {"signatory_designation": "Signatory designation is required."}
-            )
+        # if not signatory_designation:
+        #     raise serializers.ValidationError(
+        #         {"signatory_designation": "Signatory designation is required."}
+        #     )
 
         if letter_type == "WARNING":
             reason = str(

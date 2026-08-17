@@ -1072,8 +1072,8 @@ class EmployeeLetter(TimeStampedModel):
         default="During the employment period, the employee carried out assigned duties and responsibilities.",
     )
 
-    authorized_signatory = models.CharField(max_length=150)
-    signatory_designation = models.CharField(max_length=150)
+    authorized_signatory = models.CharField(max_length=150, blank=True, null=True)
+    signatory_designation = models.CharField(max_length=150, blank=True, null=True)
 
     notes = models.TextField(blank=True, default="")
 
