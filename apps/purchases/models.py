@@ -328,6 +328,7 @@ class SupplierPayment(TimeStampedModel, BranchAwareModel):
         ("CHEQUE", "Cheque"),
         ("CASH", "Cash"),
         ("CARD", "Card"),
+        ("ONLINE", "Online Payment"),
         ("OTHER", "Other"),
     ]
 

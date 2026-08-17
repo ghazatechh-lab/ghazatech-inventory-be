@@ -702,17 +702,176 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = PayrollEntry
         fields = "__all__"
+
         read_only_fields = [
             "payroll_run",
             "branch",
-            "basic_salary",
-            "allowances",
             "gross_salary",
             "advance_deduction",
             "net_salary",
             "balance_payable",
             "paid_at",
         ]
+
+    def validate(self, attrs):
+        instance = self.instance
+
+        basic_salary = Decimal(
+            str(
+                attrs.get(
+                    "basic_salary",
+                    getattr(instance, "basic_salary", 0),
+                )
+                or 0
+            )
+        )
+
+        allowances = Decimal(
+            str(
+                attrs.get(
+                    "allowances",
+                    getattr(instance, "allowances", 0),
+                )
+                or 0
+            )
+        )
+
+        deductions = Decimal(
+            str(
+                attrs.get(
+                    "deductions",
+                    getattr(instance, "deductions", 0),
+                )
+                or 0
+            )
+        )
+
+        if basic_salary < 0:
+            raise serializers.ValidationError(
+                {"basic_salary": "Basic salary cannot be negative."}
+            )
+
+        if allowances < 0:
+            raise serializers.ValidationError(
+                {"allowances": "Allowances cannot be negative."}
+            )
+
+        if deductions < 0:
+            raise serializers.ValidationError(
+                {"deductions": "Deductions cannot be negative."}
+            )
+
+        gross_salary = basic_salary + allowances
+
+        if deductions > gross_salary:
+            raise serializers.ValidationError(
+                {"deductions": "Deductions cannot exceed gross salary."}
+            )
+
+        return attrs
+
+    @transaction.atomic
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        basic_salary = Decimal(
+            str(
+                validated_data.get(
+                    "basic_salary",
+                    instance.basic_salary or 0,
+                )
+                or 0
+            )
+        )
+
+        allowances = Decimal(
+            str(
+                validated_data.get(
+                    "allowances",
+                    instance.allowances or 0,
+                )
+                or 0
+            )
+        )
+
+        deductions = Decimal(
+            str(
+                validated_data.get(
+                    "deductions",
+                    instance.deductions or 0,
+                )
+                or 0
+            )
+        )
+
+        advance_deduction = Decimal(str(instance.advance_deduction or 0))
+
+        gross_salary = basic_salary + allowances
+
+        net_salary = max(
+            Decimal("0.00"),
+            gross_salary - deductions - advance_deduction,
+        )
+
+        validated_data["gross_salary"] = gross_salary
+
+        validated_data["net_salary"] = net_salary
+
+        validated_data["balance_payable"] = (
+            Decimal("0.00")
+            if str(instance.status or "").upper() == "PAID"
+            else net_salary
+        )
+
+        payroll_entry = super().update(
+            instance,
+            validated_data,
+        )
+
+        payroll_run = payroll_entry.payroll_run
+
+        if payroll_run:
+            totals = payroll_run.entries.exclude(
+                status="CANCELLED",
+            ).aggregate(
+                gross=Sum("gross_salary"),
+                deductions=Sum("deductions"),
+                advance=Sum("advance_deduction"),
+                net=Sum("net_salary"),
+            )
+
+            payroll_run.total_gross = totals["gross"] or Decimal("0.00")
+
+            payroll_run.total_deductions = totals["deductions"] or Decimal("0.00")
+
+            if hasattr(
+                payroll_run,
+                "total_advance_deduction",
+            ):
+                payroll_run.total_advance_deduction = totals["advance"] or Decimal(
+                    "0.00"
+                )
+
+            payroll_run.total_net = totals["net"] or Decimal("0.00")
+
+            update_fields = [
+                "total_gross",
+                "total_deductions",
+                "total_net",
+                "updated_at",
+            ]
+
+            if hasattr(
+                payroll_run,
+                "total_advance_deduction",
+            ):
+                update_fields.append("total_advance_deduction")
+
+            payroll_run.save(update_fields=update_fields)
+
+        return payroll_entry
 
 
 class PayrollRunSerializer(serializers.ModelSerializer):

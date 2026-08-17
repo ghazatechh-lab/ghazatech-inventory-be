@@ -1973,11 +1973,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
                 errors["cash_register"] = "Cash register is required for cash payments."
             attrs["bank_account"] = None
 
-        elif payment_method in {
-            "BANK_TRANSFER",
-            "CHEQUE",
-            "CARD",
-        }:
+        elif payment_method in {"BANK_TRANSFER", "CHEQUE", "CARD", "ONLINE"}:
             if not bank_account:
                 errors["bank_account"] = (
                     "Bank account is required for this payment method."
