@@ -676,6 +676,155 @@ class SalaryAdvanceSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+class EmployeeLoanRepaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeLoanRepayment
+        fields = "__all__"
+        read_only_fields = [
+            "loan",
+            "payroll_entry",
+            "employee",
+            "period",
+            "amount",
+        ]
+
+
+class EmployeeLoanSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(
+        source="employee.full_name",
+        read_only=True,
+    )
+    employee_code = serializers.CharField(
+        source="employee.employee_code",
+        read_only=True,
+    )
+    branch_name = serializers.CharField(
+        source="branch.branch_name",
+        read_only=True,
+        allow_null=True,
+    )
+    repayments = EmployeeLoanRepaymentSerializer(
+        many=True,
+        read_only=True,
+    )
+    paid_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EmployeeLoan
+        fields = "__all__"
+        read_only_fields = [
+            "branch",
+            "remaining_balance",
+            "status",
+            "created_by",
+        ]
+
+    def get_paid_amount(self, obj):
+        amount = Decimal(obj.amount or 0)
+        remaining = Decimal(obj.remaining_balance or 0)
+
+        return max(
+            Decimal("0.00"),
+            amount - remaining,
+        )
+
+    def validate(self, attrs):
+        amount = Decimal(
+            str(
+                attrs.get(
+                    "amount",
+                    getattr(
+                        self.instance,
+                        "amount",
+                        0,
+                    ),
+                )
+                or 0
+            )
+        )
+
+        monthly_installment = Decimal(
+            str(
+                attrs.get(
+                    "monthly_installment",
+                    getattr(
+                        self.instance,
+                        "monthly_installment",
+                        0,
+                    ),
+                )
+                or 0
+            )
+        )
+
+        start_period = attrs.get(
+            "start_period",
+            getattr(
+                self.instance,
+                "start_period",
+                "",
+            ),
+        )
+
+        if amount <= 0:
+            raise serializers.ValidationError(
+                {"amount": ("Loan amount must be greater than zero.")}
+            )
+
+        if monthly_installment <= 0:
+            raise serializers.ValidationError(
+                {
+                    "monthly_installment": (
+                        "Monthly installment must be greater than zero."
+                    )
+                }
+            )
+
+        if not self.instance and monthly_installment > amount:
+            raise serializers.ValidationError(
+                {
+                    "monthly_installment": (
+                        "Monthly installment cannot exceed " "the loan amount."
+                    )
+                }
+            )
+
+        try:
+            year_text, month_text = str(start_period).split("-")
+
+            year = int(year_text)
+            month = int(month_text)
+
+            if year < 2000:
+                raise ValueError
+
+            if month < 1 or month > 12:
+                raise ValueError
+
+        except (TypeError, ValueError):
+            raise serializers.ValidationError(
+                {"start_period": ("Start period must use YYYY-MM format.")}
+            )
+
+        return attrs
+
+    def create(self, validated_data):
+        employee = validated_data["employee"]
+
+        request = self.context.get("request")
+
+        validated_data["branch"] = employee.branch
+
+        validated_data["remaining_balance"] = validated_data["amount"]
+
+        validated_data["status"] = "ACTIVE"
+
+        if request and request.user and request.user.is_authenticated:
+            validated_data["created_by"] = request.user
+
+        return super().create(validated_data)
+
+
 class PayrollEntrySerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(
         source="employee.full_name",

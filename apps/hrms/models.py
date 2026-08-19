@@ -785,6 +785,125 @@ class PayrollRun(TimeStampedModel):
         return f"Payroll {self.period or ''}".strip()
 
 
+class EmployeeLoan(TimeStampedModel):
+    STATUS_CHOICES = [
+        ("ACTIVE", "Active"),
+        ("COMPLETED", "Completed"),
+        ("CANCELLED", "Cancelled"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name="employee_loans",
+    )
+    branch = models.ForeignKey(
+        "branches.Branch",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="employee_loans",
+    )
+    loan_date = models.DateField()
+    start_period = models.CharField(
+        max_length=7,
+        help_text="First deduction month in YYYY-MM format.",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+    monthly_installment = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+    remaining_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+    reference_number = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+    reason = models.TextField(
+        blank=True,
+        default="",
+    )
+    notes = models.TextField(
+        blank=True,
+        default="",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="ACTIVE",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_employee_loans",
+    )
+
+    class Meta:
+        ordering = ["-loan_date", "-id"]
+
+    def save(self, *args, **kwargs):
+        if not self.branch_id and self.employee_id:
+            self.branch_id = self.employee.branch_id
+
+        if self._state.adding and not self.remaining_balance:
+            self.remaining_balance = self.amount
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.employee.full_name} - " f"{self.amount} - {self.status}"
+
+
+class EmployeeLoanRepayment(TimeStampedModel):
+    loan = models.ForeignKey(
+        EmployeeLoan,
+        on_delete=models.PROTECT,
+        related_name="repayments",
+    )
+    payroll_entry = models.ForeignKey(
+        "PayrollEntry",
+        on_delete=models.PROTECT,
+        related_name="loan_repayments",
+    )
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.PROTECT,
+        related_name="loan_repayments",
+    )
+    period = models.CharField(
+        max_length=7,
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    class Meta:
+        ordering = ["-period", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "loan",
+                    "payroll_entry",
+                ],
+                name="unique_loan_payroll_repayment",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.employee.full_name} - " f"{self.period} - {self.amount}"
+
+
 class PayrollEntry(TimeStampedModel):
     STATUS_CHOICES = [
         ("PENDING", "Pending"),
@@ -825,6 +944,7 @@ class PayrollEntry(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="payroll_entries",
     )
+
     period = models.CharField(max_length=7, null=True, blank=True)
     payroll_date = models.DateField(null=True, blank=True)
     salary_type = models.CharField(
@@ -863,6 +983,11 @@ class PayrollEntry(TimeStampedModel):
         default=0,
     )
     advance_deduction = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+    loan_deduction = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=0,

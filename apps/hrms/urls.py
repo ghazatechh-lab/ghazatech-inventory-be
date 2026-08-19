@@ -39,6 +39,12 @@ else:
     )
 
 router.register(
+    "employee-loans",
+    EmployeeLoanViewSet,
+    basename="employee-loan",
+)
+
+router.register(
     "document-expiry",
     DocumentExpiryViewSet,
     basename="document-expiry",

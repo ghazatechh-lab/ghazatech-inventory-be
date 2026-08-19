@@ -674,6 +674,87 @@ class PayrollRunViewSet(BaseViewSet):
         )
 
     @staticmethod
+    def _maximum_payroll_period():
+        """
+        Latest allowed payroll period is next calendar month.
+
+        Previous months, current month, and next month are allowed.
+        Anything beyond next month is rejected.
+        """
+        today_date = timezone.localdate()
+
+        if today_date.month == 12:
+            return date(
+                today_date.year + 1,
+                1,
+                1,
+            )
+
+        return date(
+            today_date.year,
+            today_date.month + 1,
+            1,
+        )
+
+    @classmethod
+    def _validated_period_dates(
+        cls,
+        period,
+    ):
+        try:
+            month_start, month_end = cls._period_dates(period)
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+        ):
+            raise serializers.ValidationError(
+                {"period": ("Period must use YYYY-MM format.")}
+            )
+
+        if month_start > cls._maximum_payroll_period():
+            raise serializers.ValidationError(
+                {
+                    "period": (
+                        "Future payroll can only be created "
+                        "for the next calendar month."
+                    )
+                }
+            )
+
+        return (
+            month_start,
+            month_end,
+        )
+
+    @staticmethod
+    def _validate_employee_joining_date(
+        employee,
+        month_end,
+    ):
+        if not employee.joining_date:
+            raise serializers.ValidationError(
+                {
+                    "employee_ids": (
+                        f"{employee.full_name} does not have "
+                        "a joining date. Update the employee "
+                        "record before generating payroll."
+                    )
+                }
+            )
+
+        if employee.joining_date > month_end:
+            raise serializers.ValidationError(
+                {
+                    "employee_ids": (
+                        f"Payroll cannot be generated for "
+                        f"{employee.full_name} before joining "
+                        f"date {employee.joining_date}."
+                    )
+                }
+            )
+
+    @staticmethod
     def _approved_unpaid_leave_days(
         employee,
         month_start,
@@ -706,6 +787,79 @@ class PayrollRunViewSet(BaseViewSet):
 
         return total
 
+    @staticmethod
+    def _employee_loan_deduction(
+        employee,
+        period,
+        available_salary,
+    ):
+        """
+        Calculate loan installment(s) applicable to the payroll period.
+
+        This ONLY calculates the deduction.
+        It does NOT reduce EmployeeLoan.remaining_balance.
+
+        The actual loan settlement continues to happen when payroll
+        is marked PAID through PayrollEntryViewSet.
+        """
+
+        available_salary = max(
+            Decimal("0.00"),
+            Decimal(str(available_salary or 0)),
+        ).quantize(
+            MONEY,
+            rounding=ROUND_HALF_UP,
+        )
+
+        if available_salary <= 0:
+            return Decimal("0.00")
+
+        total_deduction = Decimal("0.00")
+
+        loans = EmployeeLoan.objects.filter(
+            employee=employee,
+            status="ACTIVE",
+            start_period__lte=period,
+            remaining_balance__gt=0,
+        ).order_by(
+            "loan_date",
+            "id",
+        )
+
+        for loan in loans:
+            if available_salary <= 0:
+                break
+
+            monthly_installment = Decimal(str(loan.monthly_installment or 0)).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            remaining_balance = Decimal(str(loan.remaining_balance or 0)).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            installment = min(
+                monthly_installment,
+                remaining_balance,
+                available_salary,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            if installment <= 0:
+                continue
+
+            total_deduction += installment
+            available_salary -= installment
+
+        return total_deduction.quantize(
+            MONEY,
+            rounding=ROUND_HALF_UP,
+        )
+
     @action(
         detail=False,
         methods=["get"],
@@ -726,13 +880,10 @@ class PayrollRunViewSet(BaseViewSet):
             )
 
         try:
-            month_start, month_end = self._period_dates(period)
-        except (
-            TypeError,
-            ValueError,
-        ):
+            month_start, month_end = self._validated_period_dates(period)
+        except serializers.ValidationError as exc:
             return Response(
-                {"period": ("Period must use YYYY-MM format.")},
+                exc.detail,
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -827,11 +978,36 @@ class PayrollRunViewSet(BaseViewSet):
                 gross_salary * suggested_payable_days / total_period_days
                 if total_period_days
                 else Decimal("0")
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            estimated_advance_deduction = min(
+                pending_advance + legacy_advance,
+                estimated_gross,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            salary_after_advance = max(
+                Decimal("0.00"),
+                estimated_gross - estimated_advance_deduction,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            loan_deduction = self._employee_loan_deduction(
+                employee=employee,
+                period=period,
+                available_salary=salary_after_advance,
             )
 
             estimated_balance = max(
-                Decimal("0"),
-                estimated_gross - pending_advance - legacy_advance,
+                Decimal("0.00"),
+                estimated_gross - estimated_advance_deduction - loan_deduction,
             ).quantize(
                 MONEY,
                 rounding=ROUND_HALF_UP,
@@ -840,21 +1016,23 @@ class PayrollRunViewSet(BaseViewSet):
             response.append(
                 {
                     "id": employee.id,
-                    "employee_code": (employee.employee_code),
-                    "full_name": (employee.full_name),
+                    "employee_code": employee.employee_code,
+                    "full_name": employee.full_name,
                     "branch_name": (
                         employee.branch.branch_name if employee.branch else ""
                     ),
-                    "joining_date": (employee.joining_date),
-                    "basic_salary": (employee.basic_salary),
-                    "allowances": (employee.allowances),
-                    "gross_salary": (gross_salary),
-                    "total_period_days": (total_period_days),
-                    "employment_days": (employment_days),
-                    "unpaid_leave_days": (unpaid_leave_days),
-                    "suggested_payable_days": (suggested_payable_days),
+                    "joining_date": employee.joining_date,
+                    "basic_salary": employee.basic_salary,
+                    "allowances": employee.allowances,
+                    "gross_salary": gross_salary,
+                    "total_period_days": total_period_days,
+                    "employment_days": employment_days,
+                    "unpaid_leave_days": unpaid_leave_days,
+                    "suggested_payable_days": suggested_payable_days,
                     "advance_received": (pending_advance + legacy_advance),
-                    "estimated_balance": (estimated_balance),
+                    "loan_deduction": loan_deduction,
+                    "loan_deduction_preview": loan_deduction,
+                    "estimated_balance": estimated_balance,
                     "already_generated": (employee.id in generated_ids),
                 }
             )
@@ -866,6 +1044,115 @@ class PayrollRunViewSet(BaseViewSet):
                 "data": response,
             }
         )
+
+    @staticmethod
+    def _settle_employee_loan_deduction(
+        entry,
+    ):
+        """
+        Apply PayrollEntry.loan_deduction to active loans only when
+        the payroll entry is PAID.
+
+        EmployeeLoanRepayment prevents duplicate recovery for the
+        same loan/payroll entry combination.
+        """
+        amount_to_settle = Decimal(str(entry.loan_deduction or 0)).quantize(
+            MONEY,
+            rounding=ROUND_HALF_UP,
+        )
+
+        if amount_to_settle <= 0:
+            return
+
+        already_settled = EmployeeLoanRepayment.objects.filter(
+            payroll_entry=entry,
+        ).aggregate(total=Sum("amount"),)["total"] or Decimal("0.00")
+
+        amount_to_settle = max(
+            Decimal("0.00"),
+            amount_to_settle - Decimal(str(already_settled or 0)),
+        ).quantize(
+            MONEY,
+            rounding=ROUND_HALF_UP,
+        )
+
+        if amount_to_settle <= 0:
+            return
+
+        loans = (
+            EmployeeLoan.objects.select_for_update()
+            .filter(
+                employee=entry.employee,
+                status="ACTIVE",
+                start_period__lte=entry.period,
+                remaining_balance__gt=0,
+            )
+            .order_by(
+                "loan_date",
+                "id",
+            )
+        )
+
+        for loan in loans:
+            if amount_to_settle <= 0:
+                break
+
+            if EmployeeLoanRepayment.objects.filter(
+                loan=loan,
+                payroll_entry=entry,
+            ).exists():
+                continue
+
+            current_balance = Decimal(str(loan.remaining_balance or 0)).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            repayment_amount = min(
+                current_balance,
+                amount_to_settle,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            if repayment_amount <= 0:
+                continue
+
+            EmployeeLoanRepayment.objects.create(
+                loan=loan,
+                payroll_entry=entry,
+                employee=entry.employee,
+                period=entry.period,
+                amount=repayment_amount,
+            )
+
+            loan.remaining_balance = max(
+                Decimal("0.00"),
+                current_balance - repayment_amount,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            if loan.remaining_balance <= 0:
+                loan.status = "COMPLETED"
+
+            loan.save(
+                update_fields=[
+                    "remaining_balance",
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+            amount_to_settle = max(
+                Decimal("0.00"),
+                amount_to_settle - repayment_amount,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
 
     @action(
         detail=False,
@@ -927,13 +1214,10 @@ class PayrollRunViewSet(BaseViewSet):
             )
 
         try:
-            month_start, month_end = self._period_dates(period)
-        except (
-            TypeError,
-            ValueError,
-        ):
+            month_start, month_end = self._validated_period_dates(period)
+        except serializers.ValidationError as exc:
             return Response(
-                {"period": ("Period must use YYYY-MM format.")},
+                exc.detail,
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -949,6 +1233,29 @@ class PayrollRunViewSet(BaseViewSet):
 
         if branch_id:
             employees = employees.filter(branch_id=branch_id)
+
+        requested_employee_ids = {int(employee_id) for employee_id in employee_ids}
+
+        selected_employee_ids = set(
+            employees.values_list(
+                "id",
+                flat=True,
+            )
+        )
+
+        missing_employee_ids = requested_employee_ids - selected_employee_ids
+
+        if missing_employee_ids:
+            return Response(
+                {
+                    "employee_ids": (
+                        "One or more selected employees are "
+                        "not eligible for the selected payroll "
+                        "period or branch."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if not employees.exists():
             return Response(
@@ -980,6 +1287,17 @@ class PayrollRunViewSet(BaseViewSet):
         advance_rows_to_update = []
 
         for employee in employees:
+            try:
+                self._validate_employee_joining_date(
+                    employee,
+                    month_end,
+                )
+            except serializers.ValidationError as exc:
+                return Response(
+                    exc.detail,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             if PayrollEntry.objects.filter(
                 employee=employee,
                 period=period,
@@ -1109,9 +1427,23 @@ class PayrollRunViewSet(BaseViewSet):
                 rounding=ROUND_HALF_UP,
             )
 
-            net_salary = max(
-                Decimal("0"),
+            available_for_loan = max(
+                Decimal("0.00"),
                 gross_salary - regular_deductions - advance_deduction,
+            ).quantize(
+                MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+            loan_deduction = self._employee_loan_deduction(
+                employee=employee,
+                period=period,
+                available_salary=available_for_loan,
+            )
+
+            net_salary = max(
+                Decimal("0.00"),
+                gross_salary - regular_deductions - advance_deduction - loan_deduction,
             ).quantize(
                 MONEY,
                 rounding=ROUND_HALF_UP,
@@ -1132,6 +1464,7 @@ class PayrollRunViewSet(BaseViewSet):
                 gross_salary=gross_salary,
                 deductions=(regular_deductions),
                 advance_deduction=(advance_deduction),
+                loan_deduction=(loan_deduction),
                 net_salary=net_salary,
                 balance_payable=net_salary,
                 status=requested_status,
@@ -1145,6 +1478,9 @@ class PayrollRunViewSet(BaseViewSet):
             )
 
             created_entries.append(entry)
+
+            if requested_status == "PAID":
+                self._settle_employee_loan_deduction(entry)
 
             remaining_to_apply = advance_deduction
 
@@ -1278,6 +1614,7 @@ class PayrollRunViewSet(BaseViewSet):
             gross=Sum("gross_salary"),
             deductions=Sum("deductions"),
             advance_deductions=Sum("advance_deduction"),
+            loan_deductions=Sum("loan_deduction"),
             net=Sum("net_salary"),
         )
 
@@ -1310,6 +1647,7 @@ class PayrollRunViewSet(BaseViewSet):
                     "total_deductions": (totals["deductions"] or 0),
                     "total_advances": (total_advances),
                     "total_advance_deductions": (totals["advance_deductions"] or 0),
+                    "total_loan_deductions": (totals["loan_deductions"] or 0),
                     "total_net": (totals["net"] or 0),
                 },
             }
@@ -1363,6 +1701,7 @@ class PayrollRunViewSet(BaseViewSet):
                 "Gross Salary",
                 "Deductions",
                 "Advance Deduction",
+                "Loan Deduction",
                 "Net Salary",
                 "Paid By",
                 "Method",
@@ -1384,6 +1723,7 @@ class PayrollRunViewSet(BaseViewSet):
                     entry.gross_salary,
                     entry.deductions,
                     entry.advance_deduction,
+                    entry.loan_deduction,
                     entry.net_salary,
                     entry.paid_by,
                     entry.salary_calculation_method,
@@ -1392,6 +1732,145 @@ class PayrollRunViewSet(BaseViewSet):
             )
 
         return response
+
+
+class EmployeeLoanViewSet(BaseViewSet):
+    queryset = EmployeeLoan.objects.select_related(
+        "employee",
+        "branch",
+        "created_by",
+    ).prefetch_related(
+        "repayments",
+    )
+
+    serializer_class = EmployeeLoanSerializer
+
+    filterset_fields = [
+        "employee",
+        "branch",
+        "status",
+        "start_period",
+        "loan_date",
+    ]
+
+    search_fields = [
+        "employee__first_name",
+        "employee__last_name",
+        "employee__employee_code",
+        "reference_number",
+        "reason",
+    ]
+
+    ordering_fields = [
+        "loan_date",
+        "amount",
+        "monthly_installment",
+        "remaining_balance",
+        "created_at",
+    ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        branch_id = self.request.query_params.get("branch")
+
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+
+        return queryset
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="form-options",
+    )
+    def form_options(self, request):
+        branch_id = request.query_params.get("branch")
+
+        employees = Employee.objects.filter(
+            is_active=True,
+            employment_status__in=[
+                "ACTIVE",
+                "ON_LEAVE",
+                "PROBATION",
+            ],
+        ).select_related("branch")
+
+        if branch_id:
+            employees = employees.filter(branch_id=branch_id)
+
+        employee_rows = []
+
+        for employee in employees.order_by(
+            "first_name",
+            "last_name",
+        ):
+            employee_rows.append(
+                {
+                    "id": employee.id,
+                    "employee_code": employee.employee_code,
+                    "full_name": employee.full_name,
+                    "branch": employee.branch_id,
+                    "branch_name": (
+                        employee.branch.branch_name if employee.branch else ""
+                    ),
+                    "basic_salary": employee.basic_salary,
+                    "allowances": employee.allowances,
+                }
+            )
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Employee loan form options loaded."),
+                "data": {
+                    "employees": employee_rows,
+                },
+            }
+        )
+
+    @transaction.atomic
+    @action(
+        detail=True,
+        methods=["post"],
+    )
+    def cancel(self, request, pk=None):
+        loan = self.get_object()
+
+        if loan.status == "COMPLETED":
+            return Response(
+                {
+                    "success": False,
+                    "message": ("A completed loan cannot be cancelled."),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if loan.status == "CANCELLED":
+            return Response(
+                {
+                    "success": False,
+                    "message": ("This loan is already cancelled."),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        loan.status = "CANCELLED"
+
+        loan.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": ("Employee loan cancelled successfully."),
+                "data": self.get_serializer(loan).data,
+            }
+        )
 
 
 class PayrollEntryViewSet(BaseViewSet):
@@ -1432,6 +1911,215 @@ class PayrollEntryViewSet(BaseViewSet):
             queryset = queryset.filter(branch_id=branch)
 
         return queryset
+
+    def _calculate_employee_loan_deduction(self, entry):
+        """
+        Calculate the loan installment that should be deducted from this
+        payroll entry.
+
+        This does not change any EmployeeLoan balance. It only calculates
+        the deduction from ACTIVE loans that are eligible for this period.
+        """
+        gross_salary = Decimal(str(entry.gross_salary or 0)).quantize(MONEY)
+
+        regular_deductions = Decimal(str(entry.deductions or 0)).quantize(MONEY)
+
+        advance_deduction = Decimal(str(entry.advance_deduction or 0)).quantize(MONEY)
+
+        available_salary = max(
+            Decimal("0.00"),
+            gross_salary - regular_deductions - advance_deduction,
+        ).quantize(MONEY)
+
+        if available_salary <= 0:
+            return Decimal("0.00")
+
+        total_deduction = Decimal("0.00")
+
+        loans = (
+            EmployeeLoan.objects.select_for_update()
+            .filter(
+                employee=entry.employee,
+                status="ACTIVE",
+                start_period__lte=entry.period,
+                remaining_balance__gt=0,
+            )
+            .order_by(
+                "loan_date",
+                "id",
+            )
+        )
+
+        for loan in loans:
+            if available_salary <= 0:
+                break
+
+            monthly_installment = Decimal(str(loan.monthly_installment or 0)).quantize(
+                MONEY
+            )
+
+            remaining_balance = Decimal(str(loan.remaining_balance or 0)).quantize(
+                MONEY
+            )
+
+            installment = min(
+                monthly_installment,
+                remaining_balance,
+                available_salary,
+            ).quantize(MONEY)
+
+            if installment <= 0:
+                continue
+
+            total_deduction += installment
+            available_salary -= installment
+
+        return total_deduction.quantize(MONEY)
+
+    def _ensure_employee_loan_deduction(self, entry):
+        """
+        Make sure PayrollEntry.loan_deduction and net salary reflect the
+        employee's active loan before salary is marked PAID.
+
+        This is mainly a safety net for payroll entries that were generated
+        before loan-deduction support was added.
+        """
+        calculated_loan_deduction = self._calculate_employee_loan_deduction(entry)
+
+        current_loan_deduction = Decimal(str(entry.loan_deduction or 0)).quantize(MONEY)
+
+        if current_loan_deduction == calculated_loan_deduction:
+            return
+
+        entry.loan_deduction = calculated_loan_deduction
+
+        gross_salary = Decimal(str(entry.gross_salary or 0)).quantize(MONEY)
+
+        regular_deductions = Decimal(str(entry.deductions or 0)).quantize(MONEY)
+
+        advance_deduction = Decimal(str(entry.advance_deduction or 0)).quantize(MONEY)
+
+        entry.net_salary = max(
+            Decimal("0.00"),
+            gross_salary
+            - regular_deductions
+            - advance_deduction
+            - calculated_loan_deduction,
+        ).quantize(MONEY)
+
+        if str(entry.status or "").upper() != "PAID":
+            entry.balance_payable = entry.net_salary
+
+        entry.save(
+            update_fields=[
+                "loan_deduction",
+                "net_salary",
+                "balance_payable",
+                "updated_at",
+            ]
+        )
+
+    def _settle_employee_loans(self, entry):
+        """
+        Apply the loan deduction stored on this payroll entry to the
+        employee's active loans.
+
+        This method is idempotent:
+        EmployeeLoanRepayment has a unique constraint for
+        (loan, payroll_entry), so calling this method again will not
+        deduct the same repayment twice.
+        """
+        planned_deduction = Decimal(entry.loan_deduction or 0).quantize(MONEY)
+
+        if planned_deduction <= 0:
+            return
+
+        already_settled = EmployeeLoanRepayment.objects.filter(
+            payroll_entry=entry
+        ).aggregate(total=Sum("amount")).get("total") or Decimal("0.00")
+
+        amount_to_settle = max(
+            Decimal("0.00"),
+            planned_deduction - Decimal(already_settled),
+        ).quantize(MONEY)
+
+        if amount_to_settle <= 0:
+            return
+
+        loans = (
+            EmployeeLoan.objects.select_for_update()
+            .filter(
+                employee=entry.employee,
+                status="ACTIVE",
+                start_period__lte=entry.period,
+                remaining_balance__gt=0,
+            )
+            .order_by(
+                "loan_date",
+                "id",
+            )
+        )
+
+        for loan in loans:
+            if amount_to_settle <= 0:
+                break
+
+            existing_repayment = EmployeeLoanRepayment.objects.filter(
+                loan=loan,
+                payroll_entry=entry,
+            ).exists()
+
+            if existing_repayment:
+                continue
+
+            loan_balance = Decimal(loan.remaining_balance or 0).quantize(MONEY)
+
+            if loan_balance <= 0:
+                loan.status = "COMPLETED"
+                loan.save(
+                    update_fields=[
+                        "status",
+                        "updated_at",
+                    ]
+                )
+                continue
+
+            repayment_amount = min(
+                amount_to_settle,
+                loan_balance,
+            ).quantize(MONEY)
+
+            if repayment_amount <= 0:
+                continue
+
+            EmployeeLoanRepayment.objects.create(
+                loan=loan,
+                payroll_entry=entry,
+                employee=entry.employee,
+                period=entry.period,
+                amount=repayment_amount,
+            )
+
+            loan.remaining_balance = max(
+                Decimal("0.00"),
+                loan_balance - repayment_amount,
+            ).quantize(MONEY)
+
+            if loan.remaining_balance <= 0:
+                loan.status = "COMPLETED"
+
+            loan.save(
+                update_fields=[
+                    "remaining_balance",
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+            amount_to_settle = max(
+                Decimal("0.00"),
+                amount_to_settle - repayment_amount,
+            ).quantize(MONEY)
 
     @action(
         detail=False,
@@ -1502,7 +2190,9 @@ class PayrollEntryViewSet(BaseViewSet):
         request,
         pk=None,
     ):
-        entry = PayrollEntry.objects.select_for_update().get(pk=self.get_object().pk)
+        entry_id = self.get_object().pk
+
+        entry = PayrollEntry.objects.select_for_update().get(pk=entry_id)
 
         requested_status = str(request.data.get("status") or "").strip().upper()
 
@@ -1582,6 +2272,8 @@ class PayrollEntryViewSet(BaseViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            self._ensure_employee_loan_deduction(entry)
+
             entry.paid_by = paid_by
             entry.paid_at = timezone.now()
 
@@ -1604,6 +2296,9 @@ class PayrollEntryViewSet(BaseViewSet):
             )
 
         entry.save(update_fields=update_fields)
+
+        if requested_status == "PAID" and current_status != "PAID":
+            self._settle_employee_loans(entry)
 
         payroll_run = entry.payroll_run
 
@@ -1678,11 +2373,9 @@ class PayrollEntryViewSet(BaseViewSet):
         request,
         pk=None,
     ):
-        entry = (
-            PayrollEntry.objects.select_for_update()
-            .select_related("payroll_run")
-            .get(pk=self.get_object().pk)
-        )
+        entry_id = self.get_object().pk
+
+        entry = PayrollEntry.objects.select_for_update().get(pk=entry_id)
 
         current_status = str(entry.status or "").upper()
 
@@ -1709,6 +2402,8 @@ class PayrollEntryViewSet(BaseViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        self._ensure_employee_loan_deduction(entry)
+
         entry.paid_by = paid_by
         entry.status = "PAID"
         entry.paid_at = timezone.now()
@@ -1721,6 +2416,8 @@ class PayrollEntryViewSet(BaseViewSet):
                 "updated_at",
             ]
         )
+
+        self._settle_employee_loans(entry)
 
         payroll_run = entry.payroll_run
 
