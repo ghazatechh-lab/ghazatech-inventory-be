@@ -830,19 +830,23 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         source="employee.full_name",
         read_only=True,
     )
+
     employee_code = serializers.CharField(
         source="employee.employee_code",
         read_only=True,
     )
+
     branch_name = serializers.CharField(
         source="branch.branch_name",
         read_only=True,
         allow_null=True,
     )
+
     status_display = serializers.CharField(
         source="get_status_display",
         read_only=True,
     )
+
     paid_by_name = serializers.CharField(
         source="paid_by",
         read_only=True,
@@ -857,6 +861,7 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
             "branch",
             "gross_salary",
             "advance_deduction",
+            "loan_deduction",
             "net_salary",
             "balance_payable",
             "paid_at",
@@ -869,7 +874,11 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
             str(
                 attrs.get(
                     "basic_salary",
-                    getattr(instance, "basic_salary", 0),
+                    getattr(
+                        instance,
+                        "basic_salary",
+                        0,
+                    ),
                 )
                 or 0
             )
@@ -879,7 +888,11 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
             str(
                 attrs.get(
                     "allowances",
-                    getattr(instance, "allowances", 0),
+                    getattr(
+                        instance,
+                        "allowances",
+                        0,
+                    ),
                 )
                 or 0
             )
@@ -889,7 +902,11 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
             str(
                 attrs.get(
                     "deductions",
-                    getattr(instance, "deductions", 0),
+                    getattr(
+                        instance,
+                        "deductions",
+                        0,
+                    ),
                 )
                 or 0
             )
@@ -897,24 +914,24 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
 
         if basic_salary < 0:
             raise serializers.ValidationError(
-                {"basic_salary": "Basic salary cannot be negative."}
+                {"basic_salary": ("Basic salary cannot be negative.")}
             )
 
         if allowances < 0:
             raise serializers.ValidationError(
-                {"allowances": "Allowances cannot be negative."}
+                {"allowances": ("Allowances cannot be negative.")}
             )
 
         if deductions < 0:
             raise serializers.ValidationError(
-                {"deductions": "Deductions cannot be negative."}
+                {"deductions": ("Deductions cannot be negative.")}
             )
 
         gross_salary = basic_salary + allowances
 
         if deductions > gross_salary:
             raise serializers.ValidationError(
-                {"deductions": "Deductions cannot exceed gross salary."}
+                {"deductions": ("Deductions cannot exceed gross salary.")}
             )
 
         return attrs
@@ -925,6 +942,11 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         instance,
         validated_data,
     ):
+        validated_data.pop(
+            "payroll_run",
+            None,
+        )
+
         basic_salary = Decimal(
             str(
                 validated_data.get(
@@ -957,22 +979,35 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
 
         advance_deduction = Decimal(str(instance.advance_deduction or 0))
 
+        loan_deduction = Decimal(
+            str(
+                getattr(
+                    instance,
+                    "loan_deduction",
+                    0,
+                )
+                or 0
+            )
+        )
+
         gross_salary = basic_salary + allowances
 
         net_salary = max(
             Decimal("0.00"),
-            gross_salary - deductions - advance_deduction,
+            gross_salary - deductions - advance_deduction - loan_deduction,
         )
 
         validated_data["gross_salary"] = gross_salary
 
         validated_data["net_salary"] = net_salary
 
-        validated_data["balance_payable"] = (
-            Decimal("0.00")
-            if str(instance.status or "").upper() == "PAID"
-            else net_salary
-        )
+        # A PAID salary remains fully settled even
+        # after correcting its salary calculation.
+        if str(instance.status or "").upper() == "PAID":
+            validated_data["balance_payable"] = Decimal("0.00")
+
+        else:
+            validated_data["balance_payable"] = net_salary
 
         payroll_entry = super().update(
             instance,
@@ -988,6 +1023,7 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
                 gross=Sum("gross_salary"),
                 deductions=Sum("deductions"),
                 advance=Sum("advance_deduction"),
+                loan=Sum("loan_deduction"),
                 net=Sum("net_salary"),
             )
 
@@ -1003,6 +1039,12 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
                     "0.00"
                 )
 
+            if hasattr(
+                payroll_run,
+                "total_loan_deduction",
+            ):
+                payroll_run.total_loan_deduction = totals["loan"] or Decimal("0.00")
+
             payroll_run.total_net = totals["net"] or Decimal("0.00")
 
             update_fields = [
@@ -1017,6 +1059,12 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
                 "total_advance_deduction",
             ):
                 update_fields.append("total_advance_deduction")
+
+            if hasattr(
+                payroll_run,
+                "total_loan_deduction",
+            ):
+                update_fields.append("total_loan_deduction")
 
             payroll_run.save(update_fields=update_fields)
 

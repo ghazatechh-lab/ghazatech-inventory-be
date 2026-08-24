@@ -284,6 +284,10 @@ class SalesInvoice(DocumentBase):
         ("ORDER", "Sales Order"),
         ("STANDALONE", "Standalone"),
         ("POS", "POS"),
+        (
+            "HISTORICAL",
+            "Previous / Historical Invoice",
+        ),
     ]
 
     PAYMENT_STATUS_CHOICES = [
@@ -296,9 +300,16 @@ class SalesInvoice(DocumentBase):
 
     DELIVERY_STATUS_CHOICES = [
         ("PENDING", "Pending"),
-        ("PARTIALLY_DELIVERED", "Partially Delivered"),
+        (
+            "PARTIALLY_DELIVERED",
+            "Partially Delivered",
+        ),
         ("DELIVERED", "Delivered"),
         ("CANCELLED", "Cancelled"),
+        (
+            "NOT_APPLICABLE",
+            "Not Applicable",
+        ),
     ]
 
     invoice_number = models.CharField(
@@ -346,6 +357,31 @@ class SalesInvoice(DocumentBase):
         default="STANDALONE",
     )
 
+    # --------------------------------------------------
+    # Previous / Historical Invoice
+    # --------------------------------------------------
+
+    is_historical = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text=(
+            "Historical invoices affect accounting only "
+            "and must not change stock, delivery, or "
+            "Sales Order fulfilment."
+        ),
+    )
+
+    historical_reference = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        help_text=("Original invoice number or reference " "from the previous system."),
+    )
+
+    # --------------------------------------------------
+    # Payment
+    # --------------------------------------------------
+
     paid_amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -370,6 +406,10 @@ class SalesInvoice(DocumentBase):
         default="UNPAID",
     )
 
+    # --------------------------------------------------
+    # Delivery
+    # --------------------------------------------------
+
     delivery_status = models.CharField(
         max_length=30,
         choices=DELIVERY_STATUS_CHOICES,
@@ -377,6 +417,10 @@ class SalesInvoice(DocumentBase):
         blank=True,
         default="PENDING",
     )
+
+    # --------------------------------------------------
+    # Bank / Payment Instructions
+    # --------------------------------------------------
 
     bank_account = models.ForeignKey(
         "finance.BankAccount",
@@ -388,6 +432,10 @@ class SalesInvoice(DocumentBase):
     send_payment_reminders = models.BooleanField(
         default=False,
     )
+
+    # --------------------------------------------------
+    # Dates
+    # --------------------------------------------------
 
     issued_at = models.DateTimeField(
         null=True,
@@ -415,8 +463,22 @@ class SalesInvoice(DocumentBase):
             "-id",
         ]
 
+        indexes = [
+            models.Index(
+                fields=[
+                    "is_historical",
+                    "invoice_date",
+                ],
+                name="sales_inv_hist_date_idx",
+            ),
+        ]
+
     def __str__(self):
         return self.invoice_number
+
+    @property
+    def is_previous_invoice(self):
+        return bool(self.is_historical or self.sale_type == "HISTORICAL")
 
 
 class SalesLineBase(models.Model):

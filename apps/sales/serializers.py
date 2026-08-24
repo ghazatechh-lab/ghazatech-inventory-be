@@ -1035,7 +1035,6 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             "subtotal",
             "vat_amount",
             "total_amount",
-            "paid_amount",
             "balance_due",
             "payment_status",
             "issued_at",
@@ -1102,9 +1101,10 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
-        # ---------------------------------------------
-        # Prevent editing fully-paid / void invoices
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # Existing paid / void protection
+        # --------------------------------------------------
+
         if self.instance:
             current_payment_status = str(self.instance.payment_status or "").upper()
 
@@ -1166,16 +1166,36 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             ),
         )
 
-        paid_amount = attrs.get(
-            "paid_amount",
-            getattr(
-                self.instance,
-                "paid_amount",
-                Decimal("0"),
-            ),
+        paid_amount = Decimal(
+            str(
+                attrs.get(
+                    "paid_amount",
+                    getattr(
+                        self.instance,
+                        "paid_amount",
+                        0,
+                    ),
+                )
+                or 0
+            )
+        )
+
+        is_historical = bool(
+            attrs.get(
+                "is_historical",
+                getattr(
+                    self.instance,
+                    "is_historical",
+                    False,
+                ),
+            )
         )
 
         items = attrs.get("items")
+
+        # --------------------------------------------------
+        # Core validation
+        # --------------------------------------------------
 
         if not branch:
             raise serializers.ValidationError({"branch": ("Branch is required.")})
@@ -1191,19 +1211,73 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         if not due_date:
             raise serializers.ValidationError({"due_date": ("Due date is required.")})
 
-        if due_date < invoice_date:
+        if due_date and invoice_date and due_date < invoice_date:
             raise serializers.ValidationError(
                 {"due_date": ("Due date cannot be before " "issue date.")}
             )
 
-        if sales_order:
+        # --------------------------------------------------
+        # Historical invoice rules
+        # --------------------------------------------------
+
+        if is_historical:
+            if self.instance:
+                raise serializers.ValidationError(
+                    {
+                        "is_historical": (
+                            "Historical invoices cannot be edited "
+                            "after posting. Use a credit note or "
+                            "accounting adjustment instead."
+                        )
+                    }
+                )
+
+            if invoice_date >= timezone.localdate():
+                raise serializers.ValidationError(
+                    {
+                        "invoice_date": (
+                            "Previous invoice date must be " "earlier than today."
+                        )
+                    }
+                )
+
+            if sales_order:
+                raise serializers.ValidationError(
+                    {
+                        "sales_order": (
+                            "Previous invoices cannot be linked " "to a Sales Order."
+                        )
+                    }
+                )
+
+            if paid_amount > 0:
+                raise serializers.ValidationError(
+                    {
+                        "paid_amount": (
+                            "Do not enter payment while importing "
+                            "a previous invoice. Save the invoice "
+                            "first, then record the historical "
+                            "payment using the actual payment date."
+                        )
+                    }
+                )
+
+            attrs["sales_order"] = None
+            attrs["sale_type"] = "HISTORICAL"
+            attrs["delivery_status"] = "NOT_APPLICABLE"
+            attrs["paid_amount"] = Decimal("0.00")
+
+        # --------------------------------------------------
+        # Normal Sales Order validation
+        # --------------------------------------------------
+
+        elif sales_order:
             if sales_order.customer_id != customer.id:
                 raise serializers.ValidationError(
                     {
                         "sales_order": (
-                            "Sales Order customer "
-                            "does not match the "
-                            "invoice customer."
+                            "Sales Order customer does not "
+                            "match the invoice customer."
                         )
                     }
                 )
@@ -1212,17 +1286,19 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {
                         "sales_order": (
-                            "Sales Order branch "
-                            "does not match the "
-                            "invoice branch."
+                            "Sales Order branch does not " "match the invoice branch."
                         )
                     }
                 )
 
+        # --------------------------------------------------
+        # Item validation
+        # --------------------------------------------------
+
         if items is not None:
             if not items:
                 raise serializers.ValidationError(
-                    {"items": ("Add at least one " "invoice item.")}
+                    {"items": ("Add at least one invoice item.")}
                 )
 
             for index, item in enumerate(
@@ -1259,24 +1335,22 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                         {
                             "items": (
                                 f"Line {index}: "
-                                "quantity must be "
-                                "greater than zero."
+                                "quantity must be greater "
+                                "than zero."
                             )
                         }
                     )
 
                 if unit_price < 0:
                     raise serializers.ValidationError(
-                        {
-                            "items": (
-                                f"Line {index}: " "unit price cannot " "be negative."
-                            )
-                        }
+                        {"items": (f"Line {index}: " "unit price cannot be negative.")}
                     )
 
                 order_item = item.get("sales_order_item")
 
-                if order_item:
+                # Historical invoices must not validate
+                # against current order fulfilment.
+                if order_item and not is_historical:
                     already_invoiced = SalesInvoiceItem.objects.filter(
                         sales_order_item=order_item,
                     ).exclude(invoice=self.instance,).aggregate(value=Sum("quantity"))[
@@ -1293,15 +1367,14 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                                 "items": (
                                     f"Line {index}: "
                                     f"only {remaining} "
-                                    "unit(s) remain "
-                                    "to invoice."
+                                    "unit(s) remain to invoice."
                                 )
                             }
                         )
 
         if paid_amount is not None and paid_amount < 0:
             raise serializers.ValidationError(
-                {"paid_amount": ("Paid amount cannot " "be negative.")}
+                {"paid_amount": ("Paid amount cannot be negative.")}
             )
 
         return attrs
@@ -1313,12 +1386,14 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         instance=None,
     ):
         subtotal = Decimal("0")
+
         vat_amount = Decimal("0")
 
         for item in items:
             values = self._calculate_line(item)
 
             subtotal += values["subtotal"]
+
             vat_amount += values["vat_amount"]
 
         shipping = Decimal(
@@ -1373,7 +1448,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         if paid_amount > total:
             raise serializers.ValidationError(
-                {"paid_amount": ("Paid amount cannot " "exceed invoice total.")}
+                {"paid_amount": ("Paid amount cannot exceed " "invoice total.")}
             )
 
         balance = max(
@@ -1410,6 +1485,11 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                 None,
             )
 
+            # Historical invoices must not retain
+            # SalesOrderItem relationships.
+            if invoice.is_historical:
+                item["sales_order_item"] = None
+
             values = self._calculate_line(item)
 
             item.pop(
@@ -1435,6 +1515,13 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             [],
         )
 
+        is_historical = bool(
+            validated_data.get(
+                "is_historical",
+                False,
+            )
+        )
+
         if not validated_data.get("invoice_number"):
             validated_data["invoice_number"] = self._generate_number(
                 validated_data["branch"]
@@ -1450,6 +1537,19 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             items,
             validated_data,
         )
+
+        if is_historical:
+            validated_data["sales_order"] = None
+
+            validated_data["sale_type"] = "HISTORICAL"
+
+            validated_data["delivery_status"] = "NOT_APPLICABLE"
+
+            validated_data["paid_amount"] = Decimal("0.00")
+
+            balance = total
+
+            payment_status = "UNPAID"
 
         validated_data.update(
             subtotal=subtotal,
@@ -1470,6 +1570,24 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             items,
         )
 
+        # --------------------------------------------------
+        # HISTORICAL ACCOUNTING POSTING
+        # --------------------------------------------------
+
+        if is_historical:
+            request = self.context.get("request")
+
+            user = getattr(
+                request,
+                "user",
+                None,
+            )
+
+            create_and_post_historical_receivable(
+                sales_invoice=invoice,
+                user=user,
+            )
+
         return invoice
 
     @transaction.atomic
@@ -1478,17 +1596,34 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         instance,
         validated_data,
     ):
-        # ---------------------------------------------
-        # Extra backend protection for PAID/VOID
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # Historical invoices are already accounting-posted.
+        # --------------------------------------------------
+
+        if instance.is_historical:
+            raise serializers.ValidationError(
+                {
+                    "is_historical": (
+                        "Historical invoices cannot be edited "
+                        "after posting. Use a credit note or "
+                        "accounting adjustment."
+                    )
+                }
+            )
+
+        # --------------------------------------------------
+        # Existing backend protection for payments
+        # --------------------------------------------------
+
         current_payment_status = str(instance.payment_status or "").upper()
 
         if Decimal(str(instance.paid_amount or 0)) > Decimal("0.00"):
             raise serializers.ValidationError(
                 {
                     "payment_status": (
-                        "An invoice with recorded payments cannot be edited. "
-                        "Reverse the payment first, then amend the invoice."
+                        "An invoice with recorded payments "
+                        "cannot be edited. Reverse the payment "
+                        "first, then amend the invoice."
                     )
                 }
             )
