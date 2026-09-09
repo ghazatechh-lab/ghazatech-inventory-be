@@ -139,7 +139,11 @@ class CashRegisterViewSet(GenericViewSet):
                 cash_register=register
             ).count(),
         }
-        used_by = [f"{count} {label}" for label, count in usage.items() if count]
+        used_by = [
+            f"{count} {label}"
+            for label, count in usage.items()
+            if count
+        ]
 
         if used_by:
             return Response(

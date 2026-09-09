@@ -28,6 +28,12 @@ ALLOWED_HOSTS = env.list(
     ],
 )
 
+CSRF_TRUSTED_ORIGINS = [
+    "https://api-inventory.ghazatech.com",
+]
+
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 
 INSTALLED_APPS = [
     "django.contrib.admin",
