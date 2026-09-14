@@ -110,6 +110,17 @@ class EmployeeViewSet(BaseViewSet):
             context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
+
+        document_type = serializer.validated_data.get("document_type")
+        if document_type:
+            existing_documents = employee.documents.filter(
+                document_type=document_type,
+            )
+            for existing in existing_documents:
+                if existing.file:
+                    existing.file.delete(save=False)
+                existing.delete()
+
         serializer.save(employee=employee, uploaded_by=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -244,6 +255,23 @@ class EmployeeDocumentViewSet(BaseViewSet):
     queryset = EmployeeDocument.objects.select_related("employee", "uploaded_by")
     serializer_class = EmployeeDocumentSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        document_type = serializer.validated_data.get("document_type")
+
+        if employee and document_type:
+            existing_documents = EmployeeDocument.objects.filter(
+                employee=employee,
+                document_type=document_type,
+            )
+            for existing in existing_documents:
+                if existing.file:
+                    existing.file.delete(save=False)
+                existing.delete()
+
+        serializer.save(uploaded_by=self.request.user)
+
     search_fields = [
         "title",
         "document_number",

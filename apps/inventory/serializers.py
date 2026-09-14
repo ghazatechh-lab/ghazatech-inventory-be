@@ -106,6 +106,12 @@ class RackSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
+    racks = serializers.PrimaryKeyRelatedField(
+        many=True,
+        required=False,
+        queryset=Rack.objects.filter(is_active=True),
+    )
+    rack_details = serializers.SerializerMethodField()
 
     # Used only while creating or editing a product. The value initializes the
     # ProductStock row for the selected branch and is not stored separately on
@@ -134,6 +140,8 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "attributes",
+            "racks",
+            "rack_details",
             "display_name",
             "initial_stock",
             "available_qty",
@@ -151,6 +159,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "display_name",
+            "rack_details",
             "available_qty",
             "current_stock",
             "reserved_stock",
@@ -162,6 +171,17 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
     def get_display_name(self, obj):
         return variant_label(obj)
+
+    def get_rack_details(self, obj):
+        return [
+            {
+                "id": rack.id,
+                "rack_code": rack.rack_code,
+                "rack_name": rack.rack_name,
+                "branch": rack.branch_id,
+            }
+            for rack in obj.racks.all().order_by("rack_code")
+        ]
 
     def _stock(self, obj):
         product = obj.product
@@ -266,10 +286,18 @@ class ProductSerializer(serializers.ModelSerializer):
         return branch.branch_code if branch else None
 
     def get_rack_code(self, obj):
-        branch_id = get_requested_branch_id(self)
-        if branch_id and obj.rack_id and obj.rack.branch_id != branch_id:
-            return None
-        return obj.rack.rack_code if obj.rack_id else None
+        branch_id = get_requested_branch_id(self) or obj.branch_id
+        racks = Rack.objects.filter(product_variants__product=obj).distinct()
+        if branch_id:
+            racks = racks.filter(branch_id=branch_id)
+        codes = list(racks.order_by("rack_code").values_list("rack_code", flat=True))
+        if codes:
+            return ", ".join(codes)
+
+        # Backward-compatible fallback for products created before variant racks.
+        if obj.rack_id and (not branch_id or obj.rack.branch_id == branch_id):
+            return obj.rack.rack_code
+        return None
 
     def get_product_image_url(self, obj):
         if not obj.product_image:
@@ -515,6 +543,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 base = ProductVariant(product=product, is_base=True)
 
             initial_stock = base_data.pop("initial_stock", None)
+            variant_racks = base_data.pop("racks", [])
             base.attributes = {}
             base.available_qty = int(initial_stock or 0)
             base.purchase_price = base_data.get("purchase_price") or None
@@ -523,6 +552,19 @@ class ProductSerializer(serializers.ModelSerializer):
             base.minimum_selling_price = base_data.get("minimum_selling_price") or 0
             base.is_active = True
             base.save()
+            if variant_racks is not None:
+                invalid_racks = [
+                    rack
+                    for rack in variant_racks
+                    if product.branch_id and rack.branch_id != product.branch_id
+                ]
+                if invalid_racks:
+                    raise serializers.ValidationError(
+                        {
+                            "variants": "All selected racks must belong to the product branch."
+                        }
+                    )
+                base.racks.set(variant_racks)
 
             self._stock_targets[base.id] = initial_stock
             product.variants.exclude(id=base.id).delete()
@@ -534,6 +576,7 @@ class ProductSerializer(serializers.ModelSerializer):
             variant_data = dict(source_variant_data)
             variant_id = variant_data.pop("id", None)
             initial_stock = variant_data.pop("initial_stock", None)
+            variant_racks = variant_data.pop("racks", [])
 
             variant_data["is_base"] = False
             variant_data["available_qty"] = int(initial_stock or 0)
@@ -554,6 +597,20 @@ class ProductSerializer(serializers.ModelSerializer):
                     product=product,
                     **variant_data,
                 )
+
+            if variant_racks is not None:
+                invalid_racks = [
+                    rack
+                    for rack in variant_racks
+                    if product.branch_id and rack.branch_id != product.branch_id
+                ]
+                if invalid_racks:
+                    raise serializers.ValidationError(
+                        {
+                            "variants": "All selected racks must belong to the product branch."
+                        }
+                    )
+                variant.racks.set(variant_racks)
 
             self._stock_targets[variant.id] = initial_stock
             retained_ids.append(variant.id)
@@ -707,6 +764,8 @@ class ProductStockSerializer(serializers.ModelSerializer):
         source="branch.branch_code",
         read_only=True,
     )
+    rack_code = serializers.SerializerMethodField()
+    rack_name = serializers.SerializerMethodField()
     variant_label = serializers.SerializerMethodField()
     tax_treatment = serializers.CharField(
         source="product.tax_treatment",
@@ -725,6 +784,26 @@ class ProductStockSerializer(serializers.ModelSerializer):
 
     def get_variant_label(self, obj):
         return variant_label(obj.variant)
+
+    def _racks(self, obj):
+        variant = obj.variant
+        if variant is None and not obj.product.has_variants:
+            variant = obj.product.variants.filter(is_base=True).first()
+        if variant:
+            return list(variant.racks.filter(branch=obj.branch).order_by("rack_code"))
+        return []
+
+    def get_rack_code(self, obj):
+        racks = self._racks(obj)
+        if racks:
+            return ", ".join(rack.rack_code for rack in racks)
+        return obj.product.rack.rack_code if obj.product.rack_id else ""
+
+    def get_rack_name(self, obj):
+        racks = self._racks(obj)
+        if racks:
+            return ", ".join(filter(None, (rack.rack_name for rack in racks)))
+        return obj.product.rack.rack_name if obj.product.rack_id else ""
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

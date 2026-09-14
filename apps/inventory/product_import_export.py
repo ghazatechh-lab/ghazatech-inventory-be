@@ -335,6 +335,9 @@ def import_products_from_workbook(*, request, branch, uploaded_file):
 
         has_variants = any(bool(item.get("attributes")) for item in variants)
 
+        for variant in variants:
+            variant["racks"] = [rack.id] if rack else []
+
         payload = {
             **product_data,
             "barcode": barcode,
@@ -342,7 +345,7 @@ def import_products_from_workbook(*, request, branch, uploaded_file):
             "category": category.id,
             "supplier": supplier.id if supplier else None,
             "branch": branch.id,
-            "rack": rack.id if rack else None,
+            "rack": None,
             "has_variants": has_variants,
             "unit": "PCS",
             "tax_treatment": "VAT",

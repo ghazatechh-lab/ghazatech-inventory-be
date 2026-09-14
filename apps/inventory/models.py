@@ -180,6 +180,12 @@ class ProductVariant(TimeStampedModel):
     product = models.ForeignKey(
         Product, on_delete=models.CASCADE, related_name="variants"
     )
+    racks = models.ManyToManyField(
+        Rack,
+        blank=True,
+        related_name="product_variants",
+        help_text="Physical rack locations where this product variant is stored.",
+    )
     attributes = models.JSONField(default=dict, blank=True)
     available_qty = models.PositiveIntegerField(default=0)
     purchase_price = models.DecimalField(

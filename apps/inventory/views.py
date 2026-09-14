@@ -91,7 +91,7 @@ class ProductViewSet(ModelViewSet):
             "rack",
         )
         .prefetch_related(
-            "variants",
+            "variants__racks",
             "stocks",
         )
     )
@@ -106,7 +106,6 @@ class ProductViewSet(ModelViewSet):
     filterset_fields = [
         "brand",
         "category",
-        "rack",
         "has_variants",
         "is_active",
     ]
@@ -114,12 +113,16 @@ class ProductViewSet(ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         branch_id = self.request.query_params.get("branch")
+        rack_id = self.request.query_params.get("rack")
 
         if branch_id:
             queryset = queryset.filter(
                 Q(branch_id=branch_id)
                 | Q(stocks__branch_id=branch_id, stocks__current_stock__gt=0)
             ).distinct()
+
+        if rack_id:
+            queryset = queryset.filter(variants__racks_id=rack_id).distinct()
 
         return queryset
 

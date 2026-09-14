@@ -26,6 +26,7 @@ class ProductVariantInline(admin.TabularInline):
     extra = 0
     fields = (
         "attributes",
+        "racks",
         "available_qty",
         "purchase_price",
         "retail_price",
@@ -44,7 +45,6 @@ class ProductAdmin(admin.ModelAdmin):
         "brand",
         "category",
         "branch",
-        "rack",
         "has_variants",
         "total_available_qty",
         "is_active",
@@ -54,7 +54,6 @@ class ProductAdmin(admin.ModelAdmin):
         "brand",
         "category",
         "branch",
-        "rack",
         "tax_treatment",
         "has_variants",
         "is_active",
