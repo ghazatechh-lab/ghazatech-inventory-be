@@ -949,6 +949,8 @@ class SalesInvoiceViewSet(Base):
         "branch",
         "sales_order",
         "salesperson",
+        "created_by",
+        "updated_by",
         "bank_account",
     ).prefetch_related(
         "items__product",
@@ -961,7 +963,15 @@ class SalesInvoiceViewSet(Base):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        invoice = serializer.save()
+        creator = (
+            self.request.user
+            if self.request.user and self.request.user.is_authenticated
+            else None
+        )
+        invoice = serializer.save(
+            created_by=creator,
+            updated_by=creator,
+        )
         post_sales_invoice(
             invoice,
             user=(self.request.user if self.request.user.is_authenticated else None),
@@ -969,7 +979,12 @@ class SalesInvoiceViewSet(Base):
 
     @transaction.atomic
     def perform_update(self, serializer):
-        invoice = serializer.save()
+        updater = (
+            self.request.user
+            if self.request.user and self.request.user.is_authenticated
+            else None
+        )
+        invoice = serializer.save(updated_by=updater)
         # Unpaid invoice amendments are auditable: reverse the previous system
         # journal and post the new totals instead of silently editing the GL.
         repost_sales_invoice(

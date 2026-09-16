@@ -45,6 +45,24 @@ class DocumentBase(TimeStampedModel, BranchAware):
         on_delete=models.SET_NULL,
     )
 
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_%(class)s_documents",
+        editable=False,
+    )
+
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="updated_%(class)s_documents",
+        editable=False,
+    )
+
     currency = models.CharField(
         max_length=5,
         null=True,

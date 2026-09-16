@@ -1,4 +1,3 @@
-import calendar
 import csv
 from datetime import date, timedelta
 from decimal import Decimal
@@ -110,17 +109,6 @@ class EmployeeViewSet(BaseViewSet):
             context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
-
-        document_type = serializer.validated_data.get("document_type")
-        if document_type:
-            existing_documents = employee.documents.filter(
-                document_type=document_type,
-            )
-            for existing in existing_documents:
-                if existing.file:
-                    existing.file.delete(save=False)
-                existing.delete()
-
         serializer.save(employee=employee, uploaded_by=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -252,26 +240,15 @@ class EmployeeViewSet(BaseViewSet):
 
 
 class EmployeeDocumentViewSet(BaseViewSet):
-    queryset = EmployeeDocument.objects.select_related("employee", "uploaded_by")
+    queryset = EmployeeDocument.objects.select_related(
+        "employee",
+        "employee__branch",
+        "employee__department",
+        "employee__designation",
+        "uploaded_by",
+    )
     serializer_class = EmployeeDocumentSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-
-    def perform_create(self, serializer):
-        employee = serializer.validated_data.get("employee")
-        document_type = serializer.validated_data.get("document_type")
-
-        if employee and document_type:
-            existing_documents = EmployeeDocument.objects.filter(
-                employee=employee,
-                document_type=document_type,
-            )
-            for existing in existing_documents:
-                if existing.file:
-                    existing.file.delete(save=False)
-                existing.delete()
-
-        serializer.save(uploaded_by=self.request.user)
-
     search_fields = [
         "title",
         "document_number",
@@ -280,6 +257,9 @@ class EmployeeDocumentViewSet(BaseViewSet):
         "employee__last_name",
     ]
     filterset_fields = ["employee", "document_type"]
+
+    def perform_create(self, serializer):
+        serializer.save(uploaded_by=self.request.user)
 
 
 class AttendanceViewSet(BaseViewSet):
@@ -2489,21 +2469,168 @@ class PayrollEntryViewSet(BaseViewSet):
 
 class DocumentExpiryViewSet(BaseViewSet):
     queryset = EmployeeDocument.objects.select_related(
-        "employee", "employee__branch", "uploaded_by"
+        "employee",
+        "employee__branch",
+        "employee__department",
+        "employee__designation",
+        "uploaded_by",
     )
     serializer_class = EmployeeDocumentSerializer
     http_method_names = ["get", "head", "options"]
 
     def get_queryset(self):
         queryset = super().get_queryset().filter(expiry_date__isnull=False)
-        days = int(self.request.query_params.get("days", 90))
         branch_id = self.request.query_params.get("branch")
-        queryset = queryset.filter(
-            expiry_date__lte=timezone.localdate() + timedelta(days=days)
-        )
+        document_type = self.request.query_params.get("document_type")
+        department_id = self.request.query_params.get("department")
+        search = str(self.request.query_params.get("search") or "").strip()
+        days_param = self.request.query_params.get("days")
+
+        if days_param not in (None, ""):
+            try:
+                days = max(0, int(days_param))
+            except (TypeError, ValueError):
+                days = 90
+
+            queryset = queryset.filter(
+                expiry_date__lte=timezone.localdate() + timedelta(days=days)
+            )
+
         if branch_id:
             queryset = queryset.filter(employee__branch_id=branch_id)
-        return queryset.order_by("expiry_date")
+
+        if document_type:
+            queryset = queryset.filter(document_type=document_type)
+
+        if department_id:
+            queryset = queryset.filter(employee__department_id=department_id)
+
+        if search:
+            from django.db.models import Q
+
+            queryset = queryset.filter(
+                Q(title__icontains=search)
+                | Q(document_number__icontains=search)
+                | Q(employee__employee_code__icontains=search)
+                | Q(employee__first_name__icontains=search)
+                | Q(employee__last_name__icontains=search)
+            )
+
+        return queryset.order_by("expiry_date", "employee__first_name")
+
+    @action(detail=False, methods=["get"], url_path="export-excel")
+    def export_excel(self, request):
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        queryset = self.filter_queryset(self.get_queryset())
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Document Expiry"
+
+        headers = [
+            "Employee Code",
+            "Employee",
+            "Branch",
+            "Department",
+            "Designation",
+            "Document Type",
+            "Title",
+            "Document Number",
+            "Issue Date",
+            "Expiry Date",
+            "Days Left",
+            "Status",
+            "Uploaded By",
+            "Notes",
+        ]
+        ws.append(headers)
+
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        today = timezone.localdate()
+
+        for document in queryset:
+            days_left = (document.expiry_date - today).days
+
+            if days_left < 0:
+                expiry_status = "Expired"
+            elif days_left <= 7:
+                expiry_status = "Expiring in 7 Days"
+            elif days_left <= 30:
+                expiry_status = "Expiring in 30 Days"
+            else:
+                expiry_status = "Valid"
+
+            employee = document.employee
+
+            ws.append(
+                [
+                    getattr(employee, "employee_code", "") if employee else "",
+                    getattr(employee, "full_name", "") if employee else "",
+                    (
+                        getattr(getattr(employee, "branch", None), "branch_name", "")
+                        if employee
+                        else ""
+                    ),
+                    (
+                        getattr(getattr(employee, "department", None), "name", "")
+                        if employee
+                        else ""
+                    ),
+                    (
+                        getattr(getattr(employee, "designation", None), "name", "")
+                        if employee
+                        else ""
+                    ),
+                    (
+                        document.get_document_type_display()
+                        if document.document_type
+                        else ""
+                    ),
+                    document.title or "",
+                    document.document_number or "",
+                    document.issue_date,
+                    document.expiry_date,
+                    days_left,
+                    expiry_status,
+                    (
+                        document.uploaded_by.get_full_name()
+                        or document.uploaded_by.username
+                        if document.uploaded_by
+                        else ""
+                    ),
+                    document.notes or "",
+                ]
+            )
+
+        widths = [16, 26, 20, 20, 22, 22, 28, 22, 14, 14, 12, 22, 22, 36]
+        for index, width in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(index)].width = width
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        response = HttpResponse(
+            output.getvalue(),
+            content_type=(
+                "application/vnd.openxmlformats-officedocument." "spreadsheetml.sheet"
+            ),
+        )
+        response["Content-Disposition"] = 'attachment; filename="document-expiry.xlsx"'
+        return response
 
 
 class HRMSReportViewSet(BaseViewSet):

@@ -1157,6 +1157,12 @@ class EmployeeLetter(TimeStampedModel):
     LETTER_TYPE_CHOICES = [
         ("WARNING", "Warning Letter"),
         ("EXPERIENCE", "Experience Letter"),
+        ("EMPLOYMENT", "Employment Certificate"),
+        ("NOC", "NOC Letter"),
+        ("SALARY_TRANSFER", "Salary Transfer Letter"),
+        ("PROMOTION", "Promotion Letter"),
+        ("TERMINATION", "Termination Letter"),
+        ("CUSTOM", "Custom Letter"),
     ]
 
     employee = models.ForeignKey(

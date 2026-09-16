@@ -188,6 +188,9 @@ class QuotationSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
+    created_by_name = serializers.SerializerMethodField()
+    updated_by_name = serializers.SerializerMethodField()
+
     class Meta:
         model = Quotation
         fields = "__all__"
@@ -201,6 +204,17 @@ class QuotationSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_updated_by_name(self, obj):
+        if not obj.updated_by:
+            return ""
+
+        return (
+            obj.updated_by.get_full_name()
+            or getattr(obj.updated_by, "username", "")
+            or getattr(obj.updated_by, "email", "")
+            or str(obj.updated_by)
+        )
 
     def get_salesperson_name(self, obj):
         if not obj.salesperson:
@@ -1041,9 +1055,22 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             "paid_at",
             "voided_at",
             "last_reminder_sent_at",
+            "created_by",
+            "updated_by",
             "created_at",
             "updated_at",
         ]
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return ""
+
+        return (
+            obj.created_by.get_full_name()
+            or getattr(obj.created_by, "username", "")
+            or getattr(obj.created_by, "email", "")
+            or str(obj.created_by)
+        )
 
     def get_salesperson_name(self, obj):
         if not obj.salesperson:
@@ -1072,27 +1099,36 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         )
 
     def _generate_number(self, branch):
-        branch_code = (
-            getattr(
-                branch,
-                "branch_code",
-                None,
-            )
-            or getattr(
-                branch,
-                "code",
-                None,
-            )
-            or "INV"
+        """
+        Generate a short invoice number:
+        INV-00001, INV-00002, ...
+
+        Existing legacy invoice numbers are left unchanged.
+        Only existing short-format invoice numbers are considered
+        when determining the next sequence.
+        """
+        prefix = "INV-"
+        highest_sequence = 0
+
+        existing_numbers = SalesInvoice.objects.filter(
+            invoice_number__regex=r"^INV-[0-9]{5}$",
+        ).values_list(
+            "invoice_number",
+            flat=True,
         )
 
-        prefix = timezone.now().strftime(f"INV-{branch_code}-%Y%m")
+        for invoice_number in existing_numbers:
+            try:
+                sequence = int(str(invoice_number).replace(prefix, "", 1))
+            except (TypeError, ValueError):
+                continue
 
-        count = SalesInvoice.objects.filter(
-            invoice_number__startswith=prefix,
-        ).count()
+            highest_sequence = max(
+                highest_sequence,
+                sequence,
+            )
 
-        return f"{prefix}-{count + 1:04d}"
+        return f"{prefix}{highest_sequence + 1:05d}"
 
     def _calculate_line(self, item):
         return calculate_serialized_sales_line(
@@ -1371,6 +1407,50 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                                 )
                             }
                         )
+
+        discount_amount = Decimal(
+            str(
+                attrs.get(
+                    "discount_amount",
+                    getattr(self.instance, "discount_amount", 0) or 0,
+                )
+                or 0
+            )
+        )
+
+        if discount_amount < 0:
+            raise serializers.ValidationError(
+                {"discount_amount": "Discount cannot be negative."}
+            )
+
+        if items is not None:
+            discount_limit = Decimal("0")
+            vat_total = Decimal("0")
+
+            for item in items:
+                values = self._calculate_line(item)
+                discount_limit += values["subtotal"]
+                vat_total += values["vat_amount"]
+
+            shipping = Decimal(
+                str(
+                    attrs.get(
+                        "shipping_amount",
+                        getattr(self.instance, "shipping_amount", 0) or 0,
+                    )
+                    or 0
+                )
+            )
+            discount_limit += vat_total + shipping
+
+            if discount_amount > discount_limit:
+                raise serializers.ValidationError(
+                    {
+                        "discount_amount": (
+                            "Discount cannot exceed the invoice amount before discount."
+                        )
+                    }
+                )
 
         if paid_amount is not None and paid_amount < 0:
             raise serializers.ValidationError(

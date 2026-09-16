@@ -50,6 +50,26 @@ class EmployeeDocumentSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
     uploaded_by_name = serializers.SerializerMethodField()
     employee_name = serializers.CharField(source="employee.full_name", read_only=True)
+    employee_code = serializers.CharField(
+        source="employee.employee_code",
+        read_only=True,
+        allow_null=True,
+    )
+    branch_name = serializers.CharField(
+        source="employee.branch.branch_name",
+        read_only=True,
+        allow_null=True,
+    )
+    department_name = serializers.CharField(
+        source="employee.department.name",
+        read_only=True,
+        allow_null=True,
+    )
+    designation_name = serializers.CharField(
+        source="employee.designation.name",
+        read_only=True,
+        allow_null=True,
+    )
 
     class Meta:
         model = EmployeeDocument
