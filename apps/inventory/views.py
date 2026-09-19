@@ -13,6 +13,7 @@ from rest_framework.viewsets import (
 
 from apps.common.response import ok
 
+from apps.recovery.services import soft_delete_to_recovery
 from .models import (
     Brand,
     Category,
@@ -127,9 +128,18 @@ class ProductViewSet(ModelViewSet):
         return queryset
 
     def perform_destroy(self, obj):
-        obj.is_deleted = True
-        obj.deleted_by = self.request.user
-        obj.save()
+        reason = (
+            self.request.data.get("deletion_reason")
+            or self.request.data.get("reason")
+            or self.request.headers.get("X-Deletion-Reason")
+            or ""
+        )
+        soft_delete_to_recovery(
+            obj,
+            user=self.request.user,
+            reason=reason,
+            request=self.request,
+        )
 
     @action(
         detail=False,

@@ -10,6 +10,7 @@ from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
 
+from apps.recovery.services import soft_delete_to_recovery
 from .models import Customer
 from .serializers import CustomerSerializer
 
@@ -86,14 +87,17 @@ class CustomerViewSet(ModelViewSet):
         )
 
     def perform_destroy(self, obj):
-        obj.is_deleted = True
-        obj.deleted_by = self.request.user
-        obj.save(
-            update_fields=[
-                "is_deleted",
-                "deleted_by",
-                "updated_at",
-            ]
+        reason = (
+            self.request.data.get("deletion_reason")
+            or self.request.data.get("reason")
+            or self.request.headers.get("X-Deletion-Reason")
+            or ""
+        )
+        soft_delete_to_recovery(
+            obj,
+            user=self.request.user,
+            reason=reason,
+            request=self.request,
         )
 
     @action(detail=False, methods=["get"])

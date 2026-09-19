@@ -27,6 +27,7 @@ urlpatterns = [
     path("api/service-repairs/", include("apps.service_repairs.urls")),
     path("api/notifications/", include("apps.notifications.urls")),
     path("api/audit-logs/", include("apps.audit_logs.urls")),
+    path("api/recovery/", include("apps.recovery.urls")),
     path("api/reports/", include("apps.reports.urls")),
     path("api/fleet/", include("apps.fleet.urls")),
     path("api/dashboard/", reports_dashboard, name="reports-dashboard"),

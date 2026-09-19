@@ -11,6 +11,7 @@ from rest_framework.parsers import (
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
+from apps.recovery.services import soft_delete_to_recovery
 from .models import (
     Supplier,
     SupplierDocument,
@@ -166,15 +167,17 @@ class SupplierViewSet(
         self,
         obj,
     ):
-        obj.is_deleted = True
-        obj.deleted_by = self.request.user
-
-        obj.save(
-            update_fields=[
-                "is_deleted",
-                "deleted_by",
-                "updated_at",
-            ],
+        reason = (
+            self.request.data.get("deletion_reason")
+            or self.request.data.get("reason")
+            or self.request.headers.get("X-Deletion-Reason")
+            or ""
+        )
+        soft_delete_to_recovery(
+            obj,
+            user=self.request.user,
+            reason=reason,
+            request=self.request,
         )
 
     @action(

@@ -64,6 +64,7 @@ INSTALLED_APPS = [
     "apps.audit_logs",
     "apps.fleet",
     "apps.reports",
+    "apps.recovery",
 ]
 
 
@@ -222,6 +223,10 @@ CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_BEAT_SCHEDULE = {
     "check-employee-documents-daily": {
         "task": ("apps.hrms.tasks." "check_document_expiry"),
+        "schedule": 86400,
+    },
+    "cleanup-expired-recovery-records-daily": {
+        "task": "apps.recovery.tasks.cleanup_expired_recovery_records",
         "schedule": 86400,
     },
 }
