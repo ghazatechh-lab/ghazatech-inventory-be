@@ -12,14 +12,17 @@ def check_document_expiry():
         "passport_expiry_date",
         "visa_expiry_date",
         "emirates_id_expiry_date",
-        "labour_card_expiry_date",
+        "labor_contract_end_date",
         "driving_license_expiry_date",
         "insurance_expiry_date",
     ]
     created = 0
-    for e in Employee.objects.filter(status="ACTIVE"):
+    for e in Employee.objects.filter(
+        is_active=True,
+        employment_status__in=["ACTIVE", "PROBATION", "ON_LEAVE"],
+    ):
         for field in fields:
-            expiry = getattr(e, field)
+            expiry = getattr(e, field, None)
             if expiry and expiry <= today + timedelta(days=60):
                 days = (expiry - today).days
                 priority = "URGENT" if days < 0 or days <= 7 else "WARNING"

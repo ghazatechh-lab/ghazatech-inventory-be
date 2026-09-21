@@ -4,6 +4,7 @@ from decimal import Decimal
 from io import BytesIO
 
 from django.db import transaction
+from django.contrib.contenttypes.models import ContentType
 from django.db.models import Sum
 from django.http import HttpResponse
 from django.utils import timezone
@@ -13,6 +14,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
+
+from apps.recovery.models import RecoveryRecord
+from apps.recovery.services import create_recovery_record
 
 from .models import *
 from .serializers import *
@@ -71,6 +75,82 @@ class EmployeeViewSet(BaseViewSet):
         "employment_status",
         "created_at",
     ]
+
+    def get_queryset(self):
+        """
+        Keep inactive employees available in the normal employee directory.
+
+        "Inactive" is an employment/account state, not a deletion state.
+        Employees are hidden only while they have an active DELETED record in
+        Recovery Centre.
+        """
+        queryset = super().get_queryset()
+
+        employee_content_type = ContentType.objects.get_for_model(
+            Employee,
+            for_concrete_model=False,
+        )
+        deleted_object_ids = RecoveryRecord.objects.filter(
+            content_type=employee_content_type,
+            status=RecoveryRecord.STATUS_DELETED,
+        ).values_list("object_id", flat=True)
+
+        # RecoveryRecord.object_id is a CharField while Employee.pk is an
+        # integer. Convert the values before using them in the Employee query;
+        # otherwise PostgreSQL may fail with an integer/varchar comparison.
+        deleted_employee_ids = []
+        for object_id in deleted_object_ids:
+            try:
+                deleted_employee_ids.append(int(object_id))
+            except (TypeError, ValueError):
+                continue
+
+        if deleted_employee_ids:
+            queryset = queryset.exclude(pk__in=deleted_employee_ids)
+
+        return queryset
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        """
+        Move an employee to Recovery Centre.
+
+        Deletion does not change employment_status or is_active. This keeps
+        "Inactive" separate from "Deleted" and allows a restored employee to
+        return exactly as they were before deletion.
+        """
+        employee = self.get_object()
+
+        reason = ""
+        try:
+            reason = (
+                request.data.get("reason") or request.data.get("deletion_reason") or ""
+            ).strip()
+        except Exception:
+            reason = ""
+
+        create_recovery_record(
+            instance=employee,
+            user=request.user,
+            reason=reason or "Employee deleted from employee directory",
+            request=request,
+        )
+
+        # Disable only the linked application login while the employee is in
+        # Recovery Centre. Do not alter the Employee active/status fields.
+        linked_user = getattr(employee, "user", None)
+        if linked_user and linked_user.is_active:
+            linked_user.is_active = False
+            linked_user.save(update_fields=["is_active"])
+
+        return Response(
+            {
+                "success": True,
+                "message": "Employee moved to Recovery Centre.",
+                "data": None,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=False, methods=["get"], url_path="form-options")
     def form_options(self, request):

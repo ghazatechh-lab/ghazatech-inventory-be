@@ -76,31 +76,90 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
             return None
         return model_class._default_manager.filter(pk=record.object_id).first()
 
+    def _hard_delete_employee(self, employee):
+        """
+        Permanently remove an Employee and employee-owned related records.
+
+        Some HRMS relations intentionally use PROTECT for normal operations.
+        Permanent deletion from Recovery Centre is an explicit destructive
+        action, so those employee-owned rows are removed first.
+        """
+        # Delete direct loan repayments before their protected parent loans.
+        for related_name in [
+            "loan_repayments",
+            "documents",
+            "attendance_records",
+            "leave_balances",
+            "leave_requests",
+            "salary_revisions",
+            "salary_advances",
+            "payroll_entries",
+            "salary_certificates",
+            "employee_letters",
+            "vehicle_trips",
+            "service_jobs",
+        ]:
+            manager = getattr(employee, related_name, None)
+            if manager is not None:
+                manager.all().delete()
+
+        # EmployeeLoanRepayment also references EmployeeLoan with PROTECT, so
+        # employee loans must be removed after repayments.
+        loans = getattr(employee, "employee_loans", None)
+        if loans is not None:
+            for loan in list(loans.all()):
+                repayments = getattr(loan, "repayments", None)
+                if repayments is not None:
+                    repayments.all().delete()
+                loan.delete()
+
+        # The linked User has SET_NULL to Employee, so keep the account row but
+        # remove its employee link during Employee deletion. It remains inactive.
+        linked_user = getattr(employee, "user", None)
+        if linked_user is not None and linked_user.is_active:
+            linked_user.is_active = False
+            linked_user.save(update_fields=["is_active"])
+
+        employee.delete()
+
     def _restore_record(self, record, user):
         if record.status != RecoveryRecord.STATUS_DELETED:
             raise ValidationError({"detail": "Only deleted records can be restored."})
         instance = self._get_object_instance(record)
         if instance is None:
-            raise ValidationError({"detail": "The original database record no longer exists."})
-        if not hasattr(instance, "is_deleted"):
-            raise ValidationError({"detail": "This record type does not support recovery."})
-
-        instance.is_deleted = False
-        update_fields = ["is_deleted"]
-        if hasattr(instance, "deleted_at"):
-            instance.deleted_at = None
-            update_fields.append("deleted_at")
-        if hasattr(instance, "deleted_by"):
-            instance.deleted_by = None
-            update_fields.append("deleted_by")
-        if hasattr(instance, "updated_at"):
-            update_fields.append("updated_at")
-        instance.save(update_fields=update_fields)
+            raise ValidationError(
+                {"detail": "The original database record no longer exists."}
+            )
+        if hasattr(instance, "is_deleted"):
+            instance.is_deleted = False
+            update_fields = ["is_deleted"]
+            if hasattr(instance, "deleted_at"):
+                instance.deleted_at = None
+                update_fields.append("deleted_at")
+            if hasattr(instance, "deleted_by"):
+                instance.deleted_by = None
+                update_fields.append("deleted_by")
+            if hasattr(instance, "updated_at"):
+                update_fields.append("updated_at")
+            instance.save(update_fields=update_fields)
+        elif record.module == "hrms" and record.model_name == "employee":
+            # Employee was never modified when moved to Recovery Centre, so
+            # preserve its original is_active/employment_status values.
+            linked_user = getattr(instance, "user", None)
+            if linked_user and not linked_user.is_active:
+                linked_user.is_active = True
+                linked_user.save(update_fields=["is_active"])
+        else:
+            raise ValidationError(
+                {"detail": "This record type does not support recovery."}
+            )
 
         record.status = RecoveryRecord.STATUS_RESTORED
         record.restored_at = timezone.now()
         record.restored_by = user
-        record.save(update_fields=["status", "restored_at", "restored_by", "updated_at"])
+        record.save(
+            update_fields=["status", "restored_at", "restored_by", "updated_at"]
+        )
 
         AuditLog.objects.create(
             user=user,
@@ -116,14 +175,24 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
 
     def _permanent_delete_record(self, record, user):
         if record.status != RecoveryRecord.STATUS_DELETED:
-            raise ValidationError({"detail": "Only deleted records can be permanently deleted."})
+            raise ValidationError(
+                {"detail": "Only deleted records can be permanently deleted."}
+            )
         instance = self._get_object_instance(record)
         if instance is not None:
             try:
-                instance.delete()
+                if record.module == "hrms" and record.model_name == "employee":
+                    self._hard_delete_employee(instance)
+                else:
+                    instance.delete()
             except ProtectedError as exc:
                 raise ValidationError(
-                    {"detail": "This record is referenced by protected transactions and cannot be permanently deleted."}
+                    {
+                        "detail": (
+                            "This record is referenced by protected transactions "
+                            "and cannot be permanently deleted."
+                        )
+                    }
                 ) from exc
 
         record.status = RecoveryRecord.STATUS_PERMANENT
@@ -157,7 +226,9 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(
             {
                 "total_deleted": current.count(),
-                "deleted_today": current.filter(deleted_at__date=timezone.localdate()).count(),
+                "deleted_today": current.filter(
+                    deleted_at__date=timezone.localdate()
+                ).count(),
                 "restored_this_month": RecoveryRecord.objects.filter(
                     status=RecoveryRecord.STATUS_RESTORED,
                     restored_at__gte=month_start,
@@ -175,16 +246,22 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"])
     def activity(self, request):
-        queryset = RecoveryRecord.objects.exclude(status=RecoveryRecord.STATUS_DELETED).select_related(
+        queryset = RecoveryRecord.objects.exclude(
+            status=RecoveryRecord.STATUS_DELETED
+        ).select_related(
             "deleted_by", "restored_by", "permanently_deleted_by", "branch"
-        )[:100]
+        )[
+            :100
+        ]
         return Response(self.get_serializer(queryset, many=True).data)
 
     @action(detail=False, methods=["get"])
     def export(self, request):
         queryset = self.filter_queryset(self.get_queryset())
         response = HttpResponse(content_type="text/csv")
-        response["Content-Disposition"] = 'attachment; filename="recovery-centre-log.csv"'
+        response["Content-Disposition"] = (
+            'attachment; filename="recovery-centre-log.csv"'
+        )
         writer = csv.writer(response)
         writer.writerow(
             [
@@ -265,7 +342,9 @@ class RecoverySettingsViewSet(viewsets.ViewSet):
                 or request.user.has_operation_permission("settings.recovery.edit")
             ):
                 return Response(
-                    {"detail": "You do not have permission to change recovery settings."},
+                    {
+                        "detail": "You do not have permission to change recovery settings."
+                    },
                     status=status.HTTP_403_FORBIDDEN,
                 )
             serializer = RecoverySettingsSerializer(
