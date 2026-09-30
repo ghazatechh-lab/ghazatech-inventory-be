@@ -8,6 +8,11 @@ from apps.notifications.services import notify_branch
 
 from .models import ProductStock, StockMovement
 
+from apps.inventory.master_branch import (
+    normalize_inventory_branch,
+    create_sync_log,
+)
+
 VAT = "VAT"
 ZERO_VAT = "ZERO_VAT"
 NON_VAT = "NON_VAT"
@@ -48,7 +53,7 @@ def _common_tax_treatment(treatment):
     }[treatment]
 
 
-@transaction.atomic
+@transaction.atomic(using="default")
 def adjust_stock(
     *,
     product,
@@ -72,6 +77,8 @@ def adjust_stock(
     source_document_number="",
     **_ignored,
 ):
+    source_branch = branch
+    branch = normalize_inventory_branch(source_branch)
     """Apply a signed quantity to a unified ProductStock balance.
 
     Positive quantities increase current_stock and negative quantities reduce
@@ -219,6 +226,18 @@ def adjust_stock(
         tax_invoice_date=tax_invoice_date,
         is_vat_relevant=treatment in {VAT, ZERO_VAT},
     )
+
+    if source_branch and source_branch.pk != branch.pk:
+        create_sync_log(
+            source_branch=source_branch,
+            product=product,
+            variant=variant,
+            quantity=quantity,
+            movement_type=movement_type,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            source_document_number=source_document_number,
+        )
 
     if stock.available_stock < 10:
         notify_branch(

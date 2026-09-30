@@ -22,6 +22,7 @@ from apps.purchases.models import (
 from apps.suppliers.models import Supplier
 
 from apps.common.response import ok
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 
 from .models import (
     Shipment,
@@ -90,6 +91,7 @@ def _user_display_name(
 
 
 class ShipmentViewSet(
+    BranchDatabaseQuerysetMixin,
     ModelViewSet,
 ):
     queryset = Shipment.objects.select_related(

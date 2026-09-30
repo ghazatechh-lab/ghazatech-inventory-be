@@ -13,6 +13,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 
 from .models import (
     AccountingPeriod,
@@ -84,7 +85,7 @@ from .serializers import (
 )
 
 
-class GenericViewSet(ModelViewSet):
+class GenericViewSet(BranchDatabaseQuerysetMixin, ModelViewSet):
     search_fields = []
     ordering_fields = "__all__"
 
@@ -139,11 +140,7 @@ class CashRegisterViewSet(GenericViewSet):
                 cash_register=register
             ).count(),
         }
-        used_by = [
-            f"{count} {label}"
-            for label, count in usage.items()
-            if count
-        ]
+        used_by = [f"{count} {label}" for label, count in usage.items() if count]
 
         if used_by:
             return Response(

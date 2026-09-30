@@ -22,13 +22,14 @@ from apps.branches.models import Branch
 from apps.inventory.models import Rack
 from apps.inventory.services import adjust_stock
 import logging
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
 
-class Base(ModelViewSet):
+class Base(BranchDatabaseQuerysetMixin, ModelViewSet):
     search_fields = []
     ordering_fields = "__all__"
     ordering = ["-id"]

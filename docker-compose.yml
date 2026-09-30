@@ -1,4 +1,8 @@
 services:
+  # =========================================================
+  # MASTER / COMBINED DATABASE
+  # Branch 4
+  # =========================================================
   db:
     image: postgres:16-alpine
     environment:
@@ -7,58 +11,149 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
     # In production, do not expose DB publicly
     # ports:
     #   - "5432:5432"
 
+
+  # =========================================================
+  # VAT DATABASE
+  # Branch 2
+  # =========================================================
+  db_vat:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${VAT_POSTGRES_DB:-ghaza_vat_db}
+      POSTGRES_USER: ${VAT_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${VAT_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_vat_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+    # In production, do not expose DB publicly
+    # ports:
+    #   - "5433:5432"
+
+
+  # =========================================================
+  # NON-VAT DATABASE
+  # Branch 3
+  # =========================================================
+  db_non_vat:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${NON_VAT_POSTGRES_DB:-ghaza_non_vat_db}
+      POSTGRES_USER: ${NON_VAT_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${NON_VAT_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_non_vat_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+    # In production, do not expose DB publicly
+    # ports:
+    #   - "5434:5432"
+
+
+  # =========================================================
+  # REDIS
+  # =========================================================
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+
     # In production, do not expose Redis publicly
     # ports:
     #   - "6379:6379"
 
+
+  # =========================================================
+  # DJANGO BACKEND
+  # =========================================================
   backend:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
+
     env_file:
       - .env
+
     volumes:
       - .:/app
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
+
     ports:
       - "8000:8000"
+
     depends_on:
       - db
+      - db_vat
+      - db_non_vat
       - redis
 
-      
+    restart: unless-stopped
 
+
+  # =========================================================
+  # CELERY WORKER
+  # =========================================================
   celery_worker:
     build: .
     command: celery -A config worker -l info
+
     env_file:
       - .env
+
     volumes:
       - .:/app
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
+
     depends_on:
       - backend
       - redis
+      - db
+      - db_vat
+      - db_non_vat
 
+    restart: unless-stopped
+
+
+  # =========================================================
+  # CELERY BEAT
+  # =========================================================
   celery_beat:
     build: .
     command: celery -A config beat -l info
+
     env_file:
       - .env
+
     volumes:
       - .:/app
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
+
     depends_on:
       - backend
       - redis
+      - db
+      - db_vat
+      - db_non_vat
 
+    restart: unless-stopped
+
+
+# =========================================================
+# PERSISTENT DATABASE VOLUMES
+# =========================================================
 volumes:
+  # Branch 4 - Master / Combined database
   postgres_data:
+
+  # Branch 2 - VAT database
+  postgres_vat_data:
+
+  # Branch 3 - Non-VAT database
+  postgres_non_vat_data:

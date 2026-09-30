@@ -11,12 +11,12 @@ from rest_framework.parsers import (
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 from apps.recovery.services import soft_delete_to_recovery
 from .models import (
     Supplier,
     SupplierDocument,
 )
-
 
 
 from .serializers import (
@@ -36,6 +36,7 @@ MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
 
 
 class SupplierViewSet(
+    BranchDatabaseQuerysetMixin,
     ModelViewSet,
 ):
     queryset = Supplier.objects.filter(

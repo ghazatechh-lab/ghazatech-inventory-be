@@ -12,6 +12,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
@@ -168,7 +169,7 @@ def _salespeople_options():
     return result
 
 
-class Base(ModelViewSet):
+class Base(BranchDatabaseQuerysetMixin, ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         b = self.request.query_params.get("branch")

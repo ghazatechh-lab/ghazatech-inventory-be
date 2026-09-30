@@ -65,6 +65,7 @@ INSTALLED_APPS = [
     "apps.fleet",
     "apps.reports",
     "apps.recovery",
+    "apps.branch_data",
 ]
 
 
@@ -76,6 +77,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "apps.branch_data.middleware.BranchDatabaseContextMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "apps.audit_logs.middleware.AuditMiddleware",
@@ -275,3 +277,9 @@ LOGGING = {
         },
     },
 }
+
+
+# VAT / Non-VAT transaction databases.
+from .multidb import DATABASE_ROUTERS, MULTI_DATABASES
+
+DATABASES.update(MULTI_DATABASES)

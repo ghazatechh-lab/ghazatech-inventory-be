@@ -30,6 +30,7 @@ urlpatterns = [
     path("api/recovery/", include("apps.recovery.urls")),
     path("api/reports/", include("apps.reports.urls")),
     path("api/fleet/", include("apps.fleet.urls")),
+    path("api/branch-data/", include("apps.branch_data.urls")),
     path("api/dashboard/", reports_dashboard, name="reports-dashboard"),
 ]
 if settings.DEBUG:
