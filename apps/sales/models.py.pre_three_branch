@@ -4,13 +4,6 @@ from django.db import models
 from apps.common.models import TimeStampedModel
 
 
-
-SALE_MODE_CHOICES = [
-    ("VAT", "VAT Sale"),
-    ("NON_VAT", "Non-VAT Sale"),
-]
-
-
 class BranchAware(models.Model):
     branch = models.ForeignKey(
         "branches.Branch",
@@ -120,14 +113,6 @@ class DocumentBase(TimeStampedModel, BranchAware):
     notes = models.TextField(
         null=True,
         blank=True,
-    )
-
-
-
-    sale_mode = models.CharField(
-        max_length=20,
-        choices=SALE_MODE_CHOICES,
-        default="VAT",
     )
 
     class Meta:

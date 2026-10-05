@@ -9,14 +9,14 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
-from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.mixins import BranchDatabaseQuerysetMixin
 
 from apps.recovery.services import soft_delete_to_recovery
 from .models import Customer
 from .serializers import CustomerSerializer
 
 
-class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
+class CustomerViewSet(BranchDatabaseQuerysetMixin, ModelViewSet):
     serializer_class = CustomerSerializer
 
     search_fields = [
