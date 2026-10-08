@@ -276,30 +276,8 @@ class EmployeeSerializer(serializers.ModelSerializer):
 
         today = timezone.localdate()
 
-        dob_min_date = date(1950, 1, 1)
-
         if date_of_birth and date_of_birth >= today:
             errors["date_of_birth"] = "Date of birth must be before today."
-
-        # New/changed DOB values use the supported employee range. Preserve an
-        # unchanged legacy DOB when editing so older existing employees remain
-        # editable without forcing an unrelated DOB change.
-        existing_dob = (
-            getattr(self.instance, "date_of_birth", None) if self.instance else None
-        )
-        dob_is_unchanged_legacy = (
-            existing_dob
-            and existing_dob < dob_min_date
-            and date_of_birth == existing_dob
-        )
-        if (
-            date_of_birth
-            and date_of_birth < dob_min_date
-            and not dob_is_unchanged_legacy
-        ):
-            errors["date_of_birth"] = (
-                "Date of birth must be on or after 1950-01-01."
-            )
 
         if emirates_issue and emirates_expiry and emirates_expiry <= emirates_issue:
             errors["emirates_id_expiry_date"] = (
@@ -663,6 +641,10 @@ class SalaryAdvanceSerializer(serializers.ModelSerializer):
             "period",
             getattr(self.instance, "period", None),
         )
+        advance_date = attrs.get(
+            "advance_date",
+            getattr(self.instance, "advance_date", None),
+        )
         amount = Decimal(
             str(
                 attrs.get(
@@ -680,6 +662,35 @@ class SalaryAdvanceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"amount": "Advance amount must be greater than zero."}
             )
+
+        today = timezone.localdate()
+
+        if advance_date and advance_date > today:
+            raise serializers.ValidationError(
+                {"advance_date": "Advance date cannot be in the future."}
+            )
+
+        joining_date = getattr(employee, "joining_date", None) if employee else None
+
+        if advance_date and joining_date and advance_date < joining_date:
+            raise serializers.ValidationError(
+                {
+                    "advance_date": (
+                        "Advance date cannot be before the employee joining date."
+                    )
+                }
+            )
+
+        if period and joining_date:
+            joining_period = joining_date.strftime("%Y-%m")
+            if period < joining_period:
+                raise serializers.ValidationError(
+                    {
+                        "period": (
+                            "Deduction period cannot be before the employee joining month."
+                        )
+                    }
+                )
 
         salary = Decimal(
             str(

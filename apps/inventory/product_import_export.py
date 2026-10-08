@@ -9,8 +9,11 @@ from django.http import FileResponse
 from openpyxl import Workbook, load_workbook
 from rest_framework import serializers
 
-from .models import Brand, Category, Product, Rack
+from apps.branch_data.services import database_alias_for_branch
+
+from .models import Brand, Category, Product, ProductStock, Rack
 from .serializers import ProductSerializer
+from .physical_catalog import physical_product_supplier_id
 
 EXPECTED_HEADERS = [
     "product name",
@@ -119,17 +122,31 @@ def _get_by_name(model, field_name: str, value: Any, row_number: int):
     return item
 
 
-def _get_supplier(value: Any, row_number: int):
+def _get_supplier(branch, value: Any, row_number: int):
     name = _normalise_text(value)
     if not name:
         return None
 
     from apps.suppliers.models import Supplier
 
-    item = Supplier.objects.filter(supplier_name__iexact=name).first()
+    using = database_alias_for_branch(branch.id)
+    item = (
+        Supplier.objects.using(using)
+        .filter(
+            branch_id=branch.id,
+            supplier_name__iexact=name,
+            is_deleted=False,
+            is_active=True,
+        )
+        .first()
+    )
     if not item:
         raise serializers.ValidationError(
-            {f"row_{row_number}": [f"Supplier '{name}' was not found."]}
+            {
+                f"row_{row_number}": [
+                    f"Supplier '{name}' was not found in {branch.branch_code}."
+                ]
+            }
         )
     return item
 
@@ -292,7 +309,7 @@ def import_products_from_workbook(*, request, branch, uploaded_file):
 
         brand = _get_by_name(Brand, "name", brand_name, row_number)
         category = _get_by_name(Category, "name", category_name, row_number)
-        supplier = _get_supplier(supplier_name, row_number)
+        supplier = _get_supplier(branch, supplier_name, row_number)
         rack = _get_rack(branch, rack_code, row_number)
 
         sku = product_data["sku"]
@@ -410,10 +427,23 @@ def build_product_export_workbook(queryset) -> BytesIO:
                 first_row = variant_index == 0 and attribute_index == 0
                 branch_id = product.branch_id
                 stock_variant = variant if product.has_variants else None
-                stock = product.stocks.filter(
+                using = database_alias_for_branch(branch_id) if branch_id else "default"
+                stock = ProductStock.objects.using(using).filter(
+                    product_id=product.id,
                     branch_id=branch_id,
-                    variant=stock_variant,
+                    variant_id=(stock_variant.id if stock_variant else None),
                 ).first()
+                supplier_id = physical_product_supplier_id(product, branch_id)
+                supplier_name = ""
+                if supplier_id and branch_id:
+                    from apps.suppliers.models import Supplier
+                    supplier_name = (
+                        Supplier.objects.using(using)
+                        .filter(pk=supplier_id, branch_id=branch_id, is_deleted=False)
+                        .values_list("supplier_name", flat=True)
+                        .first()
+                        or ""
+                    )
 
                 sheet.append(
                     [
@@ -422,11 +452,7 @@ def build_product_export_workbook(queryset) -> BytesIO:
                         product.barcode if first_row else "",
                         product.brand.name if first_row else "",
                         product.category.name if first_row else "",
-                        (
-                            product.supplier.supplier_name
-                            if first_row and product.supplier_id
-                            else ""
-                        ),
+                        supplier_name if first_row else "",
                         (
                             product.rack.rack_code
                             if first_row and product.rack_id

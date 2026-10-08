@@ -1,13 +1,20 @@
 import json
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from apps.branch_data.services import database_alias_for_branch
-from apps.branch_data.physical import require_physical_branch, request_active_branch, is_physical_branch
 from apps.branches.models import Branch
 
 from .services import adjust_stock
+from .physical_catalog import (
+    ensure_product_catalog_in_database,
+    physical_product_supplier_id,
+    require_physical_branch,
+    validate_supplier_for_branch,
+    validate_product_sku_for_branch,
+    physical_branch_label,
+)
 
 from .models import (
     Brand,
@@ -106,15 +113,6 @@ class RackSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-
-    def validate(self, attrs):
-        branch = attrs.get("branch") or getattr(self.instance, "branch", None)
-        active_branch = request_active_branch(self.context.get("request"))
-        if active_branch and is_physical_branch(active_branch) and self.instance is None:
-            branch = active_branch
-            attrs["branch"] = active_branch
-        require_physical_branch(branch, field="branch")
-        return attrs
 
 
 class ProductVariantSerializer(serializers.ModelSerializer):
@@ -237,6 +235,16 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         }
 
 
+def _is_product_sku_integrity_error(exc):
+    cause = getattr(exc, "__cause__", None)
+    diag = getattr(cause, "diag", None)
+    constraint = getattr(diag, "constraint_name", "") if diag else ""
+    return constraint in {
+        "unique_product_sku_per_branch",
+        "unique_unassigned_product_sku",
+    }
+
+
 class ProductSerializer(serializers.ModelSerializer):
     brand_name = serializers.CharField(
         source="brand.name",
@@ -249,11 +257,12 @@ class ProductSerializer(serializers.ModelSerializer):
     branch_name = serializers.SerializerMethodField()
     branch_code = serializers.SerializerMethodField()
     rack_code = serializers.SerializerMethodField()
-    supplier_name = serializers.CharField(
-        source="supplier.supplier_name",
-        read_only=True,
+    supplier = serializers.IntegerField(
+        required=False,
         allow_null=True,
+        write_only=True,
     )
+    supplier_name = serializers.SerializerMethodField()
 
     product_image_url = serializers.SerializerMethodField()
 
@@ -324,6 +333,28 @@ class ProductSerializer(serializers.ModelSerializer):
             if obj.rack.branch_id == requested_branch.id:
                 return obj.rack.rack_code
         return None
+
+    def _physical_supplier_id(self, obj):
+        return physical_product_supplier_id(obj, getattr(obj, "branch_id", None))
+
+    def get_supplier_name(self, obj):
+        supplier_id = self._physical_supplier_id(obj)
+        if not supplier_id or not obj.branch_id:
+            return None
+        branch = require_physical_branch(obj.branch_id)
+        using = database_alias_for_branch(branch.id)
+        from apps.suppliers.models import Supplier
+        return (
+            Supplier.objects.using(using)
+            .filter(pk=supplier_id, branch_id=branch.id, is_deleted=False)
+            .values_list("supplier_name", flat=True)
+            .first()
+        )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["supplier"] = self._physical_supplier_id(instance)
+        return data
 
     def get_product_image_url(self, obj):
         if not obj.product_image:
@@ -430,12 +461,6 @@ class ProductSerializer(serializers.ModelSerializer):
             ),
         )
 
-        active_branch = request_active_branch(self.context.get("request"))
-        if active_branch and is_physical_branch(active_branch) and self.instance is None:
-            branch = active_branch
-            attrs["branch"] = active_branch
-        require_physical_branch(branch, field="branch")
-
         rack = attrs.get(
             "rack",
             getattr(
@@ -444,6 +469,36 @@ class ProductSerializer(serializers.ModelSerializer):
                 None,
             ),
         )
+
+        branch = require_physical_branch(branch)
+
+        if self.instance and self.instance.branch_id and self.instance.branch_id != branch.id:
+            raise serializers.ValidationError(
+                {
+                    "branch": (
+                        "An existing product cannot be moved between physical branches. "
+                        "Create a new product in the target branch instead."
+                    )
+                }
+            )
+
+        supplier_supplied = "supplier" in attrs
+        if supplier_supplied:
+            supplier_id = attrs.get("supplier")
+        elif self.instance:
+            supplier_id = physical_product_supplier_id(self.instance, branch)
+        else:
+            supplier_id = None
+
+        if supplier_id not in (None, "", 0, "0"):
+            supplier = validate_supplier_for_branch(
+                supplier_id=supplier_id,
+                branch=branch,
+                required=True,
+            )
+            attrs["supplier"] = supplier.pk
+        elif supplier_supplied:
+            attrs["supplier"] = None
 
         if rack and branch and rack.branch_id != branch.id:
             raise serializers.ValidationError(
@@ -461,9 +516,12 @@ class ProductSerializer(serializers.ModelSerializer):
         if not sku:
             raise serializers.ValidationError({"sku": "SKU is required."})
 
-        sku_queryset = Product.objects.filter(
+        # Validate both the authoritative/default catalog and the target physical
+        # database before saving. This keeps PostgreSQL unique constraints as a
+        # last line of defense rather than the user-facing validation path.
+        sku_queryset = Product.objects.using("default").filter(
             sku__iexact=sku,
-            branch=branch,
+            branch_id=branch.id,
             is_deleted=False,
         )
 
@@ -472,27 +530,14 @@ class ProductSerializer(serializers.ModelSerializer):
 
         if sku_queryset.exists():
             raise serializers.ValidationError(
-                {
-                    "sku": (
-                        "A product with this SKU already exists "
-                        "in the selected branch."
-                    )
-                }
+                {"sku": f"{sku} already exists in {physical_branch_label(branch)}."}
             )
 
-        barcode = attrs.get("barcode", getattr(self.instance, "barcode", None))
-        if barcode:
-            barcode_queryset = Product.objects.filter(
-                branch=branch, barcode=barcode, is_deleted=False
-            )
-            if self.instance:
-                barcode_queryset = barcode_queryset.exclude(pk=self.instance.pk)
-            if barcode_queryset.exists():
-                raise serializers.ValidationError({
-                    "barcode": "A product with this barcode already exists in the selected branch."
-                })
-
-        attrs["sku"] = sku
+        attrs["sku"] = validate_product_sku_for_branch(
+            branch=branch,
+            sku=sku,
+            current_product_id=(self.instance.pk if self.instance else None),
+        )
 
         compatible_models = str(
             attrs.get(
@@ -541,6 +586,16 @@ class ProductSerializer(serializers.ModelSerializer):
 
         if not normalized_value:
             return None
+
+        queryset = Product.objects.filter(barcode=normalized_value)
+
+        if self.instance:
+            queryset = queryset.exclude(pk=self.instance.pk)
+
+        if queryset.exists():
+            raise serializers.ValidationError(
+                "A product with this barcode already exists."
+            )
 
         return normalized_value
 
@@ -675,104 +730,13 @@ class ProductSerializer(serializers.ModelSerializer):
 
         product.variants.exclude(id__in=retained_ids).delete()
 
-    def _mirror_catalog_to_branch_db(self, product):
-        """Mirror shared catalog rows required by physical stock FKs.
-
-        ``default`` remains authoritative for catalog editing, while VAT and
-        NON_VAT keep same-PK mirrors so ProductStock/StockMovement foreign keys
-        are valid in the physical inventory database.
-        """
-        if not product.branch_id:
-            return "default"
-
-        using = database_alias_for_branch(product.branch_id)
-        if using == "default":
-            return using
-
-        def mirror_simple(instance, model, fields):
-            defaults = {field: getattr(instance, field) for field in fields}
-            model.objects.using(using).update_or_create(
-                pk=instance.pk, defaults=defaults
-            )
-
-        mirror_simple(product.brand, Brand, ["name", "is_active"])
-        mirror_simple(product.category, Category, ["name", "is_active"])
-
-        rack_ids = set()
-        if product.rack_id:
-            rack_ids.add(product.rack_id)
-        for variant in product.variants.all():
-            rack_ids.update(variant.racks.values_list("id", flat=True))
-
-        for rack in Rack.objects.using("default").filter(id__in=rack_ids):
-            Rack.objects.using(using).update_or_create(
-                pk=rack.pk,
-                defaults={
-                    "branch_id": rack.branch_id,
-                    "rack_code": rack.rack_code,
-                    "rack_name": rack.rack_name,
-                    "is_active": rack.is_active,
-                },
-            )
-
-        supplier_id = product.supplier_id
-        if supplier_id:
-            from apps.suppliers.models import Supplier
-            if not Supplier.objects.using(using).filter(pk=supplier_id).exists():
-                supplier_id = None
-
-        Product.objects.using(using).update_or_create(
-            pk=product.pk,
-            defaults={
-                "product_name": product.product_name,
-                "sku": product.sku,
-                "barcode": product.barcode,
-                "brand_id": product.brand_id,
-                "category_id": product.category_id,
-                "branch_id": product.branch_id,
-                "rack_id": product.rack_id,
-                "has_variants": product.has_variants,
-                "compatible_models": product.compatible_models,
-                "condition": product.condition,
-                "unit": product.unit,
-                "tax_treatment": product.tax_treatment,
-                "vat_inclusive": product.vat_inclusive,
-                "vat_rate": product.vat_rate,
-                "supplier_id": supplier_id,
-                "description": product.description,
-                "product_image": product.product_image.name if product.product_image else None,
-                "warranty_period_days": product.warranty_period_days,
-                "reorder_level": product.reorder_level,
-                "is_active": product.is_active,
-                "is_deleted": product.is_deleted,
-                "deleted_at": product.deleted_at,
-                "deleted_by_id": None,
-            },
+    def _mirror_catalog_to_branch_db(self, product, *, supplier_id=None):
+        return ensure_product_catalog_in_database(
+            product,
+            product.branch,
+            supplier_id=supplier_id,
+            validate_supplier=supplier_id not in (None, "", 0, "0"),
         )
-
-        mirrored_variant_ids = []
-        for variant in product.variants.all():
-            mirrored, _ = ProductVariant.objects.using(using).update_or_create(
-                pk=variant.pk,
-                defaults={
-                    "product_id": product.pk,
-                    "attributes": variant.attributes,
-                    "available_qty": variant.available_qty,
-                    "purchase_price": variant.purchase_price,
-                    "retail_price": variant.retail_price,
-                    "wholesale_price": variant.wholesale_price,
-                    "minimum_selling_price": variant.minimum_selling_price,
-                    "is_base": variant.is_base,
-                    "is_active": variant.is_active,
-                },
-            )
-            mirrored.racks.set(list(variant.racks.values_list("id", flat=True)))
-            mirrored_variant_ids.append(variant.pk)
-
-        ProductVariant.objects.using(using).filter(product_id=product.pk).exclude(
-            pk__in=mirrored_variant_ids
-        ).delete()
-        return using
 
     def _sync_branch_stock(self, product, *, reference_type):
         """Synchronize product-form quantity with the branch stock ledger."""
@@ -842,15 +806,29 @@ class ProductSerializer(serializers.ModelSerializer):
             "variants",
             [],
         )
+        supplier_id = validated_data.pop("supplier", None)
 
-        product = super().create(validated_data)
+        # Supplier is branch-owned and must never be persisted as a FK on the
+        # shared/default Product row. It is written only to the target physical
+        # product mirror after same-database validation.
+        try:
+            with transaction.atomic(using="default"):
+                product = super().create(validated_data)
+        except IntegrityError as exc:
+            if _is_product_sku_integrity_error(exc):
+                branch = require_physical_branch(validated_data.get("branch"))
+                sku = str(validated_data.get("sku") or "").strip()
+                raise serializers.ValidationError(
+                    {"sku": f"{sku} already exists in {physical_branch_label(branch)}."}
+                ) from exc
+            raise
 
         self._sync_variants(
             product,
             variants_data,
         )
 
-        self._mirror_catalog_to_branch_db(product)
+        self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
         self._sync_branch_stock(
             product,
             reference_type=("PRODUCT_CREATE"),
@@ -872,11 +850,27 @@ class ProductSerializer(serializers.ModelSerializer):
             "variants",
             [],
         )
+        supplier_supplied = "supplier" in validated_data
+        supplier_id = validated_data.pop("supplier", None)
+        if not supplier_supplied:
+            supplier_id = physical_product_supplier_id(instance, instance.branch_id)
 
-        product = super().update(
-            instance,
-            validated_data,
-        )
+        try:
+            with transaction.atomic(using="default"):
+                product = super().update(
+                    instance,
+                    validated_data,
+                )
+        except IntegrityError as exc:
+            if _is_product_sku_integrity_error(exc):
+                branch = require_physical_branch(
+                    validated_data.get("branch", instance.branch_id)
+                )
+                sku = str(validated_data.get("sku", instance.sku) or "").strip()
+                raise serializers.ValidationError(
+                    {"sku": f"{sku} already exists in {physical_branch_label(branch)}."}
+                ) from exc
+            raise
 
         if variants_supplied or not product.has_variants:
             self._sync_variants(
@@ -884,7 +878,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 variants_data,
             )
 
-        self._mirror_catalog_to_branch_db(product)
+        self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
         self._sync_branch_stock(
             product,
             reference_type=("PRODUCT_EDIT"),
@@ -1169,8 +1163,6 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
 
         if not branch:
             errors["branch"] = "Branch is required."
-        elif not is_physical_branch(branch):
-            errors["branch"] = "Select Branch 1 or Branch 2. Branch 3 cannot own stock adjustments."
 
         if not product:
             errors["product"] = "Product is required."

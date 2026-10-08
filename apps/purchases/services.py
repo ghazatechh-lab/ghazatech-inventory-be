@@ -4,6 +4,10 @@ from django.utils import timezone
 from apps.audit_logs.services import create_immutable_audit
 from apps.branch_data.services import database_alias_for_branch
 from apps.inventory.services import adjust_stock
+from apps.inventory.physical_catalog import (
+    ensure_product_catalog_in_database,
+    resolve_variant_in_physical_database,
+)
 
 
 def confirm_grn(grn, user, request=None):
@@ -34,12 +38,24 @@ def confirm_grn(grn, user, request=None):
             )
 
             if quantity > 0:
+                # A GRN may reference a shared catalog product while inventory
+                # lives in the physical branch DB. Ensure the product/variant
+                # mirror exists before ProductStock/StockMovement are created.
+                destination_product = ensure_product_catalog_in_database(
+                    item.product,
+                    grn.branch,
+                    strict_racks=False,
+                    reuse_existing_sku=True,
+                )
+                destination_variant = resolve_variant_in_physical_database(
+                    item.variant, destination_product, grn.branch
+                )
                 unit_cost = po_item.unit_price if po_item else None
                 tax_treatment = po_item.tax_treatment if po_item else item.product.tax_treatment
                 vat_percentage = po_item.vat_percentage if po_item else item.product.vat_rate
                 adjust_stock(
-                    product=item.product,
-                    variant=item.variant,
+                    product=destination_product,
+                    variant=destination_variant,
                     branch=grn.branch,
                     warehouse=grn.warehouse_location or "",
                     quantity=quantity,

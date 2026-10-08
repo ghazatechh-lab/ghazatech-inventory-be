@@ -5,7 +5,8 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from apps.inventory.models import ProductStock
-from apps.inventory.services import adjust_stock, resolve_or_create_destination_catalog_product
+from apps.inventory.services import adjust_stock
+from apps.inventory.physical_catalog import ensure_product_catalog_in_database
 from apps.branch_data.services import database_alias_for_branch
 
 
@@ -116,6 +117,7 @@ def dispatch(t, u):
     return t
 
 
+@transaction.atomic
 def receive(t, u):
     status = str(t.status or "").upper()
     if status not in {"DISPATCHED", "IN_TRANSIT"}:
@@ -123,38 +125,41 @@ def receive(t, u):
             {"status": "Only dispatched transfers can be received."}
         )
 
-    destination_db = database_alias_for_branch(t.to_branch)
+    for item in t.items.select_related("product", "variant"):
+        # Ensure the destination DB has a valid catalog mirror before stock is
+        # written. Supplier/rack relationships are never copied blindly from
+        # the source branch. Existing destination supplier mapping is preserved.
+        ensure_product_catalog_in_database(
+            item.product,
+            t.to_branch,
+            strict_racks=False,
+        )
 
-    with transaction.atomic(using=destination_db):
-        for item in t.items.select_related("product", "variant"):
-            quantity = item.received_quantity or max(
-                0, item.dispatched_quantity - item.damaged_quantity
-            )
-            destination_product, destination_variant = resolve_or_create_destination_catalog_product(
-                item.product, t.to_branch, source_variant=item.variant
-            )
-            adjust_stock(
-                product=destination_product,
-                variant=destination_variant,
-                branch=t.to_branch,
-                quantity=quantity,
-                movement_type="TRANSFER_IN",
-                performed_by=u,
-                reference_type="Transfer",
-                reference_id=t.id,
-                remarks=f"Transfer {t.transfer_number} from {t.from_branch.branch_code}",
-                unit_cost=item.transfer_unit_cost,
-                vat_treatment="OUT_OF_SCOPE",
-                source_document_number=t.transfer_number,
-            )
-            item.received_quantity = quantity
-            item.destination_value = Decimal(quantity) * Decimal(
-                item.transfer_unit_cost or 0
-            )
-            item.value_difference = item.destination_value - Decimal(item.source_value or 0)
-            item.save(
-                update_fields=["received_quantity", "destination_value", "value_difference"]
-            )
+        quantity = item.received_quantity or max(
+            0, item.dispatched_quantity - item.damaged_quantity
+        )
+        adjust_stock(
+            product=item.product,
+            variant=item.variant,
+            branch=t.to_branch,
+            quantity=quantity,
+            movement_type="TRANSFER_IN",
+            performed_by=u,
+            reference_type="Transfer",
+            reference_id=t.id,
+            remarks=f"Transfer {t.transfer_number} from {t.from_branch.branch_code}",
+            unit_cost=item.transfer_unit_cost,
+            vat_treatment="OUT_OF_SCOPE",
+            source_document_number=t.transfer_number,
+        )
+        item.received_quantity = quantity
+        item.destination_value = Decimal(quantity) * Decimal(
+            item.transfer_unit_cost or 0
+        )
+        item.value_difference = item.destination_value - Decimal(item.source_value or 0)
+        item.save(
+            update_fields=["received_quantity", "destination_value", "value_difference"]
+        )
 
     t.status = "RECEIVED"
     t.received_by = u
