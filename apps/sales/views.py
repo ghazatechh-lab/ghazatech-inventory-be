@@ -2,7 +2,7 @@ import csv
 from io import BytesIO
 from datetime import timedelta
 from decimal import Decimal
-from apps.common.three_branch import SalesBranchGuardMixin, get_requested_branch, request_sale_mode
+from apps.common.three_branch import BranchAccessQuerysetMixin, get_requested_branch, request_sale_mode
 
 from django.db import transaction
 from django.db.models import Avg, Count, DurationField, ExpressionWrapper, F, Q, Sum
@@ -10,9 +10,16 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.decorators import action
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
+from apps.common.transactions import routed_atomic
+from apps.branch_data.combined import combined_list
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.routing import BR03
+from apps.branch_data.services import database_alias_for_branch
+from apps.branch_data.sales_flow import SalesPhysicalBranchGuardMixin
 
 from .models import *
 from apps.inventory.models import Product, ProductStock, StockMovement
@@ -62,9 +69,10 @@ def _sales_product_options(branch_id, user=None):
     if not branch:
         return []
 
+    using = database_alias_for_branch(branch.id)
     stocks = (
-        ProductStock.objects.select_related("product", "variant", "branch")
-        .filter(branch=branch, product__is_active=True)
+        ProductStock.objects.using(using).select_related("product", "variant", "branch")
+        .filter(branch_id=branch.id, product__is_active=True)
         .order_by("product__product_name", "variant_id")
     )
 
@@ -169,11 +177,327 @@ def _salespeople_options():
     return result
 
 
-class Base(SalesBranchGuardMixin, ModelViewSet):
+class Base(SalesPhysicalBranchGuardMixin, CombinedPhysicalBranchListMixin, BranchAccessQuerysetMixin, ModelViewSet):
+    def request_querysets(self):
+        combined = self.combined_querysets()
+        if combined is not None:
+            return [item[3] for item in combined]
+        return [self.filter_queryset(self.get_queryset())]
+
+    @staticmethod
+    def sum_counts(querysets, method):
+        return sum(method(queryset) for queryset in querysets)
+
+    def combined_summary_response(self):
+        combined = self.combined_querysets()
+        if combined is None:
+            return None
+
+        querysets = [item[3] for item in combined]
+        today = timezone.localdate()
+        name = self.__class__.__name__
+
+        def sum_value(qs_list, field, **filters):
+            total = Decimal("0")
+            for qs in qs_list:
+                value = qs.filter(**filters).aggregate(value=Sum(field))["value"] or 0
+                total += Decimal(str(value))
+            return total
+
+        if name == "QuotationViewSet":
+            week_start = today - timedelta(days=today.weekday())
+            open_statuses = ["DRAFT", "SENT", "PENDING"]
+            accepted_rows = []
+            for qs in querysets:
+                accepted_rows.extend(
+                    qs.filter(
+                        status="ACCEPTED",
+                        accepted_at__year=today.year,
+                        accepted_at__month=today.month,
+                        accepted_at__isnull=False,
+                    ).values_list("accepted_at", "created_at")
+                )
+            days = [
+                (accepted_at - created_at).total_seconds() / 86400
+                for accepted_at, created_at in accepted_rows
+                if accepted_at and created_at
+            ]
+            return {
+                "open_quotations": sum(qs.filter(status__in=open_statuses).count() for qs in querysets),
+                "open_change": f"+{sum(qs.filter(created_at__date__gte=week_start).count() for qs in querysets)}",
+                "value_pending": sum_value(querysets, "total_amount", status__in=["SENT", "PENDING"]),
+                "accepted_this_month": len(accepted_rows),
+                "acceptance_change": 0,
+                "avg_turnaround_days": round(sum(days) / len(days), 1) if days else 0,
+            }
+
+        if name == "SalesOrderViewSet":
+            open_statuses = ["DRAFT", "PENDING", "CONFIRMED", "AWAITING_FULFILLMENT", "PARTIALLY_FULFILLED"]
+            fulfilled_count = 0
+            fulfilled_on_time = 0
+            for qs in querysets:
+                fulfilled = qs.filter(status="FULFILLED")
+                fulfilled_count += fulfilled.count()
+                fulfilled_on_time += fulfilled.filter(fulfilled_at__date__lte=F("delivery_date")).count()
+            return {
+                "open_orders": sum(qs.filter(status__in=open_statuses).count() for qs in querysets),
+                "open_today": sum(qs.filter(created_at__date=today).count() for qs in querysets),
+                "awaiting_fulfillment": sum(qs.filter(status__in=["CONFIRMED", "AWAITING_FULFILLMENT", "PARTIALLY_FULFILLED"]).count() for qs in querysets),
+                "order_value_mtd": sum_value(querysets, "total_amount", order_date__year=today.year, order_date__month=today.month),
+                "order_value_change": 0,
+                "fulfilled_on_time": round(fulfilled_on_time / fulfilled_count * 100, 1) if fulfilled_count else 0,
+            }
+
+        if name == "SalesInvoiceViewSet":
+            outstanding_total = Decimal("0")
+            overdue_total = Decimal("0")
+            outstanding_count = overdue_count = 0
+            paid_month = Decimal("0")
+            durations = []
+            for qs in querysets:
+                outstanding = qs.filter(balance_due__gt=0).exclude(payment_status="VOID")
+                overdue = outstanding.filter(due_date__lt=today)
+                outstanding_total += Decimal(str(outstanding.aggregate(value=Sum("balance_due"))["value"] or 0))
+                overdue_total += Decimal(str(overdue.aggregate(value=Sum("balance_due"))["value"] or 0))
+                outstanding_count += outstanding.count()
+                overdue_count += overdue.count()
+                paid_month += Decimal(str(qs.filter(payment_status="PAID", paid_at__year=today.year, paid_at__month=today.month).aggregate(value=Sum("total_amount"))["value"] or 0))
+                for paid_at, invoice_date in qs.filter(payment_status="PAID", paid_at__isnull=False, invoice_date__isnull=False).values_list("paid_at", "invoice_date"):
+                    durations.append((paid_at.date() - invoice_date).days)
+            return {
+                "outstanding": outstanding_total,
+                "outstanding_count": outstanding_count,
+                "overdue": overdue_total,
+                "overdue_count": overdue_count,
+                "paid_this_month": paid_month,
+                "paid_change": 0,
+                "avg_days_to_pay": round(sum(durations) / len(durations), 1) if durations else 0,
+            }
+
+        if name == "POSSaleViewSet":
+            total = cash = card = Decimal("0")
+            count = returns_today = 0
+            for source, alias, branch, qs in combined:
+                today_qs = qs.filter(sale_datetime__date=today, status="PAID")
+                total += Decimal(str(today_qs.aggregate(value=Sum("total_amount"))["value"] or 0))
+                count += today_qs.count()
+                cash += Decimal(str(today_qs.filter(payment_method="CASH").aggregate(value=Sum("total_amount"))["value"] or 0))
+                cash += Decimal(str(today_qs.filter(payment_method="SPLIT").aggregate(value=Sum("cash_amount"))["value"] or 0))
+                card += Decimal(str(today_qs.filter(payment_method="CARD").aggregate(value=Sum("total_amount"))["value"] or 0))
+                card += Decimal(str(today_qs.filter(payment_method="SPLIT").aggregate(value=Sum("card_amount"))["value"] or 0))
+                returns_today += SalesReturn.objects.using(alias).filter(branch_id=branch.id, return_date=today).count()
+            payment_total = cash + card
+            return {
+                "todays_sales": total,
+                "transactions": count,
+                "avg_basket_size": (total / count) if count else 0,
+                "cash_percentage": round(cash / payment_total * 100, 1) if payment_total else 0,
+                "card_percentage": round(card / payment_total * 100, 1) if payment_total else 0,
+                "returns_today": returns_today,
+            }
+
+        if name == "SalesPaymentViewSet":
+            methods = set()
+            for qs in querysets:
+                methods.update(qs.exclude(payment_method__isnull=True).exclude(payment_method="").values_list("payment_method", flat=True).distinct())
+            return {
+                "received_today": sum_value(querysets, "amount", payment_date=today, status="PAID"),
+                "received_mtd": sum_value(querysets, "amount", payment_date__year=today.year, payment_date__month=today.month, status="PAID"),
+                "pending_clearance": sum_value(querysets, "amount", status="PENDING"),
+                "active_methods": len(methods),
+            }
+
+        if name == "SalesReturnViewSet":
+            resolution_days = []
+            for qs in querysets:
+                for completed_at, created_at in qs.filter(status="COMPLETED", completed_at__isnull=False).values_list("completed_at", "created_at"):
+                    resolution_days.append((completed_at.date() - created_at.date()).days)
+            return {
+                "open_returns": sum(qs.filter(status__in=["DRAFT", "PENDING_APPROVAL", "APPROVED"]).count() for qs in querysets),
+                "value_mtd": sum_value(querysets, "total_amount", return_date__year=today.year, return_date__month=today.month),
+                "restocked": sum(qs.filter(status="COMPLETED", items__condition="SELLABLE").distinct().count() for qs in querysets),
+                "avg_resolution_days": round(sum(resolution_days) / len(resolution_days), 1) if resolution_days else 0,
+            }
+
+        if name == "PriceListViewSet":
+            week_end = today + timedelta(days=7)
+            active_promotions = 0
+            overrides = 0
+            for _source, alias, _branch, qs in combined:
+                active_promotions += qs.filter(status="ACTIVE", valid_from__lte=today).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=today)).count()
+                overrides += PriceListItem.objects.using(alias).filter(price_list_id__in=qs.values_list("id", flat=True), custom_price__isnull=False).count()
+            return {
+                "active_price_lists": sum(qs.filter(status="ACTIVE").count() for qs in querysets),
+                "items_with_overrides": overrides,
+                "active_promotions": active_promotions,
+                "expiring_this_week": sum(qs.filter(status="ACTIVE", valid_until__range=[today, week_end]).count() for qs in querysets),
+            }
+
+        if name == "SalesReportViewSet":
+            month_start = today.replace(day=1)
+            revenue = Decimal("0")
+            order_count = quotation_count = 0
+            customer_totals = {}
+            for _source, alias, branch, _qs in combined:
+                invoices = SalesInvoice.objects.using(alias).filter(branch_id=branch.id, invoice_date__gte=month_start, invoice_date__lte=today).exclude(payment_status="VOID")
+                orders = SalesOrder.objects.using(alias).filter(branch_id=branch.id, order_date__gte=month_start, order_date__lte=today)
+                quotations = Quotation.objects.using(alias).filter(branch_id=branch.id, quote_date__gte=month_start, quote_date__lte=today)
+                revenue += Decimal(str(invoices.aggregate(value=Sum("total_amount"))["value"] or 0))
+                order_count += orders.count()
+                quotation_count += quotations.count()
+                for row in invoices.values("customer__customer_name").annotate(value=Sum("total_amount")):
+                    key = row["customer__customer_name"] or ""
+                    customer_totals[key] = customer_totals.get(key, Decimal("0")) + Decimal(str(row["value"] or 0))
+            top_customer, top_value = (max(customer_totals.items(), key=lambda item: item[1]) if customer_totals else ("", Decimal("0")))
+            return {
+                "revenue_mtd": revenue,
+                "revenue_change": 0,
+                "orders_mtd": order_count,
+                "orders_change": 0,
+                "top_customer": top_customer,
+                "top_customer_value": top_value,
+                "conversion_rate": round(order_count / quotation_count * 100, 1) if quotation_count else 0,
+            }
+
+        return None
+
     def get_queryset(self):
         qs = super().get_queryset()
         b = self.request.query_params.get("branch")
         return qs.filter(branch_id=b) if b else qs
+
+    def _combined_filtered_queryset(self, queryset, branch_code):
+        """Apply normal sales list filters for one physical source DB.
+
+        The incoming logical branch is BR03, so it must never be applied as
+        the physical branch filter. Instead each source is explicitly locked
+        to BR01 or BR02 while all other exact filters, search and ordering are
+        preserved.
+        """
+        queryset = queryset.filter(
+            branch__branch_code__iexact=branch_code,
+        )
+
+        ignored = {
+            "branch",
+            "page",
+            "page_size",
+            "search",
+            "q",
+            "ordering",
+            "source_branch",
+            "target_branch",
+        }
+
+        for field in getattr(self, "filterset_fields", []) or []:
+            if field in ignored:
+                continue
+
+            value = self.request.query_params.get(field)
+            if value not in (None, ""):
+                queryset = queryset.filter(**{field: value})
+
+        queryset = SearchFilter().filter_queryset(
+            self.request,
+            queryset,
+            self,
+        )
+
+        queryset = OrderingFilter().filter_queryset(
+            self.request,
+            queryset,
+            self,
+        )
+
+        return queryset
+
+    def _combined_ordering(self):
+        requested = self.request.query_params.get("ordering")
+
+        if requested:
+            ordering = requested.split(",", 1)[0].strip()
+        else:
+            configured = getattr(self, "ordering", None)
+
+            if isinstance(configured, (list, tuple)):
+                ordering = str(configured[0]) if configured else "-id"
+            else:
+                ordering = str(configured or "-id")
+
+        reverse = ordering.startswith("-")
+        field = ordering.lstrip("-")
+
+        # Most API ordering fields are also serializer fields. For related
+        # customer ordering use the serializer's flattened customer_name.
+        aliases = {
+            "customer__customer_name": "customer_name",
+            "salesperson__username": "salesperson_name",
+            "branch__branch_name": "branch_name",
+        }
+        field = aliases.get(field, field)
+
+        def key(row):
+            value = row.get(field)
+
+            if value is None:
+                value = (
+                    row.get("created_at")
+                    or row.get("updated_at")
+                    or row.get("id")
+                    or ""
+                )
+
+            return str(value)
+
+        return key, reverse
+
+    def list(self, request, *args, **kwargs):
+        branch = get_requested_branch(request)
+
+        if branch is None or str(branch.branch_code).upper() != BR03:
+            return super().list(request, *args, **kwargs)
+
+        base_queryset = self.queryset.all()
+
+        vat_queryset = self._combined_filtered_queryset(
+            base_queryset,
+            "BR01",
+        )
+        non_vat_queryset = self._combined_filtered_queryset(
+            base_queryset,
+            "BR02",
+        )
+
+        ordering_key, reverse = self._combined_ordering()
+
+        page = combined_list(
+            vat_queryset=vat_queryset,
+            non_vat_queryset=non_vat_queryset,
+            serializer_class=self.get_serializer_class(),
+            serializer_context=self.get_serializer_context(),
+            source_filter={
+                "BR01": "VAT",
+                "BR02": "NON_VAT",
+                "BRANCH_1": "VAT",
+                "BRANCH_2": "NON_VAT",
+            }.get(
+                str(request.query_params.get("source_branch", "ALL")).upper().replace("-", "_"),
+                str(request.query_params.get("source_branch", "ALL")).upper().replace("-", "_"),
+            ),
+            ordering_key=ordering_key,
+            reverse=reverse,
+            page=request.query_params.get("page", 1),
+            page_size=request.query_params.get("page_size", 12),
+        )
+
+        return Response(
+            {
+                "count": page.count,
+                "next": None,
+                "previous": None,
+                "results": page.results,
+            }
+        )
 
 
 class QuotationViewSet(Base):
@@ -232,7 +556,7 @@ class QuotationViewSet(Base):
                         "branch_name": b.branch_name,
                         "branch_code": getattr(b, "branch_code", ""),
                     }
-                    for b in Branch.objects.filter(is_active=True).order_by(
+                    for b in Branch.objects.filter(is_active=True, branch_code__in=["BR01", "BR02"]).order_by(
                         "branch_name"
                     )
                 ],
@@ -256,6 +580,10 @@ class QuotationViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
 
         today = timezone.localdate()
@@ -366,7 +694,7 @@ class QuotationViewSet(Base):
 
         return response
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -598,6 +926,7 @@ class SalesOrderViewSet(Base):
 
         branches = Branch.objects.filter(
             is_active=True,
+            branch_code__in=["BR01", "BR02"],
         ).order_by("branch_name")
 
         customers = Customer.objects.filter(
@@ -703,6 +1032,10 @@ class SalesOrderViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
 
         today = timezone.localdate()
@@ -809,69 +1142,82 @@ class SalesOrderViewSet(Base):
 
         return response
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
     )
     def confirm(self, request, pk=None):
         order = self.get_object()
-
-        if order.status != "DRAFT":
-            return Response(
-                {"detail": "Only draft sales orders can be confirmed."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        for item in order.items.all():
-            stock = (
-                ProductStock.objects.select_for_update()
-                .filter(
-                    product=item.product,
-                    variant=item.variant,
-                    branch=order.branch,
-                )
-                .first()
-            )
-
-            if not stock:
-                return Response(
-                    {
-                        "detail": f"No stock record found for {item.product.product_name}."
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            available = stock.current_stock - stock.reserved_stock
-
-            if available < item.quantity:
-                return Response(
-                    {"detail": f"Insufficient stock for {item.product.product_name}."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            stock.reserved_stock += item.quantity
-            stock.save(
-                update_fields=[
-                    "reserved_stock",
-                    "updated_at",
-                ]
-            )
-
-        order.status = "CONFIRMED"
-        order.confirmed_at = timezone.now()
-
-        order.save(
-            update_fields=[
-                "status",
-                "confirmed_at",
-                "updated_at",
-            ]
+        using = (
+            getattr(getattr(order, "_state", None), "db", None)
+            or database_alias_for_branch(order.branch_id)
         )
+
+        with transaction.atomic(using=using):
+            order = (
+                SalesOrder.objects.using(using)
+                .select_for_update()
+                .get(pk=order.pk)
+            )
+
+            if order.status != "DRAFT":
+                return Response(
+                    {"detail": "Only draft sales orders can be confirmed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            for item in order.items.all():
+                stock_rows = list(
+                    ProductStock.objects.using(using)
+                    .select_for_update()
+                    .filter(
+                        product_id=item.product_id,
+                        variant_id=item.variant_id,
+                        branch_id=order.branch_id,
+                    )
+                    .order_by("warehouse", "id")
+                )
+                available = sum(
+                    max(0, int(row.available_stock or 0))
+                    for row in stock_rows
+                )
+
+                if not stock_rows or available < int(item.quantity):
+                    return Response(
+                        {
+                            "detail": (
+                                f"Insufficient stock for {item.product.product_name}. "
+                                f"Available: {available}."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                remaining = int(item.quantity)
+                for stock in stock_rows:
+                    if remaining <= 0:
+                        break
+                    can_reserve = max(0, int(stock.available_stock or 0))
+                    reserve = min(remaining, can_reserve)
+                    if reserve:
+                        stock.reserved_stock += reserve
+                        stock.save(
+                            using=using,
+                            update_fields=["reserved_stock", "updated_at"],
+                        )
+                        remaining -= reserve
+
+            order.status = "CONFIRMED"
+            order.confirmed_at = timezone.now()
+            order.save(
+                using=using,
+                update_fields=["status", "confirmed_at", "updated_at"],
+            )
 
         return Response(self.get_serializer(order).data)
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -962,36 +1308,61 @@ class SalesInvoiceViewSet(Base):
 
     serializer_class = SalesInvoiceSerializer
 
-    @transaction.atomic
     def perform_create(self, serializer):
         creator = (
             self.request.user
             if self.request.user and self.request.user.is_authenticated
             else None
         )
-        invoice = serializer.save(
-            created_by=creator,
-            updated_by=creator,
-        )
-        post_sales_invoice(
-            invoice,
-            user=(self.request.user if self.request.user.is_authenticated else None),
-        )
 
-    @transaction.atomic
+        branch = serializer.validated_data.get("branch")
+        if branch is None:
+            raise serializers.ValidationError({"branch": "Branch is required."})
+
+        using = database_alias_for_branch(branch.pk)
+
+        # Keep the invoice, nested items and accounting journal in the same
+        # physical branch database. A plain @transaction.atomic would open a
+        # transaction on default even when the ORM is routed to VAT/NON_VAT.
+        with transaction.atomic(using=using):
+            invoice = serializer.save(
+                created_by=creator,
+                updated_by=creator,
+            )
+            post_sales_invoice(
+                invoice,
+                user=(
+                    self.request.user
+                    if self.request.user.is_authenticated
+                    else None
+                ),
+            )
+
     def perform_update(self, serializer):
         updater = (
             self.request.user
             if self.request.user and self.request.user.is_authenticated
             else None
         )
-        invoice = serializer.save(updated_by=updater)
-        # Unpaid invoice amendments are auditable: reverse the previous system
-        # journal and post the new totals instead of silently editing the GL.
-        repost_sales_invoice(
-            invoice,
-            user=(self.request.user if self.request.user.is_authenticated else None),
+
+        instance = serializer.instance
+        using = (
+            getattr(getattr(instance, "_state", None), "db", None)
+            or database_alias_for_branch(instance.branch_id)
         )
+
+        with transaction.atomic(using=using):
+            invoice = serializer.save(updated_by=updater)
+            # Unpaid invoice amendments are auditable: reverse the previous
+            # system journal and post the new totals in the same source DB.
+            repost_sales_invoice(
+                invoice,
+                user=(
+                    self.request.user
+                    if self.request.user.is_authenticated
+                    else None
+                ),
+            )
 
     search_fields = [
         "invoice_number",
@@ -1038,6 +1409,7 @@ class SalesInvoiceViewSet(Base):
 
         branches = Branch.objects.filter(
             is_active=True,
+            branch_code__in=["BR01", "BR02"],
         ).order_by("branch_name")
 
         customers = Customer.objects.filter(
@@ -1173,6 +1545,10 @@ class SalesInvoiceViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
 
         today = timezone.localdate()
@@ -1334,7 +1710,7 @@ class SalesInvoiceViewSet(Base):
             }
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -1461,7 +1837,7 @@ class POSSaleViewSet(Base):
                 branch_id=branch_id,
             )
 
-        branches = Branch.objects.filter(is_active=True).order_by("branch_name")
+        branches = Branch.objects.filter(is_active=True, branch_code__in=["BR01", "BR02"]).order_by("branch_name")
         categories = sorted(
             {
                 str(getattr(customer, "category", "") or "").strip()
@@ -1520,6 +1896,10 @@ class POSSaleViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
 
         today = timezone.localdate()
@@ -1649,7 +2029,7 @@ class POSSaleViewSet(Base):
 
         return response
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -1660,56 +2040,47 @@ class POSSaleViewSet(Base):
         if sale.status == "VOID":
             return Response(self.get_serializer(sale).data)
 
-        for item in sale.items.select_related(
-            "product",
-            "variant",
-        ):
-            stock = ProductStock.objects.select_for_update().get(
-                product=item.product,
-                variant=item.variant,
-                branch=sale.branch,
+        using = (
+            getattr(getattr(sale, "_state", None), "db", None)
+            or database_alias_for_branch(sale.branch_id)
+        )
+
+        with transaction.atomic(using=using):
+            sale = (
+                POSSale.objects.using(using)
+                .select_for_update()
+                .get(pk=sale.pk)
             )
 
-            previous_stock = stock.current_stock
-            stock.current_stock = stock.current_stock + item.quantity
+            from apps.inventory.services import adjust_stock
 
-            stock.save(
+            for item in sale.items.select_related("product", "variant"):
+                adjust_stock(
+                    product=item.product,
+                    variant=item.variant,
+                    branch=sale.branch,
+                    quantity=int(item.quantity),
+                    movement_type="SALE_RETURN",
+                    performed_by=(
+                        request.user if request.user.is_authenticated else None
+                    ),
+                    reference_type="POS_VOID",
+                    reference_id=str(sale.id),
+                    remarks=f"Void POS sale {sale.receipt_number}",
+                )
+
+            sale.status = "VOID"
+            sale.voided_at = timezone.now()
+            sale.void_reason = request.data.get("reason", "")
+            sale.save(
+                using=using,
                 update_fields=[
-                    "current_stock",
+                    "status",
+                    "voided_at",
+                    "void_reason",
                     "updated_at",
-                ]
+                ],
             )
-
-            StockMovement.objects.create(
-                movement_number=(f"MOV-VOID-{sale.receipt_number}-{item.id}"),
-                product=item.product,
-                variant=item.variant,
-                branch=sale.branch,
-                movement_type="SALE_RETURN",
-                quantity=item.quantity,
-                previous_stock=previous_stock,
-                new_stock=stock.current_stock,
-                reference_type="POS_VOID",
-                reference_id=str(sale.id),
-                remarks=(f"Void POS sale {sale.receipt_number}"),
-                performed_by=request.user,
-            )
-
-        sale.status = "VOID"
-        sale.voided_at = timezone.now()
-        sale.void_reason = request.data.get(
-            "reason",
-            "",
-        )
-
-        sale.save(
-            update_fields=[
-                "status",
-                "voided_at",
-                "void_reason",
-                "updated_at",
-            ]
-        )
 
         return Response(self.get_serializer(sale).data)
 
@@ -1724,7 +2095,7 @@ class SalesPaymentViewSet(Base):
     )
     serializer_class = SalesPaymentSerializer
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(self, serializer):
         payment = serializer.save()
         if str(payment.status or "").upper() == "PAID":
@@ -1735,7 +2106,7 @@ class SalesPaymentViewSet(Base):
                 ),
             )
 
-    @transaction.atomic
+    @routed_atomic
     def perform_update(self, serializer):
         previous_status = str(serializer.instance.status or "").upper()
         if previous_status == "PAID":
@@ -1909,6 +2280,10 @@ class SalesPaymentViewSet(Base):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
         today = timezone.localdate()
 
@@ -2126,7 +2501,7 @@ class SalesReturnViewSet(Base):
         )
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def submit(self, request, pk=None):
         instance = self.get_object()
         if instance.status not in ["DRAFT", "REJECTED"]:
@@ -2161,7 +2536,7 @@ class SalesReturnViewSet(Base):
         )
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def approve(self, request, pk=None):
         instance = self.get_object()
         if instance.status != "PENDING_APPROVAL":
@@ -2192,7 +2567,7 @@ class SalesReturnViewSet(Base):
         return self._workflow_response(instance, "Sales return approved.")
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def reject(self, request, pk=None):
         instance = self.get_object()
         if instance.status != "PENDING_APPROVAL":
@@ -2228,7 +2603,7 @@ class SalesReturnViewSet(Base):
         return self._workflow_response(instance, "Sales return rejected.")
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def complete(self, request, pk=None):
         instance = self.get_object()
         if instance.status != "APPROVED":
@@ -2243,7 +2618,7 @@ class SalesReturnViewSet(Base):
         return self._workflow_response(instance, "Sales return completed.")
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def cancel(self, request, pk=None):
         instance = self.get_object()
         if instance.status in ["COMPLETED", "CANCELLED"]:
@@ -2258,6 +2633,10 @@ class SalesReturnViewSet(Base):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
         today = timezone.localdate()
         completed = queryset.filter(
@@ -2406,6 +2785,10 @@ class PriceListViewSet(Base):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         queryset = self.filter_queryset(self.get_queryset())
         today = timezone.localdate()
         week_end = today + timedelta(days=7)
@@ -2842,6 +3225,10 @@ class SalesReportViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
+        combined_summary = self.combined_summary_response()
+        if combined_summary is not None:
+            return Response(combined_summary)
+
         branch_id = request.query_params.get("branch")
 
         today = timezone.localdate()
@@ -3366,7 +3753,8 @@ class DeliveryNoteViewSet(Base):
     @action(detail=True, methods=["post"])
     def deliver(self, request, pk=None):
         note = self.get_object()
-        with transaction.atomic():
+        using = getattr(getattr(note, "_state", None), "db", None) or database_alias_for_branch(note.branch_id)
+        with transaction.atomic(using=using):
             for row in note.items.select_related("sales_order_item"):
                 if row.sales_order_item:
                     row.sales_order_item.fulfilled_quantity = min(

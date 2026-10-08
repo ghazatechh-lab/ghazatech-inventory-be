@@ -1,8 +1,10 @@
 from pathlib import Path
 
 from django.db import transaction
+from apps.common.transactions import routed_atomic
 from django.db.models import Sum
 from rest_framework import serializers
+from apps.branch_data.purchase_flow import PurchasePhysicalBranchSerializerMixin
 
 from .models import (
     Supplier,
@@ -62,6 +64,7 @@ class SupplierDocumentSerializer(
 
 
 class SupplierSerializer(
+    PurchasePhysicalBranchSerializerMixin,
     serializers.ModelSerializer,
 ):
     total_purchases = serializers.SerializerMethodField()
@@ -111,6 +114,7 @@ class SupplierSerializer(
 
         return attrs
 
+    @routed_atomic
     def _generate_supplier_code(self, branch):
         branch_code = (
             str(getattr(branch, "branch_code", "") or f"B{branch.pk}")
@@ -154,7 +158,7 @@ class SupplierSerializer(
 
         return candidate
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         branch = validated_data["branch"]
         validated_data.pop("supplier_code", None)
@@ -163,6 +167,7 @@ class SupplierSerializer(
 
         return super().create(validated_data)
 
+    @routed_atomic
     def update(self, instance, validated_data):
         validated_data.pop("supplier_code", None)
         return super().update(instance, validated_data)

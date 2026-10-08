@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
+from apps.common.transactions import routed_atomic
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import action, api_view
@@ -34,7 +35,9 @@ from .serializers import (
     StockMovementSerializer,
     variant_label,
 )
-from .services import adjust_stock
+from .services import adjust_stock, resolve_unit_cost_excluding_vat
+from apps.branch_data.services import database_alias_for_branch
+from apps.branches.models import Branch
 from .permissions import ReferenceDataPermission
 from .product_import_export import (
     import_products_from_workbook,
@@ -70,7 +73,6 @@ class RackViewSet(ModelViewSet):
         "is_active",
         "created_at",
     ]
-    queryset = Rack.objects.select_related("branch").all()
     serializer_class = RackSerializer
     search_fields = [
         "rack_code",
@@ -78,7 +80,49 @@ class RackViewSet(ModelViewSet):
         "branch__branch_name",
         "branch__branch_code",
     ]
-    filterset_fields = ["branch", "is_active"]
+    filterset_fields = ["is_active"]
+
+    @staticmethod
+    def _mirror_to_physical_db(rack):
+        using = database_alias_for_branch(rack.branch_id)
+        if using == "default":
+            raise ValidationError({"branch": "Branch 3 cannot own racks."})
+        Rack.objects.using(using).update_or_create(
+            pk=rack.pk,
+            defaults={
+                "branch_id": rack.branch_id,
+                "rack_code": rack.rack_code,
+                "rack_name": rack.rack_name,
+                "is_active": rack.is_active,
+            },
+        )
+
+    def perform_create(self, serializer):
+        rack = serializer.save()
+        self._mirror_to_physical_db(rack)
+
+    def perform_update(self, serializer):
+        rack = serializer.save()
+        self._mirror_to_physical_db(rack)
+
+    def get_queryset(self):
+        queryset = Rack.objects.select_related("branch").all()
+        branch_id = self.request.query_params.get("branch")
+
+        if not branch_id:
+            return queryset
+
+        try:
+            branch = Branch.objects.get(pk=branch_id)
+        except (Branch.DoesNotExist, TypeError, ValueError):
+            return queryset.none()
+
+        # BR03 is a virtual combined branch and never owns racks.
+        # Its rack list is the union of the two physical branches.
+        if branch.branch_code == "BR03":
+            return queryset.filter(branch__branch_code__in=["BR01", "BR02"])
+
+        return queryset.filter(branch_id=branch.id)
 
 
 class ProductViewSet(ModelViewSet):
@@ -117,10 +161,19 @@ class ProductViewSet(ModelViewSet):
         rack_id = self.request.query_params.get("rack")
 
         if branch_id:
-            queryset = queryset.filter(
-                Q(branch_id=branch_id)
-                | Q(stocks__branch_id=branch_id, stocks__current_stock__gt=0)
-            ).distinct()
+            try:
+                requested_branch = Branch.objects.get(pk=branch_id)
+            except (Branch.DoesNotExist, TypeError, ValueError):
+                return queryset.none()
+
+            if requested_branch.branch_code == "BR03":
+                # BR03 is virtual. Products created for either physical branch
+                # must remain visible from the combined branch.
+                queryset = queryset.filter(
+                    branch__branch_code__in=["BR01", "BR02"]
+                ).distinct()
+            else:
+                queryset = queryset.filter(branch_id=requested_branch.id).distinct()
 
         if rack_id:
             queryset = queryset.filter(variants__racks_id=rack_id).distinct()
@@ -200,10 +253,10 @@ class StockViewSet(ReadOnlyModelViewSet):
         "variant",
     ]
 
-    def get_queryset(self):
-        """Return unified stock rows for products and active variants."""
+    def _base_queryset(self, using=None):
+        manager = ProductStock.objects.using(using) if using else ProductStock.objects
         return (
-            ProductStock.objects.select_related(
+            manager.select_related(
                 "product",
                 "product__brand",
                 "product__category",
@@ -213,6 +266,15 @@ class StockViewSet(ReadOnlyModelViewSet):
             .prefetch_related("product__variants")
             .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
         )
+
+    def get_queryset(self):
+        """Return stock from the database that physically owns the branch."""
+        branch_id = self.request.query_params.get("branch") if self.request else None
+        if branch_id:
+            branch = Branch.objects.filter(pk=branch_id).first()
+            if branch and branch.branch_code != "BR03":
+                return self._base_queryset(database_alias_for_branch(branch.id))
+        return self._base_queryset()
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
@@ -228,19 +290,54 @@ class StockViewSet(ReadOnlyModelViewSet):
         max_price = request.query_params.get("max_price")
         ordering = request.query_params.get("ordering", "product_name")
 
+        requested_branch = Branch.objects.filter(pk=branch_id).first() if branch_id else None
+        if requested_branch and requested_branch.branch_code == "BR03":
+            physical_branches = list(
+                Branch.objects.filter(branch_code__in=["BR01", "BR02"], is_active=True)
+            )
+            combined_rows = []
+            for physical_branch in physical_branches:
+                using = database_alias_for_branch(physical_branch.id)
+                combined_rows.extend(
+                    list(
+                        self._base_queryset(using).filter(
+                            branch_id=physical_branch.id
+                        )
+                    )
+                )
+            queryset = combined_rows
+            branch_id = None
+
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
-        if product_id:
-            queryset = queryset.filter(product_id=product_id)
-        if category_id:
-            queryset = queryset.filter(product__category_id=category_id)
-        if search:
-            queryset = queryset.filter(
-                Q(product__product_name__icontains=search)
-                | Q(product__sku__icontains=search)
-                | Q(branch__branch_name__icontains=search)
-                | Q(branch__branch_code__icontains=search)
-            )
+        if isinstance(queryset, list):
+            if product_id:
+                queryset = [row for row in queryset if str(row.product_id) == str(product_id)]
+            if category_id:
+                queryset = [row for row in queryset if str(row.product.category_id) == str(category_id)]
+            if search:
+                term = search.lower()
+                queryset = [
+                    row for row in queryset
+                    if term in " ".join([
+                        row.product.product_name or "",
+                        row.product.sku or "",
+                        row.branch.branch_name or "",
+                        row.branch.branch_code or "",
+                    ]).lower()
+                ]
+        else:
+            if product_id:
+                queryset = queryset.filter(product_id=product_id)
+            if category_id:
+                queryset = queryset.filter(product__category_id=category_id)
+            if search:
+                queryset = queryset.filter(
+                    Q(product__product_name__icontains=search)
+                    | Q(product__sku__icontains=search)
+                    | Q(branch__branch_name__icontains=search)
+                    | Q(branch__branch_code__icontains=search)
+                )
 
         groups = {}
         for stock in queryset:
@@ -297,7 +394,9 @@ class StockViewSet(ReadOnlyModelViewSet):
                     "total_available_quantity": stock.total_available_quantity,
                     "damaged_stock": stock.damaged_stock,
                     "available_stock": available,
-                    "average_unit_cost_excluding_vat": stock.average_unit_cost_excluding_vat,
+                    "average_unit_cost_excluding_vat": resolve_unit_cost_excluding_vat(
+                        stock, product=stock.product, variant=stock.variant
+                    ),
                     "recoverable_vat_per_unit": stock.recoverable_vat_per_unit,
                     "capitalized_vat_per_unit": stock.capitalized_vat_per_unit,
                     "average_unit_cost": stock.average_unit_cost,
@@ -319,7 +418,13 @@ class StockViewSet(ReadOnlyModelViewSet):
             group["recoverable_vat_value"] += float(stock.recoverable_vat_value)
             group["capitalized_vat_value"] += float(stock.capitalized_vat_value)
             group["total_inventory_value"] += float(stock.total_inventory_value)
-            group["average_unit_cost"] = float(stock.average_unit_cost or 0)
+            group["average_unit_cost"] = float(
+                stock.average_unit_cost
+                or resolve_unit_cost_excluding_vat(
+                    stock, product=stock.product, variant=stock.variant
+                )
+                or 0
+            )
             group["vat_treatment"] = stock.last_tax_treatment
             group["vat_percentage"] = float(stock.last_vat_percentage or 0)
             group["reorder_level"] = max(group["reorder_level"], stock.reorder_level)
@@ -559,17 +664,22 @@ class StockAdjustmentViewSet(ModelViewSet):
         variant,
         branch,
     ):
-        stock, _ = ProductStock.objects.select_for_update().get_or_create(
-            product=product,
-            variant=variant,
-            branch=branch,
-            defaults={
-                "current_stock": 0,
-                "reserved_stock": 0,
-                "reorder_level": product.reorder_level,
-            },
-        )
-
+        using = database_alias_for_branch(branch)
+        with transaction.atomic(using=using):
+            stock, _ = (
+                ProductStock.objects.using(using)
+                .select_for_update()
+                .get_or_create(
+                    product_id=product.id,
+                    variant_id=(variant.id if variant else None),
+                    branch_id=branch.id,
+                    defaults={
+                        "current_stock": 0,
+                        "reserved_stock": 0,
+                        "reorder_level": product.reorder_level,
+                    },
+                )
+            )
         return stock
 
     @staticmethod
@@ -581,12 +691,10 @@ class StockAdjustmentViewSet(ModelViewSet):
         return int(stock.available_stock or 0)
 
     def _unit_costs(self, stock):
-        unit_cost_excluding_vat = Decimal(
-            str(
-                stock.average_unit_cost_excluding_vat
-                or stock.last_purchase_cost_excluding_vat
-                or 0
-            )
+        unit_cost_excluding_vat = resolve_unit_cost_excluding_vat(
+            stock,
+            product=stock.product,
+            variant=stock.variant,
         )
 
         capitalized_unit_cost = Decimal(
@@ -598,7 +706,7 @@ class StockAdjustmentViewSet(ModelViewSet):
             capitalized_unit_cost,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(self, serializer):
         user = self.request.user
 
@@ -688,7 +796,7 @@ class StockAdjustmentViewSet(ModelViewSet):
             vat_recoverable=False,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def perform_update(self, serializer):
         """
         Reverse the original approved stock effect and apply
@@ -702,9 +810,16 @@ class StockAdjustmentViewSet(ModelViewSet):
         # because variant is nullable. PostgreSQL represents that relation
         # with an OUTER JOIN and raises:
         # "FOR UPDATE cannot be applied to the nullable side of an outer join".
-        adjustment = StockAdjustment.objects.select_for_update().get(
-            pk=serializer.instance.pk
+        adjustment_db = (
+            getattr(getattr(serializer.instance, "_state", None), "db", None)
+            or database_alias_for_branch(serializer.instance.branch_id)
         )
+        with transaction.atomic(using=adjustment_db):
+            adjustment = (
+                StockAdjustment.objects.using(adjustment_db)
+                .select_for_update()
+                .get(pk=serializer.instance.pk)
+            )
 
         old_product = adjustment.product
         old_variant = adjustment.variant

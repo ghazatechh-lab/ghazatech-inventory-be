@@ -3,6 +3,8 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from apps.common.transactions import routed_atomic
+from apps.branch_data.services import database_alias_for_branch
 
 from .models import ChartOfAccount, JournalEntry, JournalLine, LedgerEntry
 
@@ -165,26 +167,29 @@ def _payment_account(branch, payment_method, bank_account=None, cash_register=No
     raise ValueError("Select a Bank Account or Cash Register for the payment.")
 
 
-def _next_system_number():
+def _next_system_number(branch):
     prefix = timezone.now().strftime("SYS-%Y%m-")
-    last = (
-        JournalEntry.objects.select_for_update()
-        .filter(entry_number__startswith=prefix)
-        .order_by("-entry_number")
-        .values_list("entry_number", flat=True)
-        .first()
-    )
-    sequence = 1
-    if last:
-        try:
-            sequence = int(last.rsplit("-", 1)[-1]) + 1
-        except (TypeError, ValueError):
-            sequence = JournalEntry.objects.filter(entry_number__startswith=prefix).count() + 1
-    candidate = f"{prefix}{sequence:05d}"
-    while JournalEntry.objects.filter(entry_number=candidate).exists():
-        sequence += 1
+    using = database_alias_for_branch(branch)
+    with transaction.atomic(using=using):
+        queryset = JournalEntry.objects.using(using)
+        last = (
+            queryset.select_for_update()
+            .filter(entry_number__startswith=prefix)
+            .order_by("-entry_number")
+            .values_list("entry_number", flat=True)
+            .first()
+        )
+        sequence = 1
+        if last:
+            try:
+                sequence = int(last.rsplit("-", 1)[-1]) + 1
+            except (TypeError, ValueError):
+                sequence = queryset.filter(entry_number__startswith=prefix).count() + 1
         candidate = f"{prefix}{sequence:05d}"
-    return candidate
+        while queryset.filter(entry_number=candidate).exists():
+            sequence += 1
+            candidate = f"{prefix}{sequence:05d}"
+        return candidate
 
 
 def _move_account(account, debit, credit):
@@ -215,7 +220,7 @@ def _post_system_journal(*, branch, date, reference, description, lines, user=No
         )
 
     journal = JournalEntry.objects.create(
-        entry_number=_next_system_number(),
+        entry_number=_next_system_number(branch),
         entry_date=date or timezone.localdate(),
         document_date=date or timezone.localdate(),
         branch=branch,
@@ -317,7 +322,7 @@ def _update_money_source(*, amount, direction, bank_account=None, cash_register=
         ])
 
 
-@transaction.atomic
+@routed_atomic
 def post_supplier_bill(bill, user=None):
     reference = f"SUPPLIER_BILL:{bill.pk}"
     inventory = _account(bill.branch, code="12000")
@@ -346,7 +351,7 @@ def post_supplier_bill(bill, user=None):
     )
 
 
-@transaction.atomic
+@routed_atomic
 def post_supplier_payment(payment, user=None):
     reference = f"SUPPLIER_PAYMENT:{payment.pk}"
     ap = _account(payment.branch, code="20000")
@@ -382,7 +387,7 @@ def post_supplier_payment(payment, user=None):
     return journal
 
 
-@transaction.atomic
+@routed_atomic
 def post_sales_invoice(invoice, user=None):
     reference = f"SALES_INVOICE:{invoice.pk}"
     ar = _account(invoice.branch, code="11000")
@@ -411,7 +416,7 @@ def post_sales_invoice(invoice, user=None):
     )
 
 
-@transaction.atomic
+@routed_atomic
 def repost_sales_invoice(invoice, user=None):
     reference = f"SALES_INVOICE:{invoice.pk}"
     existing = JournalEntry.objects.filter(source="SYSTEM", reference=reference, status="POSTED").exists()
@@ -420,7 +425,7 @@ def repost_sales_invoice(invoice, user=None):
     return post_sales_invoice(invoice, user=user)
 
 
-@transaction.atomic
+@routed_atomic
 def reverse_sales_invoice(invoice, user=None):
     return _reverse_reference(
         f"SALES_INVOICE:{invoice.pk}",
@@ -429,7 +434,7 @@ def reverse_sales_invoice(invoice, user=None):
     )
 
 
-@transaction.atomic
+@routed_atomic
 def post_sales_payment(payment, user=None):
     reference = f"SALES_PAYMENT:{payment.pk}"
     money = _payment_account(
@@ -465,7 +470,7 @@ def post_sales_payment(payment, user=None):
     return journal
 
 
-@transaction.atomic
+@routed_atomic
 def post_purchase_expense(expense, user=None):
     reference = f"PURCHASE_EXPENSE:{expense.pk}"
     expense_account = _account(expense.branch, code="51000")

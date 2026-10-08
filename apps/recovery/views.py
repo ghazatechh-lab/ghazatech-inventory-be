@@ -17,6 +17,8 @@ from apps.audit_logs.models import AuditLog
 
 from .models import RecoveryRecord, RecoverySettings
 from .serializers import RecoveryRecordSerializer, RecoverySettingsSerializer
+from .branching import source_database_for_record
+from apps.branch_data.workforce_flow import scope_queryset
 
 
 class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
@@ -66,7 +68,7 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
                 | Q(deleted_by__full_name__icontains=q)
                 | Q(deleted_by__email__icontains=q)
             )
-        return queryset
+        return scope_queryset(self.request, queryset, "branch_id")
 
     def _get_object_instance(self, record):
         if not record.content_type:
@@ -74,7 +76,8 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
         model_class = record.content_type.model_class()
         if model_class is None:
             return None
-        return model_class._default_manager.filter(pk=record.object_id).first()
+        alias = source_database_for_record(record)
+        return model_class._default_manager.using(alias).filter(pk=record.object_id).first()
 
     def _hard_delete_employee(self, employee):
         """
@@ -221,38 +224,30 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["get"])
     def summary(self, request):
         now = timezone.now()
-        current = RecoveryRecord.objects.filter(status=RecoveryRecord.STATUS_DELETED)
+        current = scope_queryset(self.request, RecoveryRecord.objects.filter(status=RecoveryRecord.STATUS_DELETED), "branch_id")
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        restored = scope_queryset(self.request, RecoveryRecord.objects.filter(status=RecoveryRecord.STATUS_RESTORED), "branch_id")
+        permanent = scope_queryset(self.request, RecoveryRecord.objects.filter(status=RecoveryRecord.STATUS_PERMANENT), "branch_id")
         return Response(
             {
                 "total_deleted": current.count(),
-                "deleted_today": current.filter(
-                    deleted_at__date=timezone.localdate()
-                ).count(),
-                "restored_this_month": RecoveryRecord.objects.filter(
-                    status=RecoveryRecord.STATUS_RESTORED,
-                    restored_at__gte=month_start,
-                ).count(),
+                "deleted_today": current.filter(deleted_at__date=timezone.localdate()).count(),
+                "restored_this_month": restored.filter(restored_at__gte=month_start).count(),
                 "expiring_soon": current.filter(
                     expires_at__isnull=False,
                     expires_at__lte=now + timedelta(days=7),
                     expires_at__gte=now,
                 ).count(),
-                "permanent_deletes": RecoveryRecord.objects.filter(
-                    status=RecoveryRecord.STATUS_PERMANENT
-                ).count(),
+                "permanent_deletes": permanent.count(),
             }
         )
 
     @action(detail=False, methods=["get"])
     def activity(self, request):
-        queryset = RecoveryRecord.objects.exclude(
-            status=RecoveryRecord.STATUS_DELETED
-        ).select_related(
+        queryset = RecoveryRecord.objects.exclude(status=RecoveryRecord.STATUS_DELETED).select_related(
             "deleted_by", "restored_by", "permanently_deleted_by", "branch"
-        )[
-            :100
-        ]
+        )
+        queryset = scope_queryset(self.request, queryset, "branch_id")[:100]
         return Response(self.get_serializer(queryset, many=True).data)
 
     @action(detail=False, methods=["get"])
@@ -310,7 +305,7 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
         ids = request.data.get("ids") or []
         if not ids:
             raise ValidationError({"ids": "Select at least one recovery record."})
-        records = list(RecoveryRecord.objects.filter(pk__in=ids))
+        records = list(scope_queryset(self.request, RecoveryRecord.objects.filter(pk__in=ids), "branch_id"))
         for record in records:
             self._restore_record(record, request.user)
         return Response({"restored": len(records)})
@@ -321,7 +316,7 @@ class RecoveryRecordViewSet(viewsets.ReadOnlyModelViewSet):
         ids = request.data.get("ids") or []
         if not ids:
             raise ValidationError({"ids": "Select at least one recovery record."})
-        records = list(RecoveryRecord.objects.filter(pk__in=ids))
+        records = list(scope_queryset(self.request, RecoveryRecord.objects.filter(pk__in=ids), "branch_id"))
         for record in records:
             self._permanent_delete_record(record, request.user)
         return Response({"deleted": len(records)})

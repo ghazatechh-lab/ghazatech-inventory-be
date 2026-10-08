@@ -8,6 +8,8 @@ class RecoveryRecordSerializer(serializers.ModelSerializer):
     restored_by_name = serializers.SerializerMethodField()
     permanent_deleted_by_name = serializers.SerializerMethodField()
     branch_name = serializers.CharField(source="branch.branch_name", read_only=True)
+    branch_code = serializers.CharField(source="branch.branch_code", read_only=True)
+    source_branch = serializers.CharField(source="branch.branch_code", read_only=True)
     expires_in_days = serializers.SerializerMethodField()
     can_restore = serializers.SerializerMethodField()
     can_permanently_delete = serializers.SerializerMethodField()
@@ -23,6 +25,8 @@ class RecoveryRecordSerializer(serializers.ModelSerializer):
             "object_id",
             "branch",
             "branch_name",
+            "branch_code",
+            "source_branch",
             "snapshot",
             "deletion_reason",
             "status",

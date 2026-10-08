@@ -28,7 +28,7 @@ SCHEMA_ONLY_APPS = {
 }
 
 # Only product/catalog reference tables are allowed in secondary databases.
-# Physical stock tables must stay on MASTER.
+# Catalog/reference rows are shared from default; physical stock is routed per branch.
 REFERENCE_INVENTORY_MODELS = {
     "brand",
     "category",
@@ -75,8 +75,20 @@ class BranchTransactionRouter:
         if label in TRANSACTION_APPS:
             return self._alias(hints)
 
-        # Shared/reference data, HRMS, and physical inventory remain
-        # authoritative on MASTER during normal application operation.
+        if label == "inventory":
+            model_name = model._meta.model_name
+
+            if model_name in {
+                "productstock",
+                "stockmovement",
+                "stockadjustment",
+            }:
+                return self._alias(hints)
+
+            # Catalog/reference inventory models remain shared on default.
+            return "default"
+
+        # Shared/reference data and HRMS remain authoritative on default.
         return "default"
 
     def db_for_write(self, model, **hints):
@@ -85,7 +97,20 @@ class BranchTransactionRouter:
         if label in TRANSACTION_APPS:
             return self._alias(hints)
 
-        # Reference-data edits, HRMS writes, and inventory writes happen on MASTER.
+        if label == "inventory":
+            model_name = model._meta.model_name
+
+            if model_name in {
+                "productstock",
+                "stockmovement",
+                "stockadjustment",
+            }:
+                return self._alias(hints)
+
+            # Catalog/reference inventory edits remain on default.
+            return "default"
+
+        # Reference-data edits and HRMS writes happen on default.
         return "default"
 
     def allow_relation(self, obj1, obj2, **hints):
@@ -119,7 +144,10 @@ class BranchTransactionRouter:
             return True
 
         if app_label == "inventory":
-            return (model_name or "").lower() in REFERENCE_INVENTORY_MODELS
+            # Under the new 3-branch architecture, VAT and NON_VAT databases
+            # own their own complete inventory, including physical stock,
+            # stock movements, adjustments, and related inventory records.
+            return True
 
         # Do not silently create unrelated application tables.
         return False

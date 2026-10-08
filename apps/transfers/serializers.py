@@ -5,7 +5,10 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from apps.inventory.models import ProductStock
-from apps.common.tax import calculate_inventory_tax, quantize_money
+from apps.inventory.services import resolve_unit_cost_excluding_vat
+from apps.branch_data.services import database_alias_for_branch
+from apps.branch_data.physical import request_active_branch, require_physical_branch, is_physical_branch
+from apps.common.tax import calculate_inventory_tax, quantize_money, quantize_unit
 
 from .models import StockTransfer, StockTransferItem
 
@@ -44,6 +47,7 @@ class ItemSerializer(serializers.ModelSerializer):
             "received_quantity",
             "damaged_quantity",
             "remarks",
+            "transfer_unit_cost",
             "line_transfer_value",
             "source_value",
             "destination_value",
@@ -57,6 +61,7 @@ class ItemSerializer(serializers.ModelSerializer):
             "dispatched_quantity",
             "received_quantity",
             "damaged_quantity",
+            "transfer_unit_cost",
             "line_transfer_value",
             "source_value",
             "destination_value",
@@ -166,7 +171,23 @@ class TransferSerializer(serializers.ModelSerializer):
         )
         to_branch = attrs.get("to_branch") or getattr(self.instance, "to_branch", None)
 
-        if from_branch == to_branch:
+        request = self.context.get("request")
+        active_branch = request_active_branch(request)
+
+        # In a physical branch UI the source is always the active branch and
+        # cannot be overridden by a crafted payload. In BR03 the source must be
+        # selected explicitly, but it still has to be BR01 or BR02.
+        if active_branch and is_physical_branch(active_branch):
+            from_branch = active_branch
+            attrs["from_branch"] = active_branch
+
+        require_physical_branch(from_branch, field="from_branch")
+        require_physical_branch(to_branch, field="to_branch")
+
+        if self.instance and from_branch.pk != self.instance.from_branch_id:
+            raise serializers.ValidationError({"from_branch": "The source branch cannot be changed after the transfer is created."})
+
+        if from_branch.pk == to_branch.pk:
             raise serializers.ValidationError(
                 {
                     "to_branch": "Destination branch must be different from source branch."
@@ -217,12 +238,15 @@ class TransferSerializer(serializers.ModelSerializer):
                 )
                 continue
 
-            stock = ProductStock.objects.filter(
-                product=product,
-                branch=from_branch,
-                variant=variant,
-            ).first()
-            available = int(stock.available_stock) if stock else 0
+            stock_db = database_alias_for_branch(from_branch)
+            stock_rows = list(
+                ProductStock.objects.using(stock_db).filter(
+                    product_id=product.id,
+                    branch_id=from_branch.id,
+                    variant_id=(variant.id if variant else None),
+                )
+            )
+            available = sum(int(row.available_stock or 0) for row in stock_rows)
             if available <= 0:
                 item_errors.append(
                     f"{product.sku}: no available stock in {from_branch.branch_code}."
@@ -287,48 +311,44 @@ class TransferSerializer(serializers.ModelSerializer):
             )
             quantity = int(item_data["requested_quantity"])
 
-            stock = (
-                ProductStock.objects.select_for_update()
-                .filter(
-                    product=product,
-                    branch=transfer.from_branch,
-                    variant=variant,
+            stock_db = database_alias_for_branch(transfer.from_branch)
+            stock_rows = list(
+                ProductStock.objects.using(stock_db).filter(
+                    product_id=product.id,
+                    branch_id=transfer.from_branch_id,
+                    variant_id=(variant.id if variant else None),
                 )
-                .first()
             )
 
-            if not stock:
+            if not stock_rows:
                 raise serializers.ValidationError(
-                    {
-                        "items": [
-                            (
-                                f"{product.sku}: stock record "
-                                "was not found in the source branch."
-                            )
-                        ]
-                    }
+                    {"items": [f"{product.sku}: stock record was not found in the source branch."]}
                 )
 
-            available_quantity = int(stock.available_stock)
-
+            available_quantity = sum(
+                int(row.available_stock or 0) for row in stock_rows
+            )
             if quantity > available_quantity:
                 raise serializers.ValidationError(
-                    {
-                        "items": [
-                            (
-                                f"{product.sku}: requested "
-                                f"{quantity}, available "
-                                f"{available_quantity}."
-                            )
-                        ]
-                    }
+                    {"items": [f"{product.sku}: requested {quantity}, available {available_quantity}."]}
                 )
 
-            unit_cost = Decimal(
-                str(
-                    stock.average_unit_cost
-                    or stock.average_unit_cost_excluding_vat
-                    or 0
+            weighted_value = Decimal("0")
+            weighted_qty = 0
+            for row in stock_rows:
+                row_qty = max(0, int(row.available_stock or 0))
+                if row_qty <= 0:
+                    continue
+                row_cost = resolve_unit_cost_excluding_vat(
+                    row, product=product, variant=variant
+                )
+                weighted_value += Decimal(row_qty) * row_cost
+                weighted_qty += row_qty
+            unit_cost = quantize_unit(
+                weighted_value / Decimal(weighted_qty)
+                if weighted_qty
+                else resolve_unit_cost_excluding_vat(
+                    stock_rows[0], product=product, variant=variant
                 )
             )
 

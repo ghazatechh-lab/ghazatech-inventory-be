@@ -10,13 +10,15 @@ from rest_framework.response import Response
 
 from apps.common.logging import LoggedModelViewSet as ModelViewSet
 from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.sales_flow import SalesPhysicalBranchGuardMixin
 
 from apps.recovery.services import soft_delete_to_recovery
 from .models import Customer
 from .serializers import CustomerSerializer
 
 
-class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
+class CustomerViewSet(SalesPhysicalBranchGuardMixin, CombinedPhysicalBranchListMixin, BranchAccessQuerysetMixin, ModelViewSet):
     serializer_class = CustomerSerializer
 
     search_fields = [
@@ -48,6 +50,27 @@ class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
     ]
 
     ordering = ["customer_name"]
+
+    def _base_combined_queryset(self, alias, branch_id):
+        return (
+            Customer.objects.using(alias)
+            .filter(is_deleted=False, branch_id=branch_id)
+            .annotate(
+                order_count=Count(
+                    "salesorder",
+                    filter=models.Q(salesorder__branch_id=branch_id),
+                    distinct=True,
+                ),
+                last_order_date=Max(
+                    "salesorder__order_date",
+                    filter=models.Q(salesorder__branch_id=branch_id),
+                ),
+                balance_due=Sum(
+                    "salesinvoice__balance_due",
+                    filter=models.Q(salesinvoice__branch_id=branch_id),
+                ),
+            )
+        )
 
     def get_queryset(self):
         from apps.sales.models import SalesInvoice, SalesOrder
@@ -103,11 +126,44 @@ class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
-        from apps.sales.models import SalesInvoice, SalesOrder
+        from apps.sales.models import SalesInvoice
+
+        today = timezone.localdate()
+        combined = self.combined_querysets()
+        if combined is not None:
+            total_customers = 0
+            active_this_month = 0
+            total_receivables = Decimal("0.00")
+            new_leads = 0
+            for _source, alias, branch, queryset in combined:
+                total_customers += queryset.count()
+                active_this_month += (
+                    queryset.filter(
+                        salesorder__order_date__year=today.year,
+                        salesorder__order_date__month=today.month,
+                    )
+                    .distinct()
+                    .count()
+                )
+                total_receivables += (
+                    SalesInvoice.objects.using(alias)
+                    .filter(
+                        branch_id=branch.id,
+                        customer_id__in=queryset.values_list("id", flat=True),
+                        balance_due__gt=0,
+                    )
+                    .aggregate(value=Sum("balance_due"))["value"]
+                    or Decimal("0.00")
+                )
+                new_leads += queryset.filter(category="LEAD", is_active=True).count()
+            return Response({
+                "total_customers": total_customers,
+                "active_this_month": active_this_month,
+                "total_receivables": total_receivables,
+                "new_leads": new_leads,
+            })
 
         queryset = self.filter_queryset(self.get_queryset())
-        today = timezone.localdate()
-
         return Response(
             {
                 "total_customers": queryset.count(),
@@ -138,7 +194,12 @@ class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def export(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
+        )
 
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="customers.csv"'
@@ -161,23 +222,24 @@ class CustomerViewSet(BranchAccessQuerysetMixin, ModelViewSet):
             ]
         )
 
-        for customer in queryset:
-            writer.writerow(
-                [
-                    customer.customer_code,
-                    customer.customer_name,
-                    customer.get_customer_type_display(),
-                    customer.contact_person or "",
-                    customer.phone or "",
-                    customer.email or "",
-                    customer.trn or customer.trn_number or "",
-                    customer.trade_license or "",
-                    customer.get_category_display(),
-                    customer.get_payment_terms_display(),
-                    customer.credit_limit or 0,
-                    getattr(customer, "balance_due", 0) or 0,
-                ]
-            )
+        for queryset in querysets:
+            for customer in queryset:
+                writer.writerow(
+                    [
+                        customer.customer_code,
+                        customer.customer_name,
+                        customer.get_customer_type_display(),
+                        customer.contact_person or "",
+                        customer.phone or "",
+                        customer.email or "",
+                        customer.trn or customer.trn_number or "",
+                        customer.trade_license or "",
+                        customer.get_category_display(),
+                        customer.get_payment_terms_display(),
+                        customer.credit_limit or 0,
+                        getattr(customer, "balance_due", 0) or 0,
+                    ]
+                )
 
         return response
 

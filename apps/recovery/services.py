@@ -7,6 +7,8 @@ from django.forms.models import model_to_dict
 from django.utils import timezone
 
 from apps.audit_logs.models import AuditLog
+from apps.branches.models import Branch
+from apps.branch_data.services import database_alias_for_branch
 
 from .models import RecoveryRecord, RecoverySettings
 
@@ -64,7 +66,15 @@ def create_recovery_record(instance, user=None, reason="", request=None):
     reason = (reason or "").strip() or "Deleted from ERP"
     content_type = ContentType.objects.get_for_model(instance, for_concrete_model=False)
     branch = getattr(instance, "branch", None)
+    if branch is not None:
+        code = str(getattr(branch, "branch_code", "") or "").upper()
+        canonical = Branch.objects.using("default").filter(branch_code=code).first() if code else None
+        branch = canonical or Branch.objects.using("default").filter(pk=getattr(branch, "pk", None)).first()
     snapshot = _json_safe(model_to_dict(instance))
+    source_db = getattr(getattr(instance, "_state", None), "db", None) or "default"
+    snapshot["__recovery_source_db"] = source_db
+    if branch is not None:
+        snapshot["__recovery_branch_code"] = branch.branch_code
     retention_days = retention_days_for(instance)
 
     record, _ = RecoveryRecord.objects.update_or_create(

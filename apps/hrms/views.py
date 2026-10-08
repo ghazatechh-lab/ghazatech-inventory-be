@@ -20,11 +20,19 @@ from apps.recovery.services import create_recovery_record
 
 from .models import *
 from .serializers import *
+from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
+from apps.branch_data.workforce_flow import (
+    WorkforceBranchScopeMixin,
+    physical_branches,
+    require_direct_write_branch,
+    require_related_branch,
+    scope_queryset,
+)
 
 MONEY = Decimal("0.01")
 
 
-class BaseViewSet(ModelViewSet):
+class BaseViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
@@ -43,6 +51,7 @@ class DesignationViewSet(BaseViewSet):
 
 
 class EmployeeViewSet(BaseViewSet):
+    direct_branch_owner = True
     queryset = Employee.objects.select_related(
         "branch", "department", "designation"
     ).prefetch_related("documents", "salary_revisions")
@@ -160,9 +169,7 @@ class EmployeeViewSet(BaseViewSet):
             {
                 "branches": [
                     {"id": item.id, "branch_name": item.branch_name}
-                    for item in Branch.objects.filter(is_active=True).order_by(
-                        "branch_name"
-                    )
+                    for item in physical_branches()
                 ],
                 "departments": DepartmentSerializer(
                     Department.objects.filter(is_active=True), many=True
@@ -339,6 +346,9 @@ class EmployeeDocumentViewSet(BaseViewSet):
     filterset_fields = ["employee", "document_type"]
 
     def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if employee:
+            require_related_branch(self.request, employee.branch)
         serializer.save(uploaded_by=self.request.user)
 
 
@@ -503,6 +513,7 @@ class LeaveRequestViewSet(BaseViewSet):
             is_active=True,
             employment_status__in=["ACTIVE", "ON_LEAVE", "PROBATION"],
         ).select_related("branch")
+        employees = scope_queryset(request, employees, "branch_id")
 
         return Response(
             {
@@ -669,6 +680,7 @@ class SalaryAdvanceViewSet(BaseViewSet):
                 "PROBATION",
             ],
         ).select_related("branch")
+        employees = scope_queryset(request, employees, "branch_id")
 
         if branch_id:
             employees = employees.filter(branch_id=branch_id)
@@ -704,6 +716,7 @@ class SalaryAdvanceViewSet(BaseViewSet):
 
 
 class PayrollRunViewSet(BaseViewSet):
+    direct_branch_owner = True
     queryset = (
         PayrollRun.objects.select_related(
             "branch",
@@ -995,6 +1008,7 @@ class PayrollRunViewSet(BaseViewSet):
                 "id",
             )
         )
+        employees = scope_queryset(request, employees, "branch_id")
 
         if branch_id:
             employees = employees.filter(branch_id=branch_id)
@@ -1134,6 +1148,7 @@ class PayrollRunViewSet(BaseViewSet):
         )
 
     @staticmethod
+    @transaction.atomic
     def _settle_employee_loan_deduction(
         entry,
     ):
@@ -1257,6 +1272,8 @@ class PayrollRunViewSet(BaseViewSet):
         payroll_date = request.data.get("payroll_date")
 
         branch_id = request.data.get("branch")
+        target_branch = require_direct_write_branch(request, branch_id)
+        branch_id = target_branch.pk
 
         employee_ids = request.data.get("employee_ids") or []
 
@@ -2000,6 +2017,7 @@ class PayrollEntryViewSet(BaseViewSet):
 
         return queryset
 
+    @transaction.atomic
     def _calculate_employee_loan_deduction(self, entry):
         """
         Calculate the loan installment that should be deducted from this
@@ -2107,6 +2125,7 @@ class PayrollEntryViewSet(BaseViewSet):
             ]
         )
 
+    @transaction.atomic
     def _settle_employee_loans(self, entry):
         """
         Apply the loan deduction stored on this payroll entry to the
@@ -2721,21 +2740,22 @@ class HRMSReportViewSet(BaseViewSet):
     @action(detail=False, methods=["get"])
     def summary(self, request):
         today = timezone.localdate()
-        branch_id = request.query_params.get("branch")
-
-        employees = Employee.objects.filter(is_active=True)
-        attendance = Attendance.objects.filter(
-            date=today,
-            status="PRESENT",
+        employees = scope_queryset(
+            request, Employee.objects.filter(is_active=True), "branch_id"
         )
-        leaves = LeaveRequest.objects.filter(status="PENDING")
-        payroll = PayrollEntry.objects.filter(period=today.strftime("%Y-%m"))
-
-        if branch_id:
-            employees = employees.filter(branch_id=branch_id)
-            attendance = attendance.filter(branch_id=branch_id)
-            leaves = leaves.filter(branch_id=branch_id)
-            payroll = payroll.filter(branch_id=branch_id)
+        attendance = scope_queryset(
+            request,
+            Attendance.objects.filter(date=today, status="PRESENT"),
+            "branch_id",
+        )
+        leaves = scope_queryset(
+            request, LeaveRequest.objects.filter(status="PENDING"), "branch_id"
+        )
+        payroll = scope_queryset(
+            request,
+            PayrollEntry.objects.filter(period=today.strftime("%Y-%m")),
+            "branch_id",
+        )
 
         return Response(
             {
@@ -2751,7 +2771,6 @@ class HRMSReportViewSet(BaseViewSet):
     @action(detail=False, methods=["get"])
     def export(self, request):
         report_type = request.query_params.get("report_type", "EMPLOYEE")
-        branch_id = request.query_params.get("branch")
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 
@@ -2762,9 +2781,11 @@ class HRMSReportViewSet(BaseViewSet):
         writer = csv.writer(response)
 
         if report_type == "ATTENDANCE":
-            queryset = Attendance.objects.select_related("employee", "branch")
-            if branch_id:
-                queryset = queryset.filter(branch_id=branch_id)
+            queryset = scope_queryset(
+                request,
+                Attendance.objects.select_related("employee", "branch"),
+                "branch_id",
+            )
             if start_date:
                 queryset = queryset.filter(date__gte=start_date)
             if end_date:
@@ -2800,11 +2821,11 @@ class HRMSReportViewSet(BaseViewSet):
             return response
 
         if report_type == "LEAVE":
-            queryset = LeaveRequest.objects.select_related(
-                "employee", "leave_type", "branch"
+            queryset = scope_queryset(
+                request,
+                LeaveRequest.objects.select_related("employee", "leave_type", "branch"),
+                "branch_id",
             )
-            if branch_id:
-                queryset = queryset.filter(branch_id=branch_id)
             if start_date:
                 queryset = queryset.filter(to_date__gte=start_date)
             if end_date:
@@ -2837,9 +2858,11 @@ class HRMSReportViewSet(BaseViewSet):
             return response
 
         if report_type == "PAYROLL":
-            queryset = PayrollEntry.objects.select_related("employee", "branch")
-            if branch_id:
-                queryset = queryset.filter(branch_id=branch_id)
+            queryset = scope_queryset(
+                request,
+                PayrollEntry.objects.select_related("employee", "branch"),
+                "branch_id",
+            )
             if start_date:
                 queryset = queryset.filter(payroll_date__gte=start_date)
             if end_date:
@@ -2871,11 +2894,11 @@ class HRMSReportViewSet(BaseViewSet):
                 )
             return response
 
-        queryset = Employee.objects.select_related(
-            "branch", "department", "designation"
+        queryset = scope_queryset(
+            request,
+            Employee.objects.select_related("branch", "department", "designation"),
+            "branch_id",
         )
-        if branch_id:
-            queryset = queryset.filter(branch_id=branch_id)
         if start_date:
             queryset = queryset.filter(joining_date__gte=start_date)
         if end_date:

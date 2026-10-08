@@ -2,6 +2,10 @@ from datetime import date
 from decimal import Decimal
 
 from django.db import transaction
+from apps.common.transactions import routed_atomic
+from apps.branch_data.services import database_alias_for_branch
+from apps.branch_data.physical import require_physical_branch, request_active_branch, is_physical_branch
+from apps.branch_data.purchase_flow import PurchasePhysicalBranchSerializerMixin
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
@@ -176,7 +180,7 @@ class POItemSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class POSerializer(serializers.ModelSerializer):
+class POSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     items = POItemSerializer(many=True)
 
     po_number = serializers.CharField(
@@ -290,6 +294,7 @@ class POSerializer(serializers.ModelSerializer):
 
         return transitions.get(obj.status, [])
 
+    @routed_atomic
     def _generate_po_number(self):
         prefix = timezone.localdate().strftime("PO-%Y%m%d")
 
@@ -430,8 +435,15 @@ class POSerializer(serializers.ModelSerializer):
 
         errors = {}
 
+        active_branch = request_active_branch(self.context.get("request"))
+        if active_branch and is_physical_branch(active_branch) and self.instance is None:
+            branch = active_branch
+            attrs["branch"] = active_branch
+
         if not branch:
             errors["branch"] = "Branch is required."
+        elif not is_physical_branch(branch):
+            errors["branch"] = "Select Branch 1 or Branch 2. Branch 3 cannot own purchases."
 
         if not supplier:
             errors["supplier"] = "Supplier is required."
@@ -506,7 +518,7 @@ class POSerializer(serializers.ModelSerializer):
                 **item,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop(
             "items",
@@ -549,7 +561,7 @@ class POSerializer(serializers.ModelSerializer):
 
         return purchase_order
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         instance,
@@ -700,7 +712,7 @@ class GRNItemSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class GRNSerializer(serializers.ModelSerializer):
+class GRNSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     # Generated automatically by the backend. The frontend must not be
     # required to submit a GRN number.
     grn_number = serializers.CharField(
@@ -822,6 +834,7 @@ class GRNSerializer(serializers.ModelSerializer):
 
         return attrs
 
+    @routed_atomic
     def _generate_number(self):
         prefix = timezone.now().strftime("GRN-%Y%m")
         count = GoodsReceivedNote.objects.filter(
@@ -884,7 +897,7 @@ class GRNSerializer(serializers.ModelSerializer):
                 **item,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
 
@@ -903,7 +916,7 @@ class GRNSerializer(serializers.ModelSerializer):
         self._save_items(grn, items)
         return grn
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         if instance.is_confirmed:
             raise serializers.ValidationError("A confirmed GRN cannot be edited.")
@@ -1147,7 +1160,7 @@ class SupplierBillAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
-class SupplierBillSerializer(serializers.ModelSerializer):
+class SupplierBillSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     bill_number = serializers.CharField(read_only=True)
 
     def to_internal_value(self, data):
@@ -1220,6 +1233,7 @@ class SupplierBillSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    @routed_atomic
     def _generate_number(self):
         prefix = timezone.localdate().strftime("SB-%Y%m-")
         last_bill = (
@@ -1498,7 +1512,7 @@ class SupplierBillSerializer(serializers.ModelSerializer):
             ]
         )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         if not items:
@@ -1523,7 +1537,7 @@ class SupplierBillSerializer(serializers.ModelSerializer):
 
         return bill
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         if instance.approved_at:
             raise serializers.ValidationError(
@@ -1820,7 +1834,7 @@ class PaymentAllocationSerializer(serializers.ModelSerializer):
         exclude = ["payment"]
 
 
-class SupplierPaymentSerializer(serializers.ModelSerializer):
+class SupplierPaymentSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     payment_number = serializers.CharField(read_only=True)
     paid_by_name = serializers.SerializerMethodField()
 
@@ -1864,6 +1878,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
             or getattr(user, "email", "")
         )
 
+    @routed_atomic
     def _generate_payment_number(self, branch):
         """
         Generate a branch-specific sequential payment number.
@@ -1873,8 +1888,11 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
         """
         from apps.branches.models import Branch
 
-        locked_branch = Branch.objects.select_for_update().get(
-            pk=branch.pk,
+        using = database_alias_for_branch(branch.pk)
+        locked_branch = (
+            Branch.objects.using(using)
+            .select_for_update()
+            .get(pk=branch.pk)
         )
 
         branch_code = (
@@ -1887,7 +1905,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
         prefix = f"SP-{branch_code}-" f"{timezone.localdate():%Y%m}-"
 
         latest_number = (
-            SupplierPayment.objects.filter(
+            SupplierPayment.objects.using(using).filter(
                 payment_number__startswith=prefix,
             )
             .order_by("-payment_number")
@@ -1902,7 +1920,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
                 sequence = int(latest_number.rsplit("-", 1)[-1]) + 1
             except (TypeError, ValueError):
                 sequence = (
-                    SupplierPayment.objects.filter(
+                    SupplierPayment.objects.using(using).filter(
                         payment_number__startswith=prefix,
                     ).count()
                     + 1
@@ -1910,7 +1928,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
 
         candidate = f"{prefix}{sequence:04d}"
 
-        while SupplierPayment.objects.filter(
+        while SupplierPayment.objects.using(using).filter(
             payment_number=candidate,
         ).exists():
             sequence += 1
@@ -2004,6 +2022,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
         attrs["amount"] = amount
         return attrs
 
+    @routed_atomic
     def _validate_allocations(
         self,
         *,
@@ -2140,7 +2159,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
 
         return prepared
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         allocations = validated_data.pop(
             "allocations",
@@ -2447,7 +2466,7 @@ class SupplierReturnItemSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class SupplierReturnSerializer(serializers.ModelSerializer):
+class SupplierReturnSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     return_number = serializers.CharField(
         read_only=True,
     )
@@ -2549,6 +2568,7 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
             },
         }
 
+    @routed_atomic
     def _generate_number(self):
         prefix = timezone.localdate().strftime(
             "RTN-%Y%m-",
@@ -2952,7 +2972,7 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
             ]
         )
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         validated_data,
@@ -3015,7 +3035,7 @@ class SupplierReturnSerializer(serializers.ModelSerializer):
 
         return supplier_return
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         instance,
@@ -3221,7 +3241,7 @@ class VendorCreditApplicationSerializer(
         ]
 
 
-class VendorCreditSerializer(serializers.ModelSerializer):
+class VendorCreditSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     credit_number = serializers.CharField(
         read_only=True,
     )
@@ -3345,6 +3365,7 @@ class VendorCreditSerializer(serializers.ModelSerializer):
             or str(user)
         )
 
+    @routed_atomic
     def _generate_number(self):
         prefix = timezone.localdate().strftime(
             "VC-%Y%m-",
@@ -3779,7 +3800,7 @@ class VendorCreditSerializer(serializers.ModelSerializer):
             total_amount,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         validated_data,
@@ -3884,7 +3905,7 @@ class VendorCreditSerializer(serializers.ModelSerializer):
 
         return vendor_credit
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         instance,
@@ -4019,7 +4040,7 @@ class PurchaseExpenseAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(obj.file.url) if request else obj.file.url
 
 
-class PurchaseExpenseSerializer(serializers.ModelSerializer):
+class PurchaseExpenseSerializer(PurchasePhysicalBranchSerializerMixin, serializers.ModelSerializer):
     expense_number = serializers.CharField(read_only=True)
     attachments = PurchaseExpenseAttachmentSerializer(many=True, read_only=True)
     branch_name = serializers.CharField(
@@ -4072,6 +4093,7 @@ class PurchaseExpenseSerializer(serializers.ModelSerializer):
             )
         return attrs
 
+    @routed_atomic
     def create(self, validated_data):
         if not validated_data.get("expense_number"):
             prefix = timezone.now().strftime("EXP-%Y%m")

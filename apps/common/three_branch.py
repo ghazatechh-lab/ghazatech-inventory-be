@@ -6,6 +6,9 @@ from django.core.exceptions import ValidationError
 from rest_framework.exceptions import PermissionDenied
 
 from apps.branches.models import Branch
+from apps.branch_data.context import set_active_branch_id
+from apps.branch_data.permissions import user_can_source
+from apps.branch_data.routing import resolve_operation_context
 from apps.common.branch_access import (
     can_switch_branches,
     can_view_all_branches,
@@ -254,5 +257,71 @@ class SalesBranchGuardMixin(BranchAccessQuerysetMixin):
         if branch is None:
             raise ValidationError({"branch": "A specific branch is required."})
 
+        branch_code = normalize_branch_code(branch)
+
+        # BR03 is virtual. Every write must resolve to BR01/VAT or
+        # BR02/NON_VAT before ORM work starts.
+        if branch_code == "BR03":
+            def permission_checker(source, *, write=False):
+                return user_can_source(
+                    request.user,
+                    source,
+                    write=write,
+                    action="create_sale" if write else "view",
+                )
+
+            context = resolve_operation_context(
+                active_branch=branch,
+                request=request,
+                permission_checker=permission_checker,
+                write=True,
+            )
+
+            real_branch = Branch.objects.using("default").filter(
+                branch_code__iexact=context.real_branch_code,
+                is_active=True,
+            ).first()
+
+            if real_branch is None:
+                raise ValidationError(
+                    {
+                        "target_branch": (
+                            f"{context.real_branch_code} is not configured."
+                        )
+                    }
+                )
+
+            # Route all subsequent ORM operations in this request to the
+            # physical source database.
+            set_active_branch_id(real_branch.pk)
+
+            try:
+                data = request.data
+                old_mutable = getattr(data, "_mutable", None)
+
+                if old_mutable is not None:
+                    data._mutable = True
+
+                data["branch"] = real_branch.pk
+
+                if "sale_mode" in field_names:
+                    data["sale_mode"] = context.source_branch
+
+                if old_mutable is not None:
+                    data._mutable = old_mutable
+
+            except Exception:
+                raise ValidationError(
+                    {
+                        "target_branch": (
+                            "Unable to apply the selected target branch."
+                        )
+                    }
+                )
+
+            return
+
+        # BR01 and BR02 are locked to their permitted sale mode.
         if "sale_mode" in field_names:
             apply_sale_mode_to_request(request, branch)
+

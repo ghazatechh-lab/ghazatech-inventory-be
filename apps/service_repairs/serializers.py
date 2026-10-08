@@ -29,6 +29,8 @@ class ServiceChargeSerializer(serializers.ModelSerializer):
 class ServiceJobSerializer(serializers.ModelSerializer):
     charges = ServiceChargeSerializer(many=True, required=False)
     branch_name = serializers.CharField(source="branch.branch_name", read_only=True)
+    source_branch_code = serializers.CharField(source="branch.branch_code", read_only=True)
+    source_branch_id = serializers.IntegerField(source="branch_id", read_only=True)
     customer_display = serializers.SerializerMethodField()
     technician_name = serializers.SerializerMethodField()
     device_name = serializers.SerializerMethodField()

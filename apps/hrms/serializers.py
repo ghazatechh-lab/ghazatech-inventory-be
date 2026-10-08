@@ -165,7 +165,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             "nationality": {"required": True, "allow_blank": False},
             "date_of_birth": {"required": True, "allow_null": False},
             "joining_date": {"required": True, "allow_null": False},
-            "branch": {"required": True, "allow_null": False},
+            "branch": {"required": False, "allow_null": True},
             "department": {"required": True, "allow_null": False},
             "designation": {"required": True, "allow_null": False},
             "emirates_id_number": {"required": True, "allow_blank": False},
@@ -475,7 +475,7 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         employee = attrs.get("employee")
-        if employee and not attrs.get("branch"):
+        if employee:
             attrs["branch"] = employee.branch
         return attrs
 
@@ -544,7 +544,7 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
             # and lets authorised HR users explicitly override it. Unpaid leave
             # is never restricted by the paid annual entitlement.
 
-        if employee and not attrs.get("branch"):
+        if employee:
             attrs["branch"] = employee.branch
         return attrs
 

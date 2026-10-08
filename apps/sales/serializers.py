@@ -1,4 +1,6 @@
 from decimal import Decimal
+from functools import wraps
+
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -6,11 +8,52 @@ from rest_framework import serializers
 from .models import *
 from apps.inventory.models import ProductStock, StockMovement
 from apps.common.sensitive_permissions import has_sensitive_permission
+from apps.common.transactions import routed_atomic
+from apps.branch_data.services import database_alias_for_branch
 from apps.sales.tax_stock_services import (
     calculate_sales_line,
     deduct_sales_item,
     validate_tax_treatment,
 )
+
+
+def sales_invoice_atomic(func):
+    """Run SalesInvoice create/update inside its owning branch database."""
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if func.__name__ == "create":
+            validated_data = kwargs.get("validated_data")
+            if validated_data is None and args:
+                validated_data = args[0]
+
+            branch = (validated_data or {}).get("branch")
+            if branch is None:
+                raise serializers.ValidationError(
+                    {"branch": "Branch is required for invoice creation."}
+                )
+
+            using = database_alias_for_branch(branch.pk)
+
+        else:
+            instance = kwargs.get("instance")
+            if instance is None and args:
+                instance = args[0]
+
+            if instance is None:
+                raise serializers.ValidationError(
+                    {"invoice": "Invoice instance is required."}
+                )
+
+            using = (
+                getattr(getattr(instance, "_state", None), "db", None)
+                or database_alias_for_branch(instance.branch_id)
+            )
+
+        with transaction.atomic(using=using):
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 def calc(item, q="quantity"):
@@ -499,7 +542,7 @@ class QuotationSerializer(serializers.ModelSerializer):
 
         return data
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         validated_data,
@@ -540,7 +583,7 @@ class QuotationSerializer(serializers.ModelSerializer):
 
         return quotation
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         instance,
@@ -904,7 +947,7 @@ class SalesOrderSerializer(serializers.ModelSerializer):
                 **item,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
 
@@ -930,7 +973,7 @@ class SalesOrderSerializer(serializers.ModelSerializer):
 
         return order
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         if instance.status in [
             "FULFILLED",
@@ -1585,7 +1628,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
                 **item,
             )
 
-    @transaction.atomic
+    @sales_invoice_atomic
     def create(
         self,
         validated_data,
@@ -1670,7 +1713,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
 
         return invoice
 
-    @transaction.atomic
+    @sales_invoice_atomic
     def update(
         self,
         instance,
@@ -1991,7 +2034,7 @@ class POSSaleSerializer(serializers.ModelSerializer):
                 request=request,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
 
@@ -2032,7 +2075,7 @@ class POSSaleSerializer(serializers.ModelSerializer):
 
         return sale
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         raise serializers.ValidationError(
             "Completed POS sales cannot be edited. Void the sale and create a new one."
@@ -2198,7 +2241,7 @@ class SalesReturnSerializer(serializers.ModelSerializer):
 
         return attrs
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         validated_data["return_number"] = self._generate_number()
@@ -2221,7 +2264,7 @@ class SalesReturnSerializer(serializers.ModelSerializer):
         self._recalculate_totals(sales_return)
         return sales_return
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
 
@@ -2410,7 +2453,7 @@ class SalesPaymentSerializer(serializers.ModelSerializer):
 
         invoice.save(update_fields=update_fields)
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         if not validated_data.get("payment_number"):
             validated_data["payment_number"] = self._generate_number()
@@ -2522,7 +2565,7 @@ class PriceListSerializer(serializers.ModelSerializer):
                 price_list=price_list, customer_id=customer_id
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         customer_ids = validated_data.pop("customer_ids", [])
@@ -2530,7 +2573,7 @@ class PriceListSerializer(serializers.ModelSerializer):
         self._save_relations(price_list, items, customer_ids)
         return price_list
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
         customer_ids = validated_data.pop("customer_ids", None)
@@ -2752,7 +2795,7 @@ class DeliveryNoteSerializer(serializers.ModelSerializer):
                 )
         return attrs
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         order = validated_data["sales_order"]
@@ -2765,7 +2808,7 @@ class DeliveryNoteSerializer(serializers.ModelSerializer):
             DeliveryNoteItem.objects.create(delivery_note=note, **item)
         return note
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
         for key, value in validated_data.items():

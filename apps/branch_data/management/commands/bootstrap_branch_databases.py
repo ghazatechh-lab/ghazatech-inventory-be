@@ -6,13 +6,13 @@ from apps.branch_data.services import clear_branch_database_cache
 
 
 class Command(BaseCommand):
-    help = "Configure BR02=VAT, BR03=NON_VAT, BR04=MASTER."
+    help = "Configure BR01=VAT, BR02=NON_VAT, BR03=combined/virtual."
 
     def handle(self, *args, **options):
         mapping = [
-            ("BR02", "VAT", "vat", False, False),
-            ("BR03", "NON_VAT", "non_vat", False, False),
-            ("BR04", "MASTER", "default", True, True),
+            ("BR01", "VAT", "vat", False, False),
+            ("BR02", "NON_VAT", "non_vat", False, False),
+            ("BR03", "MASTER", "default", False, True),
         ]
         for code, mode, alias, master, combined in mapping:
             branch = Branch.objects.filter(branch_code=code).first()

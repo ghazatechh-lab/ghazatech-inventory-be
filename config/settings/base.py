@@ -170,7 +170,7 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_SCHEMA_CLASS": ("drf_spectacular.openapi.AutoSchema"),
     "DEFAULT_FILTER_BACKENDS": [
-        ("django_filters.rest_framework." "DjangoFilterBackend"),
+        "apps.branch_data.filter_backends.VirtualBranchDjangoFilterBackend",
         ("rest_framework.filters." "SearchFilter"),
         ("rest_framework.filters." "OrderingFilter"),
     ],
@@ -283,3 +283,11 @@ LOGGING = {
 from .multidb import DATABASE_ROUTERS, MULTI_DATABASES
 
 DATABASES.update(MULTI_DATABASES)
+
+# Allow the frontend to send the currently selected physical branch.
+from corsheaders.defaults import default_headers
+
+CORS_ALLOW_HEADERS = (
+    *default_headers,
+    "x-branch-id",
+)

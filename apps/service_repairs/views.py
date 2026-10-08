@@ -6,6 +6,9 @@ from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
+from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
+from apps.branch_data.sales_flow import SalesPhysicalBranchGuardMixin
+from apps.branch_data.combined_views import requested_branch as requested_combined_branch
 
 from .models import ServiceJob
 from .serializers import ServiceJobSerializer
@@ -25,7 +28,7 @@ HISTORY_STATUSES = [
 ]
 
 
-class ServiceJobViewSet(ModelViewSet):
+class ServiceJobViewSet(SalesPhysicalBranchGuardMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
     serializer_class = ServiceJobSerializer
     filterset_fields = [
         "branch",
@@ -66,6 +69,13 @@ class ServiceJobViewSet(ModelViewSet):
         branch = self.request.query_params.get("branch")
         if branch not in (None, "", "all"):
             queryset = queryset.filter(branch_id=branch)
+
+        active_branch = requested_combined_branch(self.request)
+        if active_branch and str(active_branch.branch_code or "").upper() == "BR03":
+            source = str(self.request.query_params.get("source_branch") or "ALL").upper().replace("-", "_")
+            code = {"VAT": "BR01", "NON_VAT": "BR02", "BRANCH_1": "BR01", "BRANCH_2": "BR02"}.get(source, source)
+            if code in {"BR01", "BR02"}:
+                queryset = queryset.filter(branch__branch_code__iexact=code)
 
         section = self.request.query_params.get("section")
         if section == "active":

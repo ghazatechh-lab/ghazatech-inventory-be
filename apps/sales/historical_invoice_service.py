@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from apps.common.transactions import routed_atomic
 from rest_framework import serializers
 
 from apps.finance.models import (
@@ -37,6 +38,7 @@ def _account(branch, sub_types, account_type=None):
     return qs.filter(account_type=account_type).first() if account_type else None
 
 
+@routed_atomic
 def _increase_balance(account, amount):
     account = ChartOfAccount.objects.select_for_update().get(pk=account.pk)
     account.current_balance = _decimal(account.current_balance) + _decimal(amount)
@@ -130,7 +132,7 @@ def _ledger(receivable, account, suffix, debit=0, credit=0, remarks=""):
     )
 
 
-@transaction.atomic
+@routed_atomic
 def create_and_post_historical_receivable(sales_invoice, user=None):
     """Post a historical SalesInvoice to accounting only, on its original date."""
     if not sales_invoice.is_historical:

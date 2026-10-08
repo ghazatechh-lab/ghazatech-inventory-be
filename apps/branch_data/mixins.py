@@ -1,88 +1,138 @@
+from django.db import transaction
 from rest_framework.exceptions import ValidationError
 
-from .services import database_alias_for_branch, mode_for_branch
+from apps.branches.models import Branch
+
+from .permissions import user_can_source
+from .routing import (
+    BR03,
+    VAT,
+    NON_VAT,
+    resolve_operation_context,
+)
 
 
-class BranchDatabaseQuerysetMixin:
-    """Use on branch-scoped DRF viewsets.
+class BranchDatabaseOperationMixin:
+    """
+    Drop-in helper for DRF views/viewsets.
 
-    Reads are sent to the database configured for the active branch.
+    Expected existing project behavior:
+      - request has access to the currently selected logical branch, OR
+      - branch id/code is sent in request data/query params/header.
 
-    Branch resolution order:
-    1. X-Branch-ID request header
-    2. ?branch= query parameter
-    3. branch value in request.data for POST/PUT/PATCH requests
-    4. authenticated user's branch
-
-    Writes are routed by BranchTransactionRouter. The router can use either
-    the active branch context established by middleware or the branch attached
-    to the model instance being saved.
+    Override get_active_branch() if your project stores active branch elsewhere.
     """
 
-    branch_query_param = "branch"
-    branch_payload_field = "branch"
+    permission_action = None
 
-    def _request_data_branch_id(self):
-        request = getattr(self, "request", None)
-        if request is None:
-            return None
+    def get_active_branch(self):
+        request = self.request
 
-        method = str(getattr(request, "method", "") or "").upper()
-        if method not in {"POST", "PUT", "PATCH"}:
-            return None
+        branch = getattr(request, "active_branch", None)
+        if branch is not None:
+            return branch
 
-        data = getattr(request, "data", None)
-        if not data:
-            return None
+        raw = (
+            request.data.get("branch")
+            if hasattr(request, "data")
+            else None
+        ) or request.query_params.get("branch") or request.headers.get("X-Branch-ID")
 
-        try:
-            value = data.get(self.branch_payload_field)
-        except (AttributeError, TypeError):
-            return None
+        if not raw:
+            raise ValidationError({"branch": "Select an active branch."})
 
-        # Some clients may submit a small branch object instead of a raw PK.
-        if isinstance(value, dict):
-            value = value.get("id") or value.get("pk")
+        if str(raw).upper().startswith("BR"):
+            return Branch.objects.get(branch_code=str(raw).upper())
 
-        return value
+        return Branch.objects.get(pk=raw)
 
-    def get_branch_id(self):
-        request = getattr(self, "request", None)
+    def get_permission_checker(self):
+        user = self.request.user
+        action = self.permission_action
 
-        if request is None:
-            return None
+        def checker(source, *, write=False):
+            return user_can_source(
+                user,
+                source,
+                write=write,
+                action=action,
+            )
 
-        value = (
-            request.headers.get("X-Branch-ID")
-            or request.query_params.get(self.branch_query_param)
-            or self._request_data_branch_id()
+        return checker
+
+    def get_operation_context(self, *, write=False, target_branch=None):
+        return resolve_operation_context(
+            active_branch=self.get_active_branch(),
+            target_branch=target_branch,
+            request=self.request,
+            permission_checker=self.get_permission_checker(),
+            write=write,
         )
 
-        if value in (None, "", "all", "ALL"):
-            value = getattr(request.user, "branch_id", None)
+    def get_real_branch(self, context):
+        return Branch.objects.get(branch_code=context.real_branch_code)
 
-        if value in (None, "", "all", "ALL"):
-            return None
+    def save_serializer_to_target(self, serializer, **extra):
+        context = self.get_operation_context(write=True)
+        real_branch = self.get_real_branch(context)
 
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError({"branch": "Invalid branch."}) from exc
+        # IMPORTANT:
+        # DRF serializer.save(using=...) does NOT automatically route model save().
+        # Pass the resolved branch to the serializer and execute the save while
+        # the manager/queryset uses the requested DB, or override serializer.create.
+        #
+        # This helper supports serializers implementing:
+        #   create_in_database(validated_data, using=..., branch=...)
+        if hasattr(serializer, "create_in_database"):
+            with transaction.atomic(using=context.db_alias):
+                return serializer.create_in_database(
+                    serializer.validated_data,
+                    using=context.db_alias,
+                    branch=real_branch,
+                    source_branch=context.source_branch,
+                    **extra,
+                )
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        branch_id = self.get_branch_id()
-        alias = database_alias_for_branch(branch_id)
+        raise NotImplementedError(
+            "Serializer must implement create_in_database(..., using, branch, "
+            "source_branch) for multi-database writes."
+        )
 
-        queryset = queryset.using(alias)
 
-        if branch_id and hasattr(queryset.model, "branch_id"):
-            queryset = queryset.filter(branch_id=branch_id)
+class MultiDatabaseSerializerCreateMixin:
+    """
+    Add this to serializers that create transactional records.
 
-        return queryset
+    Override create_object_in_database() in serializers with nested writes.
+    """
 
-    def get_database_alias(self):
-        return database_alias_for_branch(self.get_branch_id())
+    def create_in_database(
+        self,
+        validated_data,
+        *,
+        using,
+        branch,
+        source_branch,
+        **extra,
+    ):
+        validated_data = dict(validated_data)
+        validated_data["branch"] = branch
+        validated_data.pop("target_branch", None)
 
-    def get_database_mode(self):
-        return mode_for_branch(self.get_branch_id())
+        return self.create_object_in_database(
+            validated_data,
+            using=using,
+            source_branch=source_branch,
+            **extra,
+        )
+
+    def create_object_in_database(
+        self,
+        validated_data,
+        *,
+        using,
+        source_branch,
+        **extra,
+    ):
+        model = self.Meta.model
+        return model._default_manager.db_manager(using).create(**validated_data)

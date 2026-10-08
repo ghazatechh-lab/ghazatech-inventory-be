@@ -2,6 +2,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
+from apps.common.transactions import routed_atomic
 from django.db.models import Count, Q, Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -14,6 +15,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.finance_flow import FinanceBranchGuardMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
 
 from .models import (
     AccountingPeriod,
@@ -85,7 +89,7 @@ from .serializers import (
 )
 
 
-class GenericViewSet(BranchAccessQuerysetMixin, ModelViewSet):
+class GenericViewSet(CombinedPhysicalBranchListMixin, BranchAccessQuerysetMixin, ModelViewSet):
     search_fields = []
     ordering_fields = "__all__"
 
@@ -577,7 +581,7 @@ class JournalEntryViewSet(GenericViewSet):
         )
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def post(self, request, pk=None):
         journal = self.get_object()
 
@@ -592,7 +596,7 @@ class JournalEntryViewSet(GenericViewSet):
         return Response(self.get_serializer(journal).data)
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def duplicate(self, request, pk=None):
         source = self.get_object()
 
@@ -635,7 +639,7 @@ class JournalEntryViewSet(GenericViewSet):
         )
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def reverse(self, request, pk=None):
         source = self.get_object()
 
@@ -1012,7 +1016,7 @@ class ReceivableInvoiceViewSet(GenericViewSet):
         return response
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def post(self, request, pk=None):
         invoice = self.get_object()
         if invoice.status != "DRAFT":
@@ -1282,7 +1286,7 @@ class ReceivableReceiptViewSet(GenericViewSet):
         "reference",
     ]
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(self, serializer):
         receipt = serializer.save()
         if not receipt.invoice_id:
@@ -1370,7 +1374,7 @@ class FixedAssetViewSet(GenericViewSet):
         return Response(self.get_serializer(asset).data)
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def capitalize(self, request, pk=None):
         asset = self.get_object()
         if asset.status != "APPROVED":
@@ -1428,7 +1432,7 @@ class FixedAssetDepreciationViewSet(GenericViewSet):
     filterset_fields = ["branch", "period", "status", "asset"]
 
     @action(detail=False, methods=["post"], url_path="post-period")
-    @transaction.atomic
+    @routed_atomic
     def post_period(self, request):
         period = request.data.get("period")
         if not period:
@@ -1808,7 +1812,7 @@ class VatReturnViewSet(GenericViewSet):
         detail=False,
         methods=["post"],
     )
-    @transaction.atomic
+    @routed_atomic
     def prepare(
         self,
         request,
@@ -2620,7 +2624,7 @@ class BudgetRevisionViewSet(GenericViewSet):
         detail=True,
         methods=["post"],
     )
-    @transaction.atomic
+    @routed_atomic
     def approve(
         self,
         request,
@@ -2708,7 +2712,7 @@ class BankTransactionViewSet(GenericViewSet):
 
         return queryset
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(self, serializer):
         transaction = serializer.save()
 
@@ -2842,7 +2846,7 @@ class BankFundTransferViewSet(GenericViewSet):
         "transfer_date",
     ]
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(
         self,
         serializer,
@@ -2915,7 +2919,7 @@ class AssetDepreciationRunViewSet(GenericViewSet):
     filterset_fields = ["period", "branch", "status"]
 
     @action(detail=False, methods=["post"], url_path="calculate")
-    @transaction.atomic
+    @routed_atomic
     def calculate(self, request):
         period = request.data.get("period")
         branch = request.data.get("branch")
@@ -3286,7 +3290,7 @@ class PayableBillViewSet(GenericViewSet):
         return Response(self.get_serializer(bill).data)
 
     @action(detail=True, methods=["post"])
-    @transaction.atomic
+    @routed_atomic
     def post(self, request, pk=None):
         bill = self.get_object()
 
@@ -3494,7 +3498,7 @@ class PayablePaymentViewSet(GenericViewSet):
         "reference",
     ]
 
-    @transaction.atomic
+    @routed_atomic
     def perform_create(self, serializer):
         payment = serializer.save()
 
@@ -4375,9 +4379,13 @@ def changes_in_equity(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def branch_consolidation(request):
+    """Consolidate BR01 + BR02 without creating/copying BR03 transactions."""
     from apps.branches.models import Branch
 
-    branches = list(Branch.objects.all().order_by("id"))
+    physical = list(Branch.objects.using("default").filter(
+        branch_code__in=["BR01", "BR02"], is_active=True
+    ).order_by("branch_code"))
+    alias_by_code = {"BR01": "vat", "BR02": "non_vat"}
     rows = []
     definitions = [
         ("Revenue", "INCOME", None),
@@ -4386,53 +4394,39 @@ def branch_consolidation(request):
     ]
 
     for label, account_type, mode in definitions:
-        values = {}
-        total = Decimal("0")
-        for branch in branches:
-            qs = ChartOfAccount.objects.filter(
-                branch=branch, account_type=account_type, is_active=True
+        values, total = {}, Decimal("0")
+        for branch in physical:
+            code = str(branch.branch_code).upper()
+            alias = alias_by_code[code]
+            qs = ChartOfAccount.objects.using(alias).filter(
+                branch_id=branch.id, account_type=account_type, is_active=True
             )
             if mode == "COST_OF_GOODS_SOLD":
                 qs = qs.filter(sub_type="COST_OF_GOODS_SOLD")
             elif mode == "OTHER":
                 qs = qs.exclude(sub_type="COST_OF_GOODS_SOLD")
             value = qs.aggregate(value=Sum("current_balance"))["value"] or Decimal("0")
-            values[str(branch.id)] = str(value)
+            values[code] = str(value)
             total += value
-        rows.append(
-            {
-                "metric": label,
-                "branches": values,
-                "elimination": "0",
-                "consolidated": str(total),
-            }
-        )
+        rows.append({"metric": label, "branches": values, "elimination": "0", "consolidated": str(total)})
 
-    revenue = Decimal(rows[0]["consolidated"])
-    cogs = Decimal(rows[1]["consolidated"])
-    operating = Decimal(rows[2]["consolidated"])
-    rows.append(
-        {
-            "metric": "Net Profit",
-            "branches": {},
-            "elimination": "0",
-            "consolidated": str(revenue - cogs - operating),
-        }
-    )
-
-    return Response(
-        {
-            "branches": [
-                {
-                    "id": branch.id,
-                    "name": branch.branch_name,
-                    "code": getattr(branch, "branch_code", ""),
-                }
-                for branch in branches
-            ],
-            "rows": rows,
-        }
-    )
+    revenue, cogs, operating = (Decimal(row["consolidated"]) for row in rows)
+    rows.append({
+        "metric": "Net Profit",
+        "branches": {
+            code: str(
+                Decimal(rows[0]["branches"].get(code, "0"))
+                - Decimal(rows[1]["branches"].get(code, "0"))
+                - Decimal(rows[2]["branches"].get(code, "0"))
+            ) for code in ("BR01", "BR02")
+        },
+        "elimination": "0",
+        "consolidated": str(revenue - cogs - operating),
+    })
+    return Response({
+        "branches": [{"id": b.id, "name": b.branch_name, "code": b.branch_code} for b in physical],
+        "rows": rows,
+    })
 
 
 DEFAULT_CLOSE_TASKS = [
@@ -4647,7 +4641,7 @@ def period_task_toggle(
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-@transaction.atomic
+@routed_atomic
 def period_action(
     request,
     period_id,

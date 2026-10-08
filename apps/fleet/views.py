@@ -5,6 +5,8 @@ from rest_framework.decorators import action
 from rest_framework.viewsets import ModelViewSet
 
 from apps.common.response import ok
+from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
+from apps.branch_data.workforce_flow import WorkforceBranchScopeMixin, require_related_branch
 
 from .models import Vehicle, VehicleTrip
 from .serializers import (
@@ -14,7 +16,8 @@ from .serializers import (
 )
 
 
-class VehicleViewSet(ModelViewSet):
+class VehicleViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
+    direct_branch_owner = True
     queryset = Vehicle.objects.select_related("branch").all()
     serializer_class = VehicleSerializer
     filterset_fields = ["branch", "status", "vehicle_type"]
@@ -54,7 +57,8 @@ class VehicleViewSet(ModelViewSet):
         return ok(counts)
 
 
-class VehicleTripViewSet(ModelViewSet):
+class VehicleTripViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
+    related_branch_field = "vehicle"
     queryset = VehicleTrip.objects.select_related(
         "vehicle", "driver", "branch", "approved_by"
     ).all()
@@ -95,6 +99,7 @@ class VehicleTripViewSet(ModelViewSet):
             new_vehicle.status = "OUT"
             new_vehicle.save(update_fields=["status", "updated_at"])
 
+        require_related_branch(self.request, new_vehicle.branch)
         serializer.save(branch=new_vehicle.branch)
 
     @transaction.atomic

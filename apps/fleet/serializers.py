@@ -13,6 +13,7 @@ class VehicleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Vehicle
         fields = "__all__"
+        extra_kwargs = {"branch": {"required": False}}
 
     def get_display_name(self, obj):
         return f"{obj.make} {obj.model}".strip()

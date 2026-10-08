@@ -12,6 +12,8 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
 from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.purchase_flow import PurchaseBranchGuardMixin
 from apps.recovery.services import soft_delete_to_recovery
 from .models import (
     Supplier,
@@ -36,6 +38,8 @@ MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
 
 
 class SupplierViewSet(
+    PurchaseBranchGuardMixin,
+    CombinedPhysicalBranchListMixin,
     BranchAccessQuerysetMixin,
     ModelViewSet,
 ):
@@ -185,52 +189,35 @@ class SupplierViewSet(
         detail=False,
         methods=["get"],
     )
-    def summary(
-        self,
-        request,
-    ):
-        queryset = self.filter_queryset(
-            self.get_queryset(),
+    def summary(self, request):
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
         )
 
-        active = queryset.filter(
-            is_active=True,
-        ).count()
-
-        total_credit = (
-            queryset.aggregate(
-                value=Sum(
-                    "credit_limit",
-                ),
-            )["value"]
-            or 0
+        active = sum(qs.filter(is_active=True).count() for qs in querysets)
+        total_credit = sum(
+            qs.aggregate(value=Sum("credit_limit"))["value"] or 0
+            for qs in querysets
         )
-
-        opening_balance = (
-            queryset.aggregate(
-                value=Sum(
-                    "opening_balance",
-                ),
-            )["value"]
-            or 0
+        opening_balance = sum(
+            qs.aggregate(value=Sum("opening_balance"))["value"] or 0
+            for qs in querysets
         )
-
-        serializer = SupplierSerializer(
-            queryset,
-            many=True,
-            context={
-                "request": request,
-            },
-        )
-
-        outstanding = sum(
-            (item["outstanding_balance"] for item in serializer.data),
-            0,
-        )
+        outstanding = 0
+        for qs in querysets:
+            serializer = SupplierSerializer(
+                qs, many=True, context={"request": request}
+            )
+            outstanding += sum(
+                (item["outstanding_balance"] for item in serializer.data), 0
+            )
 
         return Response(
             {
-                "count": queryset.count(),
+                "count": sum(qs.count() for qs in querysets),
                 "active": active,
                 "credit_limit": total_credit,
                 "opening_balance": opening_balance,

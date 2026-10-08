@@ -2,64 +2,82 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.audit_logs.services import create_immutable_audit
+from apps.branch_data.services import database_alias_for_branch
 from apps.inventory.services import adjust_stock
 
 
-@transaction.atomic
 def confirm_grn(grn, user, request=None):
-    grn = grn.__class__.objects.select_for_update().get(pk=grn.pk)
-    if grn.is_confirmed:
-        return grn
+    using = getattr(getattr(grn, "_state", None), "db", None) or database_alias_for_branch(
+        grn.branch_id
+    )
 
-    for item in grn.items.select_related("product", "variant").all():
-        quantity = int(item.accepted_quantity or 0)
-        if quantity <= 0:
-            quantity = max(
-                0,
-                int(item.received_quantity or 0)
-                - int(item.damaged_quantity or 0)
-                - int(item.rejected_quantity or 0),
+    with transaction.atomic(using=using):
+        grn = grn.__class__.objects.using(using).select_for_update().get(pk=grn.pk)
+        if grn.is_confirmed:
+            return grn
+
+        for item in grn.items.select_related("product", "variant").all():
+            quantity = int(item.accepted_quantity or 0)
+            if quantity <= 0:
+                quantity = max(
+                    0,
+                    int(item.received_quantity or 0)
+                    - int(item.damaged_quantity or 0)
+                    - int(item.rejected_quantity or 0),
+                )
+
+            po_item = (
+                grn.purchase_order.items.using(using)
+                .select_for_update()
+                .filter(product_id=item.product_id, variant_id=item.variant_id)
+                .first()
             )
 
-        if quantity > 0:
-            adjust_stock(
-                product=item.product,
-                variant=item.variant,
-                branch=grn.branch,
-                warehouse=grn.warehouse_location or "",
-                quantity=quantity,
-                movement_type="PURCHASE",
-                performed_by=user,
-                reference_type="GRN",
-                reference_id=grn.id,
-                remarks=f"PO {grn.purchase_order.po_number}",
-            )
+            if quantity > 0:
+                unit_cost = po_item.unit_price if po_item else None
+                tax_treatment = po_item.tax_treatment if po_item else item.product.tax_treatment
+                vat_percentage = po_item.vat_percentage if po_item else item.product.vat_rate
+                adjust_stock(
+                    product=item.product,
+                    variant=item.variant,
+                    branch=grn.branch,
+                    warehouse=grn.warehouse_location or "",
+                    quantity=quantity,
+                    movement_type="PURCHASE",
+                    performed_by=user,
+                    reference_type="GRN",
+                    reference_id=grn.id,
+                    remarks=f"PO {grn.purchase_order.po_number}",
+                    unit_cost=unit_cost,
+                    vat_treatment=tax_treatment,
+                    vat_percentage=vat_percentage,
+                    vat_inclusive=False,
+                    source_document_number=grn.grn_number,
+                )
 
-        po_item = (
-            grn.purchase_order.items.select_for_update()
-            .filter(product=item.product, variant=item.variant)
-            .first()
+            if po_item:
+                po_item.received_quantity = min(
+                    int(po_item.quantity or 0),
+                    int(po_item.received_quantity or 0) + quantity,
+                )
+                po_item.save(using=using, update_fields=["received_quantity"])
+
+        po_items = list(grn.purchase_order.items.using(using).all())
+        if po_items and all(
+            int(i.received_quantity or 0) >= int(i.quantity or 0) for i in po_items
+        ):
+            grn.purchase_order.status = "RECEIVED"
+        elif any(int(i.received_quantity or 0) > 0 for i in po_items):
+            grn.purchase_order.status = "PARTIALLY_RECEIVED"
+        grn.purchase_order.save(using=using, update_fields=["status", "updated_at"])
+
+        grn.is_confirmed = True
+        grn.status = "CONFIRMED"
+        grn.confirmed_at = timezone.now()
+        grn.save(
+            using=using,
+            update_fields=["is_confirmed", "status", "confirmed_at", "updated_at"],
         )
-        if po_item:
-            po_item.received_quantity = min(
-                int(po_item.quantity or 0),
-                int(po_item.received_quantity or 0) + quantity,
-            )
-            po_item.save(update_fields=["received_quantity"])
-
-    po_items = list(grn.purchase_order.items.all())
-    if po_items and all(
-        int(i.received_quantity or 0) >= int(i.quantity or 0) for i in po_items
-    ):
-        grn.purchase_order.status = "RECEIVED"
-    elif any(int(i.received_quantity or 0) > 0 for i in po_items):
-        grn.purchase_order.status = "PARTIALLY_RECEIVED"
-    grn.purchase_order.save(update_fields=["status", "updated_at"])
-
-    grn.is_confirmed = True
-    grn.status = "CONFIRMED"
-    grn.confirmed_at = timezone.now()
-    grn.save(update_fields=["is_confirmed", "status", "confirmed_at", "updated_at"])
 
     create_immutable_audit(
         user=user,

@@ -71,7 +71,7 @@ class Product(TimeStampedModel, SoftDeleteModel):
 
     product_name = models.CharField(max_length=250)
     sku = models.CharField(max_length=80)
-    barcode = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    barcode = models.CharField(max_length=100, null=True, blank=True)
     brand = models.ForeignKey(Brand, on_delete=models.PROTECT, related_name="products")
     category = models.ForeignKey(
         Category,
@@ -129,6 +129,11 @@ class Product(TimeStampedModel, SoftDeleteModel):
                 fields=["branch", "sku"],
                 condition=Q(branch__isnull=False),
                 name="unique_product_sku_per_branch",
+            ),
+            models.UniqueConstraint(
+                fields=["branch", "barcode"],
+                condition=Q(branch__isnull=False, barcode__isnull=False),
+                name="unique_product_barcode_per_branch",
             ),
             models.UniqueConstraint(
                 fields=["sku"],

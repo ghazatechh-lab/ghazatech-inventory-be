@@ -3,6 +3,8 @@ from pathlib import Path
 from decimal import Decimal
 from urllib import request
 from django.db import transaction
+from apps.common.transactions import routed_atomic
+from apps.branch_data.services import database_alias_for_branch
 from django.db.models import Q, Sum
 from django.utils import timezone
 from django.contrib.auth import get_user_model
@@ -23,13 +25,16 @@ from apps.inventory.models import Rack
 from apps.inventory.services import adjust_stock
 import logging
 from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.purchase_flow import PurchaseBranchGuardMixin
+from apps.branch_data.physical import require_physical_branch
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
 
-class Base(BranchAccessQuerysetMixin, ModelViewSet):
+class Base(PurchaseBranchGuardMixin, CombinedPhysicalBranchListMixin, BranchAccessQuerysetMixin, ModelViewSet):
     search_fields = []
     ordering_fields = "__all__"
     ordering = ["-id"]
@@ -37,9 +42,9 @@ class Base(BranchAccessQuerysetMixin, ModelViewSet):
     def perform_create(self, serializer):
         kwargs = {"created_by": self.request.user, "updated_by": self.request.user}
         if hasattr(serializer.Meta.model, "branch"):
-            kwargs["branch"] = serializer.validated_data.get("branch") or getattr(
-                self.request.user, "branch", None
-            )
+            branch = serializer.validated_data.get("branch")
+            require_physical_branch(branch, message="Branch 3 cannot own purchase data.")
+            kwargs["branch"] = branch
         serializer.save(**kwargs)
 
     def perform_update(self, serializer):
@@ -201,54 +206,46 @@ class PurchaseOrderViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
-        queryset = self.filter_queryset(
-            self.get_queryset(),
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
         )
-
         today = timezone.localdate()
-
-        month_queryset = queryset.filter(
-            order_date__year=today.year,
-            order_date__month=today.month,
-        )
-
         open_statuses = [
-            "DRAFT",
-            "PENDING_APPROVAL",
-            "APPROVED",
-            "PARTIALLY_RECEIVED",
+            "DRAFT", "PENDING_APPROVAL", "APPROVED", "PARTIALLY_RECEIVED"
         ]
 
-        overdue = queryset.filter(
-            expected_delivery_date__lt=today,
-        ).exclude(
-            status__in=[
-                "RECEIVED",
-                "CANCELLED",
-            ],
-        )
+        def total(qs, field):
+            return qs.aggregate(value=Sum(field))["value"] or 0
 
         return Response(
             {
-                "count": queryset.count(),
-                "total_purchase_this_month": month_queryset.aggregate(
-                    value=Sum(
+                "count": sum(qs.count() for qs in querysets),
+                "total_purchase_this_month": sum(
+                    total(
+                        qs.filter(
+                            order_date__year=today.year,
+                            order_date__month=today.month,
+                        ),
                         "total_amount",
                     )
-                )["value"]
-                or 0,
-                "awaiting_approval": queryset.filter(
-                    status="PENDING_APPROVAL",
-                ).count(),
-                "open_po_value": queryset.filter(
-                    status__in=open_statuses,
-                ).aggregate(
-                    value=Sum(
-                        "total_amount",
-                    )
-                )["value"]
-                or 0,
-                "overdue_deliveries": overdue.count(),
+                    for qs in querysets
+                ),
+                "awaiting_approval": sum(
+                    qs.filter(status="PENDING_APPROVAL").count() for qs in querysets
+                ),
+                "open_po_value": sum(
+                    total(qs.filter(status__in=open_statuses), "total_amount")
+                    for qs in querysets
+                ),
+                "overdue_deliveries": sum(
+                    qs.filter(expected_delivery_date__lt=today)
+                    .exclude(status__in=["RECEIVED", "CANCELLED"])
+                    .count()
+                    for qs in querysets
+                ),
             }
         )
 
@@ -463,7 +460,7 @@ class GRNViewSet(Base):
             for row in rows
         }
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=self._request_payload(request))
         serializer.is_valid(raise_exception=True)
@@ -476,7 +473,7 @@ class GRNViewSet(Base):
             status=status.HTTP_201_CREATED,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
@@ -693,7 +690,7 @@ class GRNViewSet(Base):
         detail=True,
         methods=["post"],
     )
-    @transaction.atomic
+    @routed_atomic
     def confirm(self, request, pk=None):
         grn = GoodsReceivedNote.objects.select_for_update().get(pk=self.get_object().pk)
 
@@ -869,7 +866,7 @@ class SupplierBillViewSet(Base):
                 uploaded_by=request.user if request.user.is_authenticated else None,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, request, *args, **kwargs):
         payload = self._request_payload(request)
 
@@ -888,7 +885,7 @@ class SupplierBillViewSet(Base):
             status=status.HTTP_201_CREATED,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
@@ -1155,7 +1152,7 @@ class SupplierBillViewSet(Base):
         methods=["post"],
         url_path="approve",
     )
-    @transaction.atomic
+    @routed_atomic
     def approve(self, request, pk=None):
         """
         Approve a saved Supplier Bill.
@@ -1434,45 +1431,37 @@ class SupplierBillViewSet(Base):
         methods=["get"],
     )
     def summary(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
+        )
         today = timezone.localdate()
 
-        total_payable = (
-            queryset.exclude(
-                status__in=[
-                    "PAID",
-                    "CANCELLED",
-                ]
-            ).aggregate(
-                value=Sum("balance_due")
-            )["value"]
-            or 0
-        )
+        def total(qs):
+            return qs.aggregate(value=Sum("balance_due"))["value"] or 0
 
-        overdue = (
-            queryset.filter(
-                due_date__lt=today,
+        active = [
+            qs.exclude(status__in=["PAID", "CANCELLED"]) for qs in querysets
+        ]
+        overdue = [
+            qs.filter(due_date__lt=today).exclude(
+                status__in=["PAID", "CANCELLED"]
             )
-            .exclude(
-                status__in=[
-                    "PAID",
-                    "CANCELLED",
-                ]
-            )
-            .aggregate(value=Sum("balance_due"))["value"]
-            or 0
-        )
-
-        bills_this_month = queryset.filter(
-            bill_date__year=today.year,
-            bill_date__month=today.month,
-        ).count()
-
+            for qs in querysets
+        ]
         return Response(
             {
-                "total_payable": total_payable,
-                "overdue": overdue,
-                "bills_this_month": bills_this_month,
+                "total_payable": sum(total(qs) for qs in active),
+                "overdue": sum(total(qs) for qs in overdue),
+                "bills_this_month": sum(
+                    qs.filter(
+                        bill_date__year=today.year,
+                        bill_date__month=today.month,
+                    ).count()
+                    for qs in querysets
+                ),
             }
         )
 
@@ -1597,7 +1586,7 @@ class SupplierPaymentViewSet(Base):
                 uploaded_by=request.user if request.user.is_authenticated else None,
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(
             data=self._request_payload(request),
@@ -1894,7 +1883,7 @@ class SupplierReturnViewSet(Base):
                 uploaded_by=(request.user if request.user.is_authenticated else None),
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         request,
@@ -1922,7 +1911,7 @@ class SupplierReturnViewSet(Base):
             status=status.HTTP_201_CREATED,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         request,
@@ -2213,7 +2202,7 @@ class SupplierReturnViewSet(Base):
 
         return Response(self.get_serializer(supplier_return).data)
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -2486,6 +2475,7 @@ class VendorCreditViewSet(Base):
 
         return "STANDARD_VAT"
 
+    @routed_atomic
     def _sync_return_credit_content(self, vendor_credit):
         """
         Repair or populate a Vendor Credit created from a Supplier Return.
@@ -2705,15 +2695,18 @@ class VendorCreditViewSet(Base):
         if instance.supplier_return_id and (
             not instance.items.exists() or not instance.applications.exists()
         ):
-            with transaction.atomic():
-                instance = VendorCredit.objects.select_for_update().get(pk=instance.pk)
-                instance = self._sync_return_credit_content(
-                    instance,
+            using = getattr(getattr(instance, "_state", None), "db", None) or database_alias_for_branch(instance.branch_id)
+            with transaction.atomic(using=using):
+                instance = (
+                    VendorCredit.objects.using(using)
+                    .select_for_update()
+                    .get(pk=instance.pk)
                 )
+                instance = self._sync_return_credit_content(instance)
 
         return Response(self.get_serializer(instance).data)
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         request,
@@ -2757,7 +2750,7 @@ class VendorCreditViewSet(Base):
             status=status.HTTP_201_CREATED,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         request,
@@ -2956,40 +2949,38 @@ class VendorCreditViewSet(Base):
         detail=False,
         methods=["get"],
     )
-    def summary(
-        self,
-        request,
-    ):
-        queryset = self.filter_queryset(self.get_queryset())
+    def summary(self, request):
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
+        )
+
+        def count_status(status):
+            return sum(qs.filter(status=status).count() for qs in querysets)
+
+        open_balance = sum(
+            (
+                qs.filter(status__in=["OPEN", "PARTIALLY_APPLIED"])
+                .aggregate(value=Sum("remaining_amount"))["value"]
+                or 0
+            )
+            for qs in querysets
+        )
 
         return Response(
             {
-                "all_count": queryset.count(),
-                "open_count": queryset.filter(
-                    status="OPEN",
-                ).count(),
-                "partial_count": queryset.filter(
-                    status="PARTIALLY_APPLIED",
-                ).count(),
-                "applied_count": queryset.filter(
-                    status="FULLY_APPLIED",
-                ).count(),
-                "void_count": queryset.filter(
-                    status="VOID",
-                ).count(),
-                "open_balance": (
-                    queryset.filter(
-                        status__in=[
-                            "OPEN",
-                            "PARTIALLY_APPLIED",
-                        ]
-                    ).aggregate(value=Sum("remaining_amount"))["value"]
-                    or 0
-                ),
+                "all_count": sum(qs.count() for qs in querysets),
+                "open_count": count_status("OPEN"),
+                "partial_count": count_status("PARTIALLY_APPLIED"),
+                "applied_count": count_status("FULLY_APPLIED"),
+                "void_count": count_status("VOID"),
+                "open_balance": open_balance,
             }
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -3132,7 +3123,7 @@ class VendorCreditViewSet(Base):
             status=status.HTTP_200_OK,
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -3364,7 +3355,7 @@ class VendorCreditViewSet(Base):
             status=status.HTTP_200_OK,
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -3473,7 +3464,7 @@ class VendorCreditViewSet(Base):
             ).data
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -3618,7 +3609,7 @@ class PurchaseExpenseViewSet(Base):
                 uploaded_by=(request.user if request.user.is_authenticated else None),
             )
 
-    @transaction.atomic
+    @routed_atomic
     def create(
         self,
         request,
@@ -3650,7 +3641,7 @@ class PurchaseExpenseViewSet(Base):
             status=status.HTTP_201_CREATED,
         )
 
-    @transaction.atomic
+    @routed_atomic
     def update(
         self,
         request,
@@ -3824,51 +3815,52 @@ class PurchaseExpenseViewSet(Base):
         url_path="summary",
     )
     def summary(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
-
+        combined = self.combined_querysets()
+        querysets = (
+            [item[3] for item in combined]
+            if combined is not None
+            else [self.filter_queryset(self.get_queryset())]
+        )
         today = timezone.localdate()
 
-        this_month = queryset.filter(
-            expense_date__year=today.year,
-            expense_date__month=today.month,
+        def amount(qs):
+            return qs.aggregate(value=Sum("amount"))["value"] or 0
+
+        month_sets = [
+            qs.filter(
+                expense_date__year=today.year,
+                expense_date__month=today.month,
+            )
+            for qs in querysets
+        ]
+        pending_sets = [qs.filter(status="PENDING") for qs in querysets]
+        paid_sets = [qs.filter(status="PAID") for qs in month_sets]
+
+        category_totals = {}
+        for qs in month_sets:
+            for row in qs.values("category").annotate(total=Sum("amount")):
+                category_totals[row["category"]] = (
+                    category_totals.get(row["category"], 0) + (row["total"] or 0)
+                )
+        top_category = max(
+            category_totals.items(), key=lambda item: item[1], default=("", 0)
         )
-
-        pending = queryset.filter(status="PENDING")
-
-        paid = this_month.filter(status="PAID")
-
-        top_category = (
-            this_month.values("category")
-            .annotate(total=Sum("amount"))
-            .order_by("-total")
-            .first()
-        )
-
         category_labels = dict(PurchaseExpense._meta.get_field("category").choices)
 
         return Response(
             {
-                "this_month_total": (
-                    this_month.aggregate(value=Sum("amount"))["value"] or 0
-                ),
-                "this_month_count": (this_month.count()),
-                "pending_total": (pending.aggregate(value=Sum("amount"))["value"] or 0),
-                "pending_count": (pending.count()),
-                "paid_this_month": (paid.aggregate(value=Sum("amount"))["value"] or 0),
-                "paid_count": (paid.count()),
-                "top_category": (
-                    category_labels.get(
-                        top_category["category"],
-                        top_category["category"],
-                    )
-                    if top_category
-                    else ""
-                ),
-                "top_category_total": (top_category["total"] if top_category else 0),
+                "this_month_total": sum(amount(qs) for qs in month_sets),
+                "this_month_count": sum(qs.count() for qs in month_sets),
+                "pending_total": sum(amount(qs) for qs in pending_sets),
+                "pending_count": sum(qs.count() for qs in pending_sets),
+                "paid_this_month": sum(amount(qs) for qs in paid_sets),
+                "paid_count": sum(qs.count() for qs in paid_sets),
+                "top_category": category_labels.get(top_category[0], top_category[0]),
+                "top_category_total": top_category[1],
             }
         )
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -4016,7 +4008,7 @@ class PurchaseExpenseViewSet(Base):
 
         return Response(self.get_serializer(expense).data)
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],
@@ -4054,7 +4046,7 @@ class PurchaseExpenseViewSet(Base):
 
         return Response(self.get_serializer(expense).data)
 
-    @transaction.atomic
+    @routed_atomic
     @action(
         detail=True,
         methods=["post"],

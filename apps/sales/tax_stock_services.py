@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
+from apps.common.transactions import routed_atomic
 
 from apps.audit_logs.services import create_immutable_audit
 from apps.common.sensitive_permissions import has_sensitive_permission
@@ -106,7 +107,7 @@ def validate_tax_treatment(user, tax_treatment, reason=""):
     return normalized
 
 
-@transaction.atomic
+@routed_atomic
 def deduct_sales_item(
     *,
     item,

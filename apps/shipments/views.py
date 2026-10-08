@@ -23,6 +23,8 @@ from apps.suppliers.models import Supplier
 
 from apps.common.response import ok
 from apps.common.three_branch import BranchAccessQuerysetMixin
+from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
+from apps.branch_data.purchase_flow import PurchaseBranchGuardMixin
 
 from .models import (
     Shipment,
@@ -91,6 +93,8 @@ def _user_display_name(
 
 
 class ShipmentViewSet(
+    PurchaseBranchGuardMixin,
+    CombinedPhysicalBranchListMixin,
     BranchAccessQuerysetMixin,
     ModelViewSet,
 ):

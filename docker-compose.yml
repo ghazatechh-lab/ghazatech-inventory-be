@@ -1,7 +1,7 @@
 services:
   # =========================================================
   # MASTER / COMBINED DATABASE
-  # Branch 4
+  # Combined / shared default database
   # =========================================================
   db:
     image: postgres:16-alpine
@@ -20,7 +20,7 @@ services:
 
   # =========================================================
   # VAT DATABASE
-  # Branch 2
+  # BR01 / VAT
   # =========================================================
   db_vat:
     image: postgres:16-alpine
@@ -39,7 +39,7 @@ services:
 
   # =========================================================
   # NON-VAT DATABASE
-  # Branch 3
+  # BR02 / Non-VAT
   # =========================================================
   db_non_vat:
     image: postgres:16-alpine
@@ -149,11 +149,11 @@ services:
 # PERSISTENT DATABASE VOLUMES
 # =========================================================
 volumes:
-  # Branch 4 - Master / Combined database
+  # Shared default / BR03 combined-view database
   postgres_data:
 
-  # Branch 2 - VAT database
+  # BR01 - VAT database
   postgres_vat_data:
 
-  # Branch 3 - Non-VAT database
+  # BR02 - Non-VAT database
   postgres_non_vat_data:
