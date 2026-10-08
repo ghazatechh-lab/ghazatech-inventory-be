@@ -276,8 +276,30 @@ class EmployeeSerializer(serializers.ModelSerializer):
 
         today = timezone.localdate()
 
+        dob_min_date = date(1950, 1, 1)
+
         if date_of_birth and date_of_birth >= today:
             errors["date_of_birth"] = "Date of birth must be before today."
+
+        # New/changed DOB values use the supported employee range. Preserve an
+        # unchanged legacy DOB when editing so older existing employees remain
+        # editable without forcing an unrelated DOB change.
+        existing_dob = (
+            getattr(self.instance, "date_of_birth", None) if self.instance else None
+        )
+        dob_is_unchanged_legacy = (
+            existing_dob
+            and existing_dob < dob_min_date
+            and date_of_birth == existing_dob
+        )
+        if (
+            date_of_birth
+            and date_of_birth < dob_min_date
+            and not dob_is_unchanged_legacy
+        ):
+            errors["date_of_birth"] = (
+                "Date of birth must be on or after 1950-01-01."
+            )
 
         if emirates_issue and emirates_expiry and emirates_expiry <= emirates_issue:
             errors["emirates_id_expiry_date"] = (
