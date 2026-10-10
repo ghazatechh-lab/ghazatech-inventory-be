@@ -22,6 +22,10 @@ class Command(BaseCommand):
             if alias not in connections:
                 self.stdout.write("Not configured")
                 continue
+            tables = set(connections[alias].introspection.table_names())
+            if Product._meta.db_table not in tables:
+                self.stdout.write("Product catalog table is not present; skipped")
+                continue
             rows = list(manager.using(alias).filter(sku__iexact=sku).values(
                 "id", "sku", "product_name", "branch_id", "is_deleted", "is_active"
             ))
@@ -30,8 +34,15 @@ class Command(BaseCommand):
             for row in rows:
                 branch = Branch.objects.using("default").filter(pk=row["branch_id"]).first()
                 row["branch_code"] = branch.branch_code if branch else None
-                row["stock_rows"] = list(ProductStock._base_manager.using(alias).filter(
-                    product_id=row["id"]
-                ).values("id", "branch_id", "current_stock", "reserved_stock"))
+                # Shared catalog rows do not own stock. Never query the stock
+                # table in default; some deployments intentionally omit it.
+                if alias == "default":
+                    row["stock_rows"] = "Not applicable: stock lives in physical databases"
+                elif ProductStock._meta.db_table not in tables:
+                    row["stock_rows"] = "Stock table is not present in this physical database"
+                else:
+                    row["stock_rows"] = list(ProductStock._base_manager.using(alias).filter(
+                        product_id=row["id"]
+                    ).values("id", "branch_id", "current_stock", "reserved_stock"))
                 self.stdout.write(str(row))
         self.stdout.write("\nRead-only check complete. No records changed.")
