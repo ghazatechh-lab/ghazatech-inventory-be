@@ -44,6 +44,7 @@ from .product_import_export import (
     product_export_response,
 )
 from rest_framework import status
+from apps.branches.models import Branch
 
 
 class BrandViewSet(ModelViewSet):

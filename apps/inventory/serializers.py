@@ -828,11 +828,14 @@ class ProductSerializer(serializers.ModelSerializer):
             variants_data,
         )
 
-        self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
-        self._sync_branch_stock(
-            product,
-            reference_type=("PRODUCT_CREATE"),
-        )
+        # A later stock error must roll back the physical catalog mirror too.
+        # The outer default transaction already protects shared catalog writes.
+        with transaction.atomic(using=database_alias_for_branch(product.branch_id)):
+            self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
+            self._sync_branch_stock(
+                product,
+                reference_type=("PRODUCT_CREATE"),
+            )
 
         return product
 
@@ -878,11 +881,14 @@ class ProductSerializer(serializers.ModelSerializer):
                 variants_data,
             )
 
-        self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
-        self._sync_branch_stock(
-            product,
-            reference_type=("PRODUCT_EDIT"),
-        )
+        # A later stock error must roll back the physical catalog mirror too.
+        # The outer default transaction already protects shared catalog writes.
+        with transaction.atomic(using=database_alias_for_branch(product.branch_id)):
+            self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
+            self._sync_branch_stock(
+                product,
+                reference_type=("PRODUCT_EDIT"),
+            )
 
         return product
 
