@@ -2,18 +2,54 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Vehicle, VehicleTrip
+from .models import Vehicle, VehicleDocument, VehicleTrip
+
+
+class VehicleDocumentSerializer(serializers.ModelSerializer):
+    status = serializers.CharField(source="expiry_status", read_only=True)
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VehicleDocument
+        fields = "__all__"
+        read_only_fields = ["uploaded_by"]
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+        request = self.context.get("request")
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+    def validate_file(self, value):
+        if value and value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError("Vehicle documents must be 10 MB or smaller.")
+        return value
 
 
 class VehicleSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source="branch.branch_name", read_only=True)
     display_name = serializers.SerializerMethodField()
     service_due_soon = serializers.SerializerMethodField()
+    vehicle_image_url = serializers.SerializerMethodField()
+    documents = VehicleDocumentSerializer(many=True, read_only=True)
 
     class Meta:
         model = Vehicle
         fields = "__all__"
         extra_kwargs = {"branch": {"required": False}}
+
+    def get_vehicle_image_url(self, obj):
+        if not obj.vehicle_image:
+            return None
+        request = self.context.get("request")
+        url = obj.vehicle_image.url
+        return request.build_absolute_uri(url) if request else url
+
+    def validate_vehicle_image(self, value):
+        if value and value.size > 5 * 1024 * 1024:
+            raise serializers.ValidationError("Vehicle image must be 5 MB or smaller.")
+        return value
 
     def get_display_name(self, obj):
         return f"{obj.make} {obj.model}".strip()

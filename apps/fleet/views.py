@@ -8,8 +8,9 @@ from apps.common.response import ok
 from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
 from apps.branch_data.workforce_flow import WorkforceBranchScopeMixin, require_related_branch
 
-from .models import Vehicle, VehicleTrip
+from .models import Vehicle, VehicleDocument, VehicleTrip
 from .serializers import (
+    VehicleDocumentSerializer,
     VehicleReturnSerializer,
     VehicleSerializer,
     VehicleTripSerializer,
@@ -18,7 +19,7 @@ from .serializers import (
 
 class VehicleViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
     direct_branch_owner = True
-    queryset = Vehicle.objects.select_related("branch").all()
+    queryset = Vehicle.objects.select_related("branch").prefetch_related("documents").all()
     serializer_class = VehicleSerializer
     filterset_fields = ["branch", "status", "vehicle_type"]
     search_fields = ["vehicle_code", "make", "model", "registration_number"]
@@ -141,3 +142,22 @@ class VehicleTripViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequest
             VehicleTripSerializer(trip, context={"request": request}).data,
             message="Vehicle returned successfully",
         )
+
+
+class VehicleDocumentViewSet(WorkforceBranchScopeMixin, DefaultCombinedBranchRequestMixin, ModelViewSet):
+    related_branch_field = "vehicle"
+    queryset = VehicleDocument.objects.select_related("vehicle", "vehicle__branch", "uploaded_by").all()
+    serializer_class = VehicleDocumentSerializer
+    filterset_fields = ["vehicle", "document_type", "expiry_date"]
+    search_fields = ["title", "document_number", "vehicle__vehicle_code", "vehicle__registration_number"]
+    ordering_fields = ["expiry_date", "issue_date", "created_at", "title"]
+
+    def perform_create(self, serializer):
+        vehicle = serializer.validated_data["vehicle"]
+        require_related_branch(self.request, vehicle.branch)
+        serializer.save(uploaded_by=self.request.user)
+
+    def perform_update(self, serializer):
+        vehicle = serializer.validated_data.get("vehicle", serializer.instance.vehicle)
+        require_related_branch(self.request, vehicle.branch)
+        serializer.save()

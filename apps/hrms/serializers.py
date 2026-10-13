@@ -904,6 +904,42 @@ class PayrollEntrySerializer(serializers.ModelSerializer):
         source="paid_by",
         read_only=True,
     )
+    designation_name = serializers.SerializerMethodField()
+    joining_date = serializers.DateField(source="employee.joining_date", read_only=True, allow_null=True)
+    advance_records = serializers.SerializerMethodField()
+    loan_repayments = serializers.SerializerMethodField()
+    total_deductions = serializers.SerializerMethodField()
+
+    def get_designation_name(self, obj):
+        designation = getattr(getattr(obj, "employee", None), "designation", None)
+        return getattr(designation, "name", None) or getattr(designation, "designation_name", None) or ""
+
+    def get_advance_records(self, obj):
+        return [
+            {
+                "id": item.id,
+                "reference_number": item.reference_number,
+                "amount": item.amount,
+                "period": item.period,
+                "status": item.status,
+            }
+            for item in obj.deducted_salary_advances.all()
+        ]
+
+    def get_loan_repayments(self, obj):
+        return [
+            {
+                "id": item.id,
+                "loan_id": item.loan_id,
+                "amount": item.amount,
+                "period": item.period,
+                "reference_number": item.loan.reference_number,
+            }
+            for item in obj.loan_repayments.all()
+        ]
+
+    def get_total_deductions(self, obj):
+        return (Decimal(obj.deductions or 0) + Decimal(obj.advance_deduction or 0) + Decimal(obj.loan_deduction or 0))
 
     class Meta:
         model = PayrollEntry

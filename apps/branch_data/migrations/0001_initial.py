@@ -6,7 +6,7 @@ class Migration(migrations.Migration):
     initial = True
     dependencies = [
         ("branches", "0001_initial"),
-        ("inventory", "0001_initial"),
+        ("inventory", "0002_productvariant"),
     ]
 
     operations = [

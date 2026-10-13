@@ -1981,8 +1981,12 @@ class EmployeeLoanViewSet(BaseViewSet):
 class PayrollEntryViewSet(BaseViewSet):
     queryset = PayrollEntry.objects.select_related(
         "employee",
+        "employee__designation",
         "branch",
         "payroll_run",
+    ).prefetch_related(
+        "deducted_salary_advances",
+        "loan_repayments__loan",
     ).order_by(
         "-payroll_date",
         "-id",
