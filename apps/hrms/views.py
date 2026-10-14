@@ -2022,6 +2022,35 @@ class PayrollEntryViewSet(BaseViewSet):
         return queryset
 
     @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        """Only permit deletion of unfinalized payroll without recoveries."""
+        if not request.user.has_perm("hrms.delete_payrollentry"):
+            return Response(
+                {"detail": "You do not have permission to delete payroll entries."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        entry = self.get_object()
+        entry = PayrollEntry.objects.select_for_update().get(pk=entry.pk)
+        if str(entry.status).upper() not in ("PENDING", "PROCESSING", "FAILED", "CANCELLED"):
+            return Response(
+                {"detail": "Paid or finalized payroll cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if entry.paid_at or entry.loan_repayments.exists() or entry.deducted_salary_advances.exists():
+            return Response(
+                {"detail": "Payroll with payments, loans, or advance recoveries cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        # Do not delete payroll entries containing deductions with financial implications.
+        if Decimal(entry.loan_deduction or 0) != 0 or Decimal(entry.advance_deduction or 0) != 0:
+            return Response(
+                {"detail": "Payroll with loan or advance deductions cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @transaction.atomic
     def _calculate_employee_loan_deduction(self, entry):
         """
         Calculate the loan installment that should be deducted from this
