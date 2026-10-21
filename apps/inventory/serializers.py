@@ -1,4 +1,5 @@
 import json
+import secrets
 
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
@@ -801,6 +802,19 @@ class ProductSerializer(serializers.ModelSerializer):
         validated_data,
     ):
         validated_data = self._normalize_barcode(validated_data)
+
+        # Assign a scan-friendly Code 39 value on creation, not on edit.
+        # Keep manually-entered and existing barcodes unchanged.
+        if not validated_data.get("barcode"):
+            for _ in range(10):
+                candidate = "GHZ" + secrets.token_hex(6).upper()
+                if not Product.objects.filter(barcode=candidate).exists():
+                    validated_data["barcode"] = candidate
+                    break
+            else:
+                raise serializers.ValidationError({
+                    "barcode": "Unable to generate a unique barcode. Please retry."
+                })
 
         variants_data = validated_data.pop(
             "variants",
