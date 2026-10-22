@@ -15,6 +15,9 @@ from .physical_catalog import (
     validate_supplier_for_branch,
     validate_product_sku_for_branch,
     physical_branch_label,
+    resolve_physical_product,
+    resolve_variant_in_physical_database,
+    ensure_variant_in_physical_database,
 )
 
 from .models import (
@@ -538,6 +541,7 @@ class ProductSerializer(serializers.ModelSerializer):
             branch=branch,
             sku=sku,
             current_product_id=(self.instance.pk if self.instance else None),
+            original_sku=(self.instance.sku if self.instance else None),
         )
 
         compatible_models = str(
@@ -731,67 +735,60 @@ class ProductSerializer(serializers.ModelSerializer):
 
         product.variants.exclude(id__in=retained_ids).delete()
 
-    def _mirror_catalog_to_branch_db(self, product, *, supplier_id=None):
+    def _mirror_catalog_to_branch_db(self, product, *, supplier_id=None, original_sku=None):
         return ensure_product_catalog_in_database(
             product,
             product.branch,
             supplier_id=supplier_id,
             validate_supplier=supplier_id not in (None, "", 0, "0"),
+            original_sku=original_sku,
         )
 
-    def _sync_branch_stock(self, product, *, reference_type):
-        """Synchronize product-form quantity with the branch stock ledger."""
+    def _sync_branch_stock(self, product, *, reference_type, physical_product):
+        """Use physical database IDs for physical stock and ledger mutations."""
         if not product.branch_id:
             return
-
         request = self.context.get("request")
         user = request.user if request and request.user.is_authenticated else None
-
+        using = database_alias_for_branch(product.branch_id)
         for variant in product.variants.filter(is_active=True):
-            stock_variant = variant if product.has_variants else None
-            desired_stock = getattr(self, "_stock_targets", {}).get(variant.id)
-
-            using = database_alias_for_branch(product.branch_id)
-            stock, _ = ProductStock.objects.using(using).get_or_create(
-                product_id=product.id,
-                branch_id=product.branch_id,
-                variant_id=(stock_variant.id if stock_variant else None),
-                warehouse="",
-                defaults={
-                    "current_stock": 0,
-                    "reserved_stock": 0,
-                    "reorder_level": product.reorder_level,
-                },
+            physical_variant = (
+                resolve_variant_in_physical_database(variant, physical_product, product.branch)
+                if product.has_variants else None
             )
-
-            if desired_stock is None:
-                desired_stock = int(stock.current_stock or 0)
-            else:
-                desired_stock = int(desired_stock or 0)
-
+            if product.has_variants and physical_variant is None:
+                # New variants may have been saved in the shared catalog but
+                # not yet mirrored in the physical DB. Repair only beneath the
+                # SKU-verified physical product; never match by numeric ID.
+                physical_variant = ensure_variant_in_physical_database(
+                    variant, physical_product, product.branch
+                )
+            desired_stock = getattr(self, "_stock_targets", {}).get(variant.id)
+            stock, _ = ProductStock.objects.using(using).get_or_create(
+                product_id=physical_product.pk,
+                branch_id=product.branch_id,
+                variant_id=(physical_variant.pk if physical_variant else None),
+                warehouse="",
+                defaults={"current_stock": 0, "reserved_stock": 0, "reorder_level": product.reorder_level},
+            )
+            desired_stock = int(stock.current_stock or 0) if desired_stock is None else int(desired_stock or 0)
             difference = desired_stock - int(stock.current_stock or 0)
-
             if difference:
                 adjust_stock(
-                    product=product,
-                    variant=stock_variant,
+                    product=physical_product,
+                    variant=physical_variant,
                     branch=product.branch,
                     quantity=difference,
-                    movement_type=(
-                        "OPENING"
-                        if reference_type == "PRODUCT_CREATE"
-                        else "ADJUSTMENT"
-                    ),
+                    movement_type="OPENING" if reference_type == "PRODUCT_CREATE" else "ADJUSTMENT",
                     performed_by=user,
                     reference_type=reference_type,
                     reference_id=product.id,
                     remarks="Stock quantity updated from product form.",
-                    unit_cost=(variant.purchase_price if difference > 0 else None),
+                    unit_cost=variant.purchase_price if difference > 0 else None,
                     vat_treatment=product.tax_treatment,
                     vat_percentage=product.vat_rate,
                     vat_inclusive=product.vat_inclusive,
                 )
-
             if stock.reorder_level != product.reorder_level:
                 stock.reorder_level = product.reorder_level
                 stock.save(using=using, update_fields=["reorder_level", "updated_at"])
@@ -845,9 +842,10 @@ class ProductSerializer(serializers.ModelSerializer):
         # A later stock error must roll back the physical catalog mirror too.
         # The outer default transaction already protects shared catalog writes.
         with transaction.atomic(using=database_alias_for_branch(product.branch_id)):
-            self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
+            physical_product = self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
             self._sync_branch_stock(
                 product,
+                physical_product=physical_product,
                 reference_type=("PRODUCT_CREATE"),
             )
 
@@ -872,6 +870,7 @@ class ProductSerializer(serializers.ModelSerializer):
         if not supplier_supplied:
             supplier_id = physical_product_supplier_id(instance, instance.branch_id)
 
+        original_sku = instance.sku
         try:
             with transaction.atomic(using="default"):
                 product = super().update(
@@ -898,9 +897,12 @@ class ProductSerializer(serializers.ModelSerializer):
         # A later stock error must roll back the physical catalog mirror too.
         # The outer default transaction already protects shared catalog writes.
         with transaction.atomic(using=database_alias_for_branch(product.branch_id)):
-            self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
+            physical_product = self._mirror_catalog_to_branch_db(
+                product, supplier_id=supplier_id, original_sku=original_sku
+            )
             self._sync_branch_stock(
                 product,
+                physical_product=physical_product,
                 reference_type=("PRODUCT_EDIT"),
             )
 

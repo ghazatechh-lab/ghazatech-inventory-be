@@ -67,14 +67,48 @@ def find_physical_product_by_sku(branch, sku, *, exclude_pk=None):
     return qs.first()
 
 
-def validate_product_sku_for_branch(*, branch, sku, current_product_id=None):
+def resolve_physical_product(product, branch, *, original_sku=None):
+    """Match by branch + stable SKU, never by a cross-database primary key.
+
+    For an edit the previous SKU is the identity key, allowing SKU changes.
+    If no match exists, refuse to adopt a colliding ID or guess a relationship.
+    """
+    branch = require_physical_branch(branch)
+    using = database_alias_for_branch(branch.id)
+    source_sku = str(original_sku if original_sku is not None else product.sku).strip()
+    matches = list(Product.objects.using(using).filter(
+        branch_id=branch.id, sku__iexact=source_sku, is_deleted=False
+    )[:2])
+    if len(matches) > 1:
+        raise serializers.ValidationError({"sku": "Ambiguous physical SKU; resolve duplicate records before editing."})
+    if matches:
+        target = matches[0]
+        # Treat barcodes as another identity signal when present on both sides.
+        a = str(product.barcode or '').strip()
+        b = str(target.barcode or '').strip()
+        if a and b and a != b:
+            raise serializers.ValidationError({"sku": "Physical product barcode differs; manual catalog reconciliation required."})
+        return target
+    occupied = Product.objects.using(using).filter(pk=product.pk).first()
+    if occupied is not None:
+        raise serializers.ValidationError({"sku": "Physical product ID is occupied by another SKU; manual reconciliation required."})
+    return None
+
+
+def validate_product_sku_for_branch(*, branch, sku, current_product_id=None, original_sku=None):
     """Reject a duplicate SKU before PostgreSQL reaches its unique constraint."""
     branch = require_physical_branch(branch)
     normalized = str(sku or "").strip()
     if not normalized:
         raise serializers.ValidationError({"sku": "SKU is required."})
+    physical_id = None
+    if current_product_id is not None:
+        shared = Product.objects.using("default").filter(pk=current_product_id).first()
+        if shared is not None:
+            physical = resolve_physical_product(shared, branch, original_sku=original_sku)
+            physical_id = physical.pk if physical is not None else None
     duplicate = find_physical_product_by_sku(
-        branch, normalized, exclude_pk=current_product_id
+        branch, normalized, exclude_pk=physical_id
     )
     if duplicate is not None:
         raise serializers.ValidationError(
@@ -96,6 +130,48 @@ def resolve_variant_in_physical_database(source_variant, target_product, branch)
         is_base=False, attributes=getattr(source_variant, "attributes", {}) or {}
     ).first()
 
+
+
+def ensure_variant_in_physical_database(source_variant, target_product, branch):
+    """Find or create a variant *under the verified physical product*.
+
+    Never equate variant IDs across databases. Attribute identity is used only
+    within that physical product, and ambiguous attribute matches fail closed.
+    Call inside an atomic transaction for the destination database.
+    """
+    branch = require_physical_branch(branch)
+    using = database_alias_for_branch(branch.id)
+    if target_product.branch_id != branch.id:
+        raise serializers.ValidationError({
+            "variants": "Physical product belongs to a different branch."
+        })
+    if source_variant.product.branch_id != branch.id:
+        raise serializers.ValidationError({
+            "variants": "Shared variant belongs to a different branch."
+        })
+
+    lookup = {"product_id": target_product.pk, "is_base": bool(source_variant.is_base)}
+    if not source_variant.is_base:
+        lookup["attributes"] = source_variant.attributes or {}
+    matches = list(ProductVariant.objects.using(using).select_for_update().filter(**lookup)[:2])
+    if len(matches) > 1:
+        raise serializers.ValidationError({
+            "variants": "Multiple physical variants have the same attributes; reconcile them before updating stock."
+        })
+    if matches:
+        return matches[0]
+
+    return ProductVariant.objects.using(using).create(
+        product_id=target_product.pk,
+        attributes=source_variant.attributes or {},
+        is_base=bool(source_variant.is_base),
+        is_active=source_variant.is_active,
+        available_qty=0,
+        purchase_price=source_variant.purchase_price,
+        retail_price=source_variant.retail_price,
+        wholesale_price=source_variant.wholesale_price,
+        minimum_selling_price=source_variant.minimum_selling_price,
+    )
 
 def validate_supplier_for_branch(*, supplier_id, branch, required=False):
     """Validate a supplier inside the target physical database.
@@ -141,7 +217,7 @@ def physical_product_supplier_id(product, branch=None):
     using = database_alias_for_branch(branch.id)
     return (
         Product.objects.using(using)
-        .filter(pk=product.pk, branch_id=branch.id)
+        .filter(branch_id=branch.id, sku__iexact=product.sku, is_deleted=False)
         .values_list("supplier_id", flat=True)
         .first()
     )
@@ -193,6 +269,7 @@ def ensure_product_catalog_in_database(
     validate_supplier=False,
     strict_racks=True,
     reuse_existing_sku=False,
+    original_sku=None,
 ):
     """Create/update the product catalog mirror in one physical database.
 
@@ -207,7 +284,7 @@ def ensure_product_catalog_in_database(
     if supplier_id is _UNSET:
         supplier_id = (
             Product.objects.using(using)
-            .filter(pk=product.pk, branch_id=branch.id)
+            .filter(branch_id=branch.id, sku__iexact=product.sku, is_deleted=False)
             .values_list("supplier_id", flat=True)
             .first()
         )
@@ -228,30 +305,19 @@ def ensure_product_catalog_in_database(
         target_rack = _target_rack(product.rack, branch, using)
 
     normalized_sku = str(product.sku or "").strip()
-    target_product = (
-        Product.objects.using(using)
-        .filter(pk=product.pk, branch_id=branch.id)
-        .first()
-    )
+    target_product = resolve_physical_product(product, branch, original_sku=original_sku)
     reused_existing_sku = False
     sku_match = find_physical_product_by_sku(
-        branch,
-        normalized_sku,
-        exclude_pk=(target_product.pk if target_product else None),
+        branch, normalized_sku, exclude_pk=(target_product.pk if target_product else None),
     )
     if sku_match is not None:
         if reuse_existing_sku:
             target_product = sku_match
             reused_existing_sku = True
         else:
-            raise serializers.ValidationError(
-                {
-                    "sku": (
-                        f"{normalized_sku} already exists in "
-                        f"{physical_branch_label(branch)}."
-                    )
-                }
-            )
+            raise serializers.ValidationError({
+                "sku": f"{normalized_sku} already exists in {physical_branch_label(branch)}."
+            })
 
     product_defaults = {
         "product_name": product.product_name,
@@ -309,7 +375,9 @@ def ensure_product_catalog_in_database(
         target_variant = None
         if target_product.pk == product.pk:
             target_variant = (
-                ProductVariant.objects.using(using).filter(pk=variant.pk).first()
+                ProductVariant.objects.using(using)
+                .filter(pk=variant.pk, product_id=target_product.pk)
+                .first()
             )
         if target_variant is None:
             target_variant = resolve_variant_in_physical_database(
@@ -328,10 +396,9 @@ def ensure_product_catalog_in_database(
             "is_active": variant.is_active,
         }
         if target_variant is None:
-            create_kwargs = dict(variant_defaults)
-            if target_product.pk == product.pk:
-                create_kwargs["id"] = variant.pk
-            target_variant = ProductVariant.objects.using(using).create(**create_kwargs)
+            # Destination variant PKs are independent of shared catalog PKs.
+            # A previous product/variant seed may already occupy source IDs.
+            target_variant = ProductVariant.objects.using(using).create(**variant_defaults)
         elif not reused_existing_sku:
             for field_name, field_value in variant_defaults.items():
                 setattr(target_variant, field_name, field_value)

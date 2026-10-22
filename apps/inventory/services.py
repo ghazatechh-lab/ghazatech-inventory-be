@@ -33,7 +33,16 @@ def ensure_catalog_in_branch_db(product, branch, variant=None):
     product_id = getattr(product, "pk", product)
     variant_id = getattr(variant, "pk", variant) if variant is not None else None
 
-    product_exists = Product.objects.using(using).filter(pk=product_id).exists()
+    # IDs are database-local. Never treat an unrelated physical row with the
+    # same numeric PK as the shared product mirror.
+    physical_row = Product.objects.using(using).filter(pk=product_id).first()
+    if physical_row is not None and hasattr(product, "sku"):
+        if (physical_row.sku or "").strip().casefold() != (product.sku or "").strip().casefold():
+            raise ValueError(
+                "Physical product ID collision: shared and branch SKUs differ. "
+                "Resolve the physical product by branch and SKU before modifying stock."
+            )
+    product_exists = physical_row is not None
     variant_exists = (
         variant_id is None
         or ProductVariant.objects.using(using).filter(pk=variant_id).exists()
@@ -435,6 +444,30 @@ def _adjust_stock_locked(
 
     stock.save(using=using)
 
+    # The authenticated user lives in the shared database. A stock movement
+    # stored in a physical branch database cannot point at that user unless a
+    # matching accounts_user row genuinely exists in that database.
+    # Never create/mirror a user using the shared numeric ID: the physical
+    # database may already assign that ID to a different user.
+    movement_performer_id = getattr(performed_by, "pk", performed_by)
+    movement_remarks = str(remarks or "")
+    if movement_performer_id is not None:
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        source_db = getattr(getattr(performed_by, "_state", None), "db", None)
+        physical_user_exists = User.objects.using(using).filter(
+            pk=movement_performer_id
+        ).exists()
+        # A numeric ID match is not an identity match across independent DBs.
+        # Accept an FK only for an actor explicitly loaded from this DB.
+        # Integer IDs and actors from the shared DB are not trusted as local.
+        if source_db != using or not physical_user_exists:
+            audit_note = f"[Shared actor user ID: {movement_performer_id}]"
+            if audit_note not in movement_remarks:
+                movement_remarks = f"{movement_remarks} {audit_note}".strip()
+            movement_performer_id = None
+
     movement = StockMovement.objects.using(using).create(
         movement_number=generate_stock_number(),
         product_id=product.pk,
@@ -447,8 +480,8 @@ def _adjust_stock_locked(
         new_stock=new_balance,
         reference_type=reference_type,
         reference_id=str(reference_id or ""),
-        remarks=remarks,
-        performed_by=performed_by,
+        remarks=movement_remarks,
+        performed_by_id=movement_performer_id,
         quantity_before=previous_balance,
         quantity_after=new_balance,
         unit_cost_excluding_vat=valuation["unit_cost_excluding_vat"],
