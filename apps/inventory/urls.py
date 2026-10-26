@@ -6,6 +6,7 @@ from .views import (
     CategoryViewSet,
     ProductViewSet,
     RackViewSet,
+    RackAllocationViewSet,
     StockAdjustmentViewSet,
     StockMovementViewSet,
     StockViewSet,
@@ -17,6 +18,7 @@ router.register("products", ProductViewSet, basename="product")
 router.register("brands", BrandViewSet, basename="brand")
 router.register("categories", CategoryViewSet, basename="category")
 router.register("racks", RackViewSet, basename="rack")
+router.register("rack-allocations", RackAllocationViewSet, basename="rack-allocation")
 router.register("inventory/stock", StockViewSet, basename="stock")
 router.register("inventory/movements", StockMovementViewSet, basename="movement")
 router.register("inventory/adjustments", StockAdjustmentViewSet, basename="adjustment")

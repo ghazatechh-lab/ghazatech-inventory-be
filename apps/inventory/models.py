@@ -239,6 +239,23 @@ class ProductVariant(TimeStampedModel):
         return f"{self.product.product_name} - {label or 'Variant'}"
 
 
+class RackStockAllocation(TimeStampedModel):
+    """A location breakdown of physical ProductStock; never additional stock."""
+
+    stock = models.ForeignKey(
+        "inventory.ProductStock", on_delete=models.CASCADE, related_name="rack_allocations"
+    )
+    rack = models.ForeignKey(
+        "inventory.Rack", on_delete=models.PROTECT, related_name="stock_allocations"
+    )
+    quantity = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["stock", "rack"], name="unique_stock_rack_allocation"),
+        ]
+
+
 class ProductStock(TimeStampedModel):
     product = models.ForeignKey(
         Product,

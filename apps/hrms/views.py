@@ -931,7 +931,7 @@ class PayrollRunViewSet(BaseViewSet):
             if available_salary <= 0:
                 break
 
-            monthly_installment = Decimal(str(loan.monthly_installment or 0)).quantize(
+            monthly_installment = Decimal(str((loan.monthly_deduction_overrides or {}).get(period, loan.monthly_installment) or 0)).quantize(
                 MONEY,
                 rounding=ROUND_HALF_UP,
             )
@@ -2093,7 +2093,7 @@ class PayrollEntryViewSet(BaseViewSet):
             if available_salary <= 0:
                 break
 
-            monthly_installment = Decimal(str(loan.monthly_installment or 0)).quantize(
+            monthly_installment = Decimal(str((loan.monthly_deduction_overrides or {}).get(entry.period, loan.monthly_installment) or 0)).quantize(
                 MONEY
             )
 
@@ -2616,17 +2616,16 @@ class DocumentExpiryViewSet(BaseViewSet):
         document_type = self.request.query_params.get("document_type")
         department_id = self.request.query_params.get("department")
         search = str(self.request.query_params.get("search") or "").strip()
+        # Expiry monitoring is deliberately limited to expired and soon-to-expire
+        # documents. A shorter days= filter can narrow but never widen the window.
         days_param = self.request.query_params.get("days")
-
-        if days_param not in (None, ""):
-            try:
-                days = max(0, int(days_param))
-            except (TypeError, ValueError):
-                days = 90
-
-            queryset = queryset.filter(
-                expiry_date__lte=timezone.localdate() + timedelta(days=days)
-            )
+        try:
+            days = min(30, max(0, int(days_param))) if days_param not in (None, "") else 30
+        except (TypeError, ValueError):
+            days = 30
+        queryset = queryset.filter(
+            expiry_date__lte=timezone.localdate() + timedelta(days=days)
+        )
 
         if branch_id:
             queryset = queryset.filter(employee__branch_id=branch_id)

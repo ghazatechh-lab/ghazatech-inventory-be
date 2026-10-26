@@ -21,6 +21,7 @@ from .models import (
     Product,
     ProductVariant,
     ProductStock,
+    RackStockAllocation,
     Rack,
     StockAdjustment,
     StockMovement,
@@ -124,6 +125,83 @@ class RackViewSet(ModelViewSet):
             return queryset.filter(branch__branch_code__in=["BR01", "BR02"])
 
         return queryset.filter(branch_id=branch.id)
+
+
+class RackAllocationViewSet(ReadOnlyModelViewSet):
+    """Stock-location breakdown; physical stock remains the quantity authority."""
+
+    permission_classes = [ReferenceDataPermission]
+
+    def get_queryset(self):
+        return RackStockAllocation.objects.none()
+
+    @action(detail=False, methods=["get", "put"], url_path="for-stock")
+    def for_stock(self, request):
+        from django.db.models import Sum
+        from rest_framework.permissions import SAFE_METHODS
+
+        branch_code = request.query_params.get("branch_code")
+        sku = request.query_params.get("sku")
+        stock_id = request.query_params.get("stock_id")
+        if not (branch_code and sku and stock_id):
+            raise ValidationError({"detail": "branch_code, sku and stock_id are required."})
+        if branch_code not in ("BR01", "BR02"):
+            raise ValidationError({"branch_code": "Choose a physical branch."})
+        branch = Branch.objects.using("default").filter(branch_code=branch_code).first()
+        if branch is None:
+            raise ValidationError({"branch_code": "Branch not found."})
+        alias = database_alias_for_branch(branch.id)
+        if alias not in ("vat", "non_vat"):
+            raise ValidationError({"branch_code": "Unsupported physical branch database."})
+        # Reject colliding numeric IDs by verifying SKU against physical stock product.
+        with transaction.atomic(using=alias):
+            stock = (ProductStock.objects.using(alias).select_for_update()
+                     .select_related("product", "variant")
+                     .filter(pk=stock_id, branch_id=branch.id).first())
+            if stock is None or stock.product.sku.casefold() != str(sku).casefold():
+                raise ValidationError({"stock_id": "Physical stock does not match the requested SKU and branch."})
+            if request.method == "PUT":
+                if not (request.user and request.user.is_authenticated and request.user.is_superuser):
+                    from rest_framework.exceptions import PermissionDenied
+                    raise PermissionDenied("Only administrators may modify rack allocations.")
+                items = request.data.get("allocations")
+                if not isinstance(items, list):
+                    raise ValidationError({"allocations": "Provide a list of rack_code and quantity pairs."})
+                if len(items) > 200:
+                    raise ValidationError({"allocations": "Too many rack assignments."})
+                allocations = []
+                seen = set()
+                for row in items:
+                    if not isinstance(row, dict):
+                        raise ValidationError({"allocations": "Invalid row."})
+                    code = str(row.get("rack_code") or "").strip()
+                    amount = row.get("quantity")
+                    if not code or isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                        raise ValidationError({"allocations": "Each row requires a rack_code and nonnegative integer quantity."})
+                    rack = Rack.objects.using(alias).filter(branch_id=branch.id, rack_code=code, is_active=True).first()
+                    if rack is None or rack.pk in seen:
+                        raise ValidationError({"allocations": "Unknown or duplicate rack for this branch."})
+                    seen.add(rack.pk)
+                    allocations.append((rack, amount))
+                total = sum(amount for _, amount in allocations)
+                if total > stock.current_stock:
+                    raise ValidationError({"allocations": "Rack allocation exceeds physical stock quantity."})
+                # This operation changes locations only, not ProductStock or movement ledger.
+                RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk).delete()
+                RackStockAllocation.objects.using(alias).bulk_create([
+                    RackStockAllocation(stock_id=stock.pk, rack_id=rack.pk, quantity=amount)
+                    for rack, amount in allocations
+                ])
+            records = (RackStockAllocation.objects.using(alias)
+                       .filter(stock_id=stock.pk).select_related("rack").order_by("rack__rack_code"))
+            rows = [{"rack_code": item.rack.rack_code, "rack_name": item.rack.rack_name,
+                     "quantity": item.quantity} for item in records]
+            assigned = sum(row["quantity"] for row in rows)
+            return Response({"branch_code": branch_code, "sku": stock.product.sku,
+                             "stock_id": stock.pk, "physical_quantity": stock.current_stock,
+                             "allocated_quantity": assigned,
+                             "unallocated_quantity": stock.current_stock - assigned,
+                             "allocations": rows})
 
 
 class ProductViewSet(ModelViewSet):
@@ -387,6 +465,7 @@ class StockViewSet(ReadOnlyModelViewSet):
             group["branch_stocks"].append(
                 {
                     "branch_id": stock.branch_id,
+                    "stock_id": stock.pk,
                     "branch_code": stock.branch.branch_code,
                     "branch_name": stock.branch.branch_name,
                     "current_stock": stock.current_stock,

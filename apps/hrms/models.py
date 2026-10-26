@@ -822,6 +822,10 @@ class EmployeeLoan(TimeStampedModel):
         decimal_places=2,
         default=0,
     )
+    monthly_deduction_overrides = models.JSONField(
+        default=dict, blank=True,
+        help_text="Optional YYYY-MM to deduction amount mapping; 0 skips a month.",
+    )
     reference_number = models.CharField(
         max_length=100,
         blank=True,

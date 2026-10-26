@@ -819,6 +819,25 @@ class EmployeeLoanSerializer(serializers.ModelSerializer):
             ),
         )
 
+        overrides = attrs.get(
+            "monthly_deduction_overrides",
+            getattr(self.instance, "monthly_deduction_overrides", {}) if self.instance else {},
+        ) or {}
+        if not isinstance(overrides, dict):
+            raise serializers.ValidationError({"monthly_deduction_overrides": "Expected a month-to-amount object."})
+        import re
+        for period_key, value in overrides.items():
+            if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(period_key)):
+                raise serializers.ValidationError({"monthly_deduction_overrides": f"Invalid month: {period_key}"})
+            if str(period_key) < str(start_period):
+                raise serializers.ValidationError({"monthly_deduction_overrides": "Override cannot precede loan deduction start month."})
+            try:
+                amount_override = Decimal(str(value))
+            except (ValueError, TypeError, ArithmeticError):
+                raise serializers.ValidationError({"monthly_deduction_overrides": f"Invalid amount for {period_key}."})
+            if not amount_override.is_finite() or amount_override < 0 or amount_override.as_tuple().exponent < -2:
+                raise serializers.ValidationError({"monthly_deduction_overrides": f"Use a non-negative amount with at most 2 decimals for {period_key}."})
+
         if amount <= 0:
             raise serializers.ValidationError(
                 {"amount": ("Loan amount must be greater than zero.")}
