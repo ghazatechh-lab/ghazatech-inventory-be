@@ -1,3 +1,4 @@
+from django.conf import settings
 from .context import get_active_branch_id
 from .services import database_alias_for_branch
 
@@ -69,9 +70,15 @@ class BranchTransactionRouter:
         branch_id = self._instance_branch_id(hints) or get_active_branch_id()
         return database_alias_for_branch(branch_id) if branch_id else "default"
 
+    def _schema_enabled(self):
+        return bool(getattr(settings, "GHAZA_SCHEMA_WRITE_ROUTING", False))
+
     def db_for_read(self, model, **hints):
         label = model._meta.app_label
 
+        if self._schema_enabled() and label in {"inventory", "hrms", "fleet", "service_repairs", "transfers", "recovery"}:
+            if self._instance_branch_id(hints) or get_active_branch_id():
+                return self._alias(hints)
         if label in TRANSACTION_APPS:
             return self._alias(hints)
 
@@ -94,6 +101,9 @@ class BranchTransactionRouter:
     def db_for_write(self, model, **hints):
         label = model._meta.app_label
 
+        if self._schema_enabled() and label in {"inventory", "hrms", "fleet", "service_repairs", "transfers", "recovery"}:
+            if self._instance_branch_id(hints) or get_active_branch_id():
+                return self._alias(hints)
         if label in TRANSACTION_APPS:
             return self._alias(hints)
 
@@ -125,6 +135,11 @@ class BranchTransactionRouter:
 
     def allow_migrate(self, db, app_label, model_name=None, **hints):
         if db == "default":
+            return True
+
+        if db.startswith(("tenant_vat_", "tenant_non_vat_")):
+            # Tenant schemas must have the complete app model table set to
+            # satisfy foreign keys across ERP applications.
             return True
 
         if db not in {"vat", "non_vat"}:

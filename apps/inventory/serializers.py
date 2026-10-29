@@ -33,9 +33,11 @@ from .models import (
 
 
 def get_requested_branch_id(serializer):
-    request = (
-        serializer.context.get("request") if hasattr(serializer, "context") else None
-    )
+    context = serializer.context if hasattr(serializer, "context") else {}
+    source_branch_id = context.get("source_branch_id")
+    if source_branch_id is not None:
+        return int(source_branch_id)
+    request = context.get("request")
     if not request:
         return None
     value = request.query_params.get("branch")
@@ -188,6 +190,15 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         return variant_label(obj)
 
     def get_rack_details(self, obj):
+        # Consolidated rows retain their tenant connection; do not let the
+        # relation manager route the join query to a legacy public schema.
+        alias = obj._state.db or "default"
+        through = ProductVariant.racks.through
+        rack_ids = list(
+            through.objects.using(alias)
+            .filter(productvariant_id=obj.pk)
+            .values_list("rack_id", flat=True)
+        )
         return [
             {
                 "id": rack.id,
@@ -195,21 +206,37 @@ class ProductVariantSerializer(serializers.ModelSerializer):
                 "rack_name": rack.rack_name,
                 "branch": rack.branch_id,
             }
-            for rack in obj.racks.all().order_by("rack_code")
+            for rack in Rack.objects.using(alias)
+            .filter(pk__in=rack_ids)
+            .order_by("rack_code")
         ]
 
     def _stock(self, obj):
-        product = obj.product
-        branch_id = get_requested_branch_id(self) or product.branch_id
+        alias = obj._state.db or "default"
+        # ForeignKey descriptor `obj.product` can re-route to the legacy VAT
+        # public schema, where this tenant product ID does not exist.
+        product = (
+            Product.objects.using(alias)
+            .only("id", "branch_id", "has_variants")
+            .get(pk=obj.product_id)
+        )
+        branch_id = (
+            self.context.get("source_branch_id")
+            or get_requested_branch_id(self)
+            or product.branch_id
+        )
         if not branch_id:
             return None
-
-        stock_variant = obj if product.has_variants else None
-        return ProductStock.objects.filter(
-            product=product,
-            variant=stock_variant,
-            branch_id=branch_id,
-        ).first()
+        stock_variant_id = obj.pk if product.has_variants else None
+        return (
+            ProductStock.objects.using(alias)
+            .filter(
+                product_id=obj.product_id,
+                variant_id=stock_variant_id,
+                branch_id=branch_id,
+            )
+            .first()
+        )
 
     def get_current_stock(self, obj):
         stock = self._stock(obj)
@@ -332,7 +359,10 @@ class ProductSerializer(serializers.ModelSerializer):
         if obj.rack_id:
             if not requested_branch:
                 return obj.rack.rack_code
-            if requested_branch.branch_code == "BR03" and obj.rack.branch.branch_code in {"BR01", "BR02"}:
+            if (
+                requested_branch.branch_code == "BR03"
+                and obj.rack.branch.branch_code in {"BR01", "BR02"}
+            ):
                 return obj.rack.rack_code
             if obj.rack.branch_id == requested_branch.id:
                 return obj.rack.rack_code
@@ -348,6 +378,7 @@ class ProductSerializer(serializers.ModelSerializer):
         branch = require_physical_branch(obj.branch_id)
         using = database_alias_for_branch(branch.id)
         from apps.suppliers.models import Supplier
+
         return (
             Supplier.objects.using(using)
             .filter(pk=supplier_id, branch_id=branch.id, is_deleted=False)
@@ -476,7 +507,11 @@ class ProductSerializer(serializers.ModelSerializer):
 
         branch = require_physical_branch(branch)
 
-        if self.instance and self.instance.branch_id and self.instance.branch_id != branch.id:
+        if (
+            self.instance
+            and self.instance.branch_id
+            and self.instance.branch_id != branch.id
+        ):
             raise serializers.ValidationError(
                 {
                     "branch": (
@@ -735,7 +770,9 @@ class ProductSerializer(serializers.ModelSerializer):
 
         product.variants.exclude(id__in=retained_ids).delete()
 
-    def _mirror_catalog_to_branch_db(self, product, *, supplier_id=None, original_sku=None):
+    def _mirror_catalog_to_branch_db(
+        self, product, *, supplier_id=None, original_sku=None
+    ):
         return ensure_product_catalog_in_database(
             product,
             product.branch,
@@ -753,8 +790,11 @@ class ProductSerializer(serializers.ModelSerializer):
         using = database_alias_for_branch(product.branch_id)
         for variant in product.variants.filter(is_active=True):
             physical_variant = (
-                resolve_variant_in_physical_database(variant, physical_product, product.branch)
-                if product.has_variants else None
+                resolve_variant_in_physical_database(
+                    variant, physical_product, product.branch
+                )
+                if product.has_variants
+                else None
             )
             if product.has_variants and physical_variant is None:
                 # New variants may have been saved in the shared catalog but
@@ -769,9 +809,17 @@ class ProductSerializer(serializers.ModelSerializer):
                 branch_id=product.branch_id,
                 variant_id=(physical_variant.pk if physical_variant else None),
                 warehouse="",
-                defaults={"current_stock": 0, "reserved_stock": 0, "reorder_level": product.reorder_level},
+                defaults={
+                    "current_stock": 0,
+                    "reserved_stock": 0,
+                    "reorder_level": product.reorder_level,
+                },
             )
-            desired_stock = int(stock.current_stock or 0) if desired_stock is None else int(desired_stock or 0)
+            desired_stock = (
+                int(stock.current_stock or 0)
+                if desired_stock is None
+                else int(desired_stock or 0)
+            )
             difference = desired_stock - int(stock.current_stock or 0)
             if difference:
                 adjust_stock(
@@ -779,7 +827,11 @@ class ProductSerializer(serializers.ModelSerializer):
                     variant=physical_variant,
                     branch=product.branch,
                     quantity=difference,
-                    movement_type="OPENING" if reference_type == "PRODUCT_CREATE" else "ADJUSTMENT",
+                    movement_type=(
+                        "OPENING"
+                        if reference_type == "PRODUCT_CREATE"
+                        else "ADJUSTMENT"
+                    ),
                     performed_by=user,
                     reference_type=reference_type,
                     reference_id=product.id,
@@ -809,9 +861,9 @@ class ProductSerializer(serializers.ModelSerializer):
                     validated_data["barcode"] = candidate
                     break
             else:
-                raise serializers.ValidationError({
-                    "barcode": "Unable to generate a unique barcode. Please retry."
-                })
+                raise serializers.ValidationError(
+                    {"barcode": "Unable to generate a unique barcode. Please retry."}
+                )
 
         variants_data = validated_data.pop(
             "variants",
@@ -842,7 +894,9 @@ class ProductSerializer(serializers.ModelSerializer):
         # A later stock error must roll back the physical catalog mirror too.
         # The outer default transaction already protects shared catalog writes.
         with transaction.atomic(using=database_alias_for_branch(product.branch_id)):
-            physical_product = self._mirror_catalog_to_branch_db(product, supplier_id=supplier_id)
+            physical_product = self._mirror_catalog_to_branch_db(
+                product, supplier_id=supplier_id
+            )
             self._sync_branch_stock(
                 product,
                 physical_product=physical_product,
@@ -964,12 +1018,27 @@ class ProductStockSerializer(serializers.ModelSerializer):
         return variant_label(obj.variant)
 
     def _racks(self, obj):
-        variant = obj.variant
-        if variant is None and not obj.product.has_variants:
-            variant = obj.product.variants.filter(is_base=True).first()
-        if variant:
-            return list(variant.racks.filter(branch=obj.branch).order_by("rack_code"))
-        return []
+        alias = obj._state.db or "default"
+        variant_id = obj.variant_id
+        if variant_id is None and not obj.product.has_variants:
+            variant_id = (
+                ProductVariant.objects.using(alias)
+                .filter(product_id=obj.product_id, is_base=True)
+                .values_list("id", flat=True)
+                .first()
+            )
+        if not variant_id:
+            return []
+        rack_ids = (
+            ProductVariant.racks.through.objects.using(alias)
+            .filter(productvariant_id=variant_id)
+            .values_list("rack_id", flat=True)
+        )
+        return list(
+            Rack.objects.using(alias)
+            .filter(id__in=rack_ids, branch_id=obj.branch_id)
+            .order_by("rack_code")
+        )
 
     def get_rack_code(self, obj):
         racks = self._racks(obj)
@@ -1257,3 +1326,385 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         return (
             str(getattr(obj, "adjustment_reason", "") or "").replace("_", " ").title()
         )
+
+
+class TenantProductSerializer(ProductSerializer):
+    """Native tenant-schema Product create/edit; no shared/default catalog writes.
+
+    Never resolve branch-owned foreign keys using the Django default manager.
+    """
+
+    def _scope(self):
+        request = self.context.get("request")
+        if not request:
+            raise serializers.ValidationError({"branch": "Branch context is required."})
+        raw = (
+            request.data.get("branch")
+            if request.method in {"POST", "PUT", "PATCH"}
+            else None
+        )
+        raw = (
+            raw
+            or request.query_params.get("branch")
+            or request.headers.get("X-Branch-ID")
+        )
+        try:
+            branch = Branch.objects.using("default").get(pk=int(raw), is_active=True)
+        except (TypeError, ValueError, Branch.DoesNotExist):
+            raise serializers.ValidationError(
+                {"branch": "Select a valid physical branch."}
+            )
+        if branch.tax_mode not in {"VAT", "NON_VAT"}:
+            raise serializers.ValidationError(
+                {"branch": "Choose Sharjah, Dubai or another physical branch."}
+            )
+        from apps.branch_data.schema_routing import register_branch_connection
+
+        return branch, register_branch_connection(branch.pk, branch.tax_mode)
+
+    def get_fields(self):
+        fields = super().get_fields()
+        branch, alias = self._scope()
+        fields["brand"].queryset = Brand.objects.using(alias).filter(is_active=True)
+        fields["category"].queryset = Category.objects.using(alias).filter(
+            is_active=True
+        )
+        fields["rack"].queryset = Rack.objects.using(alias).filter(
+            branch_id=branch.pk, is_active=True
+        )
+        fields["branch"].queryset = Branch.objects.using(alias).filter(pk=branch.pk)
+        fields["variants"].child.fields["racks"].child_relation.queryset = (
+            Rack.objects.using(alias).filter(branch_id=branch.pk, is_active=True)
+        )
+        return fields
+
+    def validate(self, attrs):
+        branch, alias = self._scope()
+        selected = attrs.get("branch")
+        if selected and selected.pk != branch.pk:
+            raise serializers.ValidationError(
+                {"branch": "Product branch must match the selected branch."}
+            )
+        attrs["branch"] = Branch.objects.using(alias).get(pk=branch.pk)
+        if self.instance and self.instance.branch_id != branch.pk:
+            raise serializers.ValidationError(
+                {"branch": "Moving a product between branches is not supported."}
+            )
+        sku = str(attrs.get("sku", getattr(self.instance, "sku", "")) or "").strip()
+        if not sku:
+            raise serializers.ValidationError({"sku": "SKU is required."})
+        q = Product.objects.using(alias).filter(sku__iexact=sku, is_deleted=False)
+        if self.instance:
+            q = q.exclude(pk=self.instance.pk)
+        if q.exists():
+            raise serializers.ValidationError(
+                {"sku": "SKU already exists in this branch."}
+            )
+        attrs["sku"] = sku
+        supplier_id = attrs.get("supplier")
+        if supplier_id not in (None, "", 0, "0"):
+            from apps.suppliers.models import Supplier
+
+            if (
+                not Supplier.objects.using(alias)
+                .filter(pk=supplier_id, branch_id=branch.pk, is_deleted=False)
+                .exists()
+            ):
+                raise serializers.ValidationError(
+                    {"supplier": "Select a supplier from the selected branch."}
+                )
+        tax = attrs.get("tax_treatment", getattr(self.instance, "tax_treatment", "VAT"))
+        attrs["vat_rate"] = 5 if tax == "VAT" else 0
+        if tax != "VAT":
+            attrs["vat_inclusive"] = False
+        attrs["compatible_models"] = attrs.get("compatible_models") or "All Models"
+        return attrs
+
+    def _physical_supplier_id(self, obj):
+        return obj.supplier_id
+
+    def to_representation(self, instance):
+        data = serializers.ModelSerializer.to_representation(self, instance)
+        data["supplier"] = instance.supplier_id
+        return data
+
+    def get_branch_name(self, obj):
+        return (
+            Branch.objects.using("default")
+            .filter(pk=obj.branch_id)
+            .values_list("branch_name", flat=True)
+            .first()
+        )
+
+    def get_branch_code(self, obj):
+        return (
+            Branch.objects.using("default")
+            .filter(pk=obj.branch_id)
+            .values_list("branch_code", flat=True)
+            .first()
+        )
+
+    def get_supplier_name(self, obj):
+        if not obj.supplier_id:
+            return None
+        from apps.suppliers.models import Supplier
+
+        return (
+            Supplier.objects.using(obj._state.db)
+            .filter(pk=obj.supplier_id)
+            .values_list("supplier_name", flat=True)
+            .first()
+        )
+
+    def get_rack_code(self, obj):
+        codes = list(
+            Rack.objects.using(obj._state.db)
+            .filter(product_variants__product_id=obj.pk)
+            .distinct()
+            .values_list("rack_code", flat=True)
+        )
+        return (
+            ", ".join(codes) if codes else (obj.rack.rack_code if obj.rack_id else None)
+        )
+
+    def get_total_available_qty(self, obj):
+        stocks = ProductStock.objects.using(obj._state.db).filter(
+            product_id=obj.pk, branch_id=obj.branch_id
+        )
+        return sum(
+            max(0, int(item.current_stock) - int(item.reserved_stock))
+            for item in stocks
+        )
+
+    def _save_variants(self, obj, supplied, *, initial=False):
+        alias = obj._state.db
+        desired_ids = []
+        if not obj.has_variants:
+            supplied = supplied[:1] if supplied else [{}]
+        for row in supplied:
+            row = dict(row)
+            racks = row.pop("racks", [])
+            qty = row.pop("initial_stock", None)
+            variant_id = row.pop("id", None)
+            row.pop("available_qty", None)
+            row.pop("is_base", None)
+            row["attributes"] = row.get("attributes", {}) if obj.has_variants else {}
+            row["is_base"] = not obj.has_variants
+            if not obj.has_variants:
+                existing = (
+                    ProductVariant.objects.using(alias)
+                    .filter(product_id=obj.pk, is_base=True)
+                    .first()
+                )
+            else:
+                existing = (
+                    ProductVariant.objects.using(alias)
+                    .filter(product_id=obj.pk, pk=variant_id, is_base=False)
+                    .first()
+                    if variant_id
+                    else None
+                )
+            if existing:
+                for key, val in row.items():
+                    setattr(existing, key, val)
+                existing.save(using=alias)
+                variant = existing
+            else:
+                variant = ProductVariant.objects.using(alias).create(
+                    product_id=obj.pk, **row
+                )
+            # Explicitly write the M2M through rows into the same tenant schema.
+            # The relationship manager can otherwise route to a legacy alias
+            # (vat/public or non_vat/public), causing FK failures on COMMIT.
+            through = ProductVariant.racks.through
+            desired_rack_ids = {rack.pk for rack in racks}
+            linked = set(
+                through.objects.using(alias)
+                .filter(productvariant_id=variant.pk)
+                .values_list("rack_id", flat=True)
+            )
+            removed = linked - desired_rack_ids
+            added = desired_rack_ids - linked
+            if removed:
+                through.objects.using(alias).filter(
+                    productvariant_id=variant.pk, rack_id__in=removed
+                ).delete()
+            if added:
+                through.objects.using(alias).bulk_create(
+                    [
+                        through(productvariant_id=variant.pk, rack_id=rack_id)
+                        for rack_id in sorted(added)
+                    ]
+                )
+            desired_ids.append(variant.pk)
+            stock_variant_id = variant.pk if obj.has_variants else None
+            stock, _ = ProductStock.objects.using(alias).get_or_create(
+                product_id=obj.pk,
+                branch_id=obj.branch_id,
+                variant_id=stock_variant_id,
+                warehouse="",
+                defaults={"current_stock": 0, "reorder_level": obj.reorder_level},
+            )
+            # Opening stock is a one-time receipt only on product creation.
+            # Both the stock balance and its audit movement use the tenant alias.
+            if qty not in (None, "", 0, "0"):
+                if not initial:
+                    raise serializers.ValidationError(
+                        {
+                            "variants": "Use Stock Adjustments or GRN to change existing stock."
+                        }
+                    )
+                self._create_opening_stock(obj, variant, stock, int(qty))
+        if not initial:
+            omitted = (
+                ProductVariant.objects.using(alias)
+                .filter(product_id=obj.pk)
+                .exclude(pk__in=desired_ids)
+            )
+            if omitted.exists():
+                raise serializers.ValidationError(
+                    {
+                        "variants": "Deleting existing variants requires a separate stock-safe workflow."
+                    }
+                )
+
+    def _create_opening_stock(self, product, variant, stock, qty):
+        """Record opening stock and its valuation atomically in one tenant DB."""
+        from decimal import Decimal
+        from django.utils import timezone
+        from apps.common.tax import (
+            calculate_inventory_tax,
+            quantize_money,
+            quantize_unit,
+        )
+        from .services import generate_stock_number
+
+        alias = product._state.db
+        if alias != stock._state.db or alias != variant._state.db:
+            raise serializers.ValidationError(
+                {"variants": "Opening stock must use the product's tenant database."}
+            )
+        if qty <= 0 or stock.current_stock or stock.reserved_stock:
+            raise serializers.ValidationError(
+                {"variants": "Opening quantity must be positive and stock must be new."}
+            )
+        cost = variant.purchase_price
+        if cost is None or Decimal(str(cost)) <= 0:
+            raise serializers.ValidationError(
+                {
+                    "variants": "Enter a purchase price greater than zero for opening stock valuation."
+                }
+            )
+        treatment = product.tax_treatment
+        rate = product.vat_rate if treatment == "VAT" else 0
+        valuation = calculate_inventory_tax(
+            unit_cost=Decimal(str(cost)),
+            vat_percentage=rate,
+            tax_treatment={
+                "VAT": "STANDARD_VAT",
+                "ZERO_VAT": "ZERO_RATED",
+                "NON_VAT": "OUT_OF_SCOPE",
+            }.get(treatment, "OUT_OF_SCOPE"),
+            vat_inclusive=bool(product.vat_inclusive) if treatment == "VAT" else False,
+            recoverable=treatment == "VAT",
+        )
+        carrying = quantize_unit(valuation["capitalized_unit_cost"])
+        stock.current_stock = qty
+        stock.reorder_level = product.reorder_level
+        stock.average_unit_cost = carrying
+        stock.average_unit_cost_excluding_vat = valuation["unit_cost_excluding_vat"]
+        stock.recoverable_vat_per_unit = valuation["recoverable_vat_per_unit"]
+        stock.capitalized_vat_per_unit = valuation["capitalized_vat_per_unit"]
+        stock.last_purchase_cost_excluding_vat = valuation["unit_cost_excluding_vat"]
+        stock.last_purchase_cost = quantize_unit(
+            valuation["unit_cost_excluding_vat"] + valuation["vat_per_unit"]
+        )
+        stock.last_tax_treatment = treatment
+        stock.last_vat_percentage = rate
+        stock.last_stock_update = timezone.now()
+        stock.valuation_updated_at = timezone.now()
+        stock.save(using=alias)
+
+        # The non-variant base record has a null stock.variant FK by design.
+        ledger_variant_id = variant.pk if product.has_variants else None
+        request = self.context.get("request")
+        actor = getattr(request, "user", None)
+        actor_id = (
+            getattr(actor, "pk", None)
+            if getattr(actor, "is_authenticated", False)
+            else None
+        )
+        for _ in range(5):
+            number = generate_stock_number()
+            if (
+                not StockMovement.objects.using(alias)
+                .filter(movement_number=number)
+                .exists()
+            ):
+                break
+        StockMovement.objects.using(alias).create(
+            movement_number=number,
+            product_id=product.pk,
+            variant_id=ledger_variant_id,
+            branch_id=product.branch_id,
+            movement_type="OPENING",
+            quantity=qty,
+            previous_stock=0,
+            new_stock=qty,
+            quantity_before=0,
+            quantity_after=qty,
+            warehouse="",
+            reference_type="PRODUCT_CREATE",
+            reference_id=str(product.pk),
+            remarks=f"Opening stock from product creation"
+            + (f" [Shared actor user ID: {actor_id}]" if actor_id else ""),
+            unit_cost_excluding_vat=valuation["unit_cost_excluding_vat"],
+            vat_treatment=treatment,
+            vat_percentage=rate,
+            recoverable_vat_amount=quantize_money(
+                Decimal(qty) * valuation["recoverable_vat_per_unit"]
+            ),
+            non_recoverable_vat_amount=quantize_money(
+                Decimal(qty) * valuation["capitalized_vat_per_unit"]
+            ),
+            capitalized_unit_cost=carrying,
+            net_value_change=quantize_money(Decimal(qty) * carrying),
+            gross_value_change=quantize_money(
+                Decimal(qty)
+                * (valuation["unit_cost_excluding_vat"] + valuation["vat_per_unit"])
+            ),
+            running_stock_value=quantize_money(Decimal(qty) * carrying),
+            source_document_type="PRODUCT_CREATE",
+            source_document_number=str(product.pk),
+            is_vat_relevant=treatment in {"VAT", "ZERO_VAT"},
+        )
+
+    def create(self, validated_data):
+        branch, alias = self._scope()
+        rows = validated_data.pop("variants", [])
+        supplier_id = validated_data.pop("supplier", None)
+        if supplier_id:
+            validated_data["supplier_id"] = supplier_id
+        if not validated_data.get("barcode"):
+            validated_data["barcode"] = "GHZ" + secrets.token_hex(6).upper()
+        validated_data["branch_id"] = branch.pk
+        validated_data.pop("branch", None)
+        with transaction.atomic(using=alias):
+            obj = Product.objects.using(alias).create(**validated_data)
+            self._save_variants(obj, rows, initial=True)
+        return obj
+
+    def update(self, instance, validated_data):
+        branch, alias = self._scope()
+        rows = validated_data.pop("variants", None)
+        supplier_id = validated_data.pop("supplier", serializers.empty)
+        if supplier_id is not serializers.empty:
+            validated_data["supplier_id"] = supplier_id
+        validated_data.pop("branch", None)
+        with transaction.atomic(using=alias):
+            for key, val in validated_data.items():
+                setattr(instance, key, val)
+            instance.save(using=alias)
+            if rows is not None:
+                self._save_variants(instance, rows)
+        return instance

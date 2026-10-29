@@ -16,8 +16,9 @@ class BranchDatabaseProfile(models.Model):
         on_delete=models.CASCADE,
         related_name="database_profile",
     )
-    mode = models.CharField(max_length=20, choices=MODE_CHOICES, unique=True)
-    database_alias = models.CharField(max_length=40, unique=True)
+    mode = models.CharField(max_length=20, choices=MODE_CHOICES)
+    database_alias = models.CharField(max_length=40)
+    schema_name = models.CharField(max_length=63, blank=True, default="")
     is_master_inventory = models.BooleanField(default=False)
     show_combined_reports = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
@@ -26,6 +27,12 @@ class BranchDatabaseProfile(models.Model):
 
     class Meta:
         ordering = ["branch_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["database_alias", "schema_name"],
+                name="unique_branch_db_schema",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.branch} - {self.mode} ({self.database_alias})"

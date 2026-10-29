@@ -30,10 +30,7 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
             "dispatched_by",
             "received_by",
         )
-        .prefetch_related(
-            "items__product",
-            "items__variant",
-        )
+        .prefetch_related("items")
         .all()
     )
 
@@ -86,8 +83,7 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
             branch,
             field=("from_branch" if action_name == "dispatch" else "to_branch"),
             message=(
-                f"The transfer {action_name} branch must be Branch 1 or Branch 2. "
-                "Branch 3 cannot own or move physical stock."
+                f"The transfer {action_name} must target a physical tenant branch."
             ),
         )
 
@@ -95,7 +91,7 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
         queryset = super().get_queryset()
 
         active_branch = self._active_branch()
-        if active_branch and active_branch.branch_code != "BR03":
+        if active_branch and is_physical_branch(active_branch):
             # Source branch owns the transfer from creation through dispatch and
             # keeps it in history afterwards. The destination branch receives
             # visibility only once goods have actually left the source branch.
@@ -194,32 +190,11 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
         )
         active_branch = request_active_branch(request)
 
-        # Receiving is intentionally stricter than viewing the transfer.
-        # The stock-in operation must be performed while operating in the
-        # actual physical destination branch. Source branch and BR03 may view
-        # the transfer, but they cannot receive it.
-        if not active_branch or not is_physical_branch(active_branch):
-            raise PermissionDenied(
-                "Switch to the destination physical branch before receiving this transfer."
-            )
-
-        active_code = str(active_branch.branch_code or "").upper()
-        destination_code = str(destination_branch.branch_code or "").upper()
-
-        # Compare canonical physical branch identity.  Branch codes are stable
-        # across the multi-database setup, while mirrored database rows/object
-        # instances must never be compared directly.
-        same_destination = (
-            active_code == destination_code
-            and active_code in {"BR01", "BR02"}
-        )
-
-        if not same_destination:
-            raise PermissionDenied(
-                f"Only {destination_branch.branch_code} - "
-                f"{destination_branch.branch_name} can receive this transfer."
-            )
-
+        # The administrator can receive from Consolidated. All physical stock
+        # mutations are explicitly directed to transfer.to_branch's tenant.
+        if not is_admin_user(request.user):
+            if not active_branch or not is_physical_branch(active_branch) or active_branch.pk != destination_branch.pk:
+                raise PermissionDenied("Switch to the destination branch to receive this transfer.")
         transfer = receive(transfer, request.user)
         return ok(
             TransferSerializer(transfer, context={"request": request}).data,

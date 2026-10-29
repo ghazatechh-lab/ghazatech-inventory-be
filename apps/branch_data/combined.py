@@ -91,56 +91,25 @@ def combined_list(
 ):
     source_filter = str(source_filter or "ALL").upper().replace("-", "_")
 
-    if vat_branch_id is None:
-        vat_branch_id = (
-            Branch.objects.using("default")
-            .filter(branch_code__iexact="BR01", is_active=True)
-            .values_list("id", flat=True)
-            .first()
-        )
-
-    if non_vat_branch_id is None:
-        non_vat_branch_id = (
-            Branch.objects.using("default")
-            .filter(branch_code__iexact="BR02", is_active=True)
-            .values_list("id", flat=True)
-            .first()
-        )
-
-    if vat_branch_id is None:
-        raise RuntimeError("Active BR01 branch was not found.")
-
-    if non_vat_branch_id is None:
-        raise RuntimeError("Active BR02 branch was not found.")
-
-    vat_rows = []
-    non_vat_rows = []
-
-    if source_filter in {"ALL", VAT}:
-        vat_rows = serialize_queryset(
-            vat_queryset.using("vat"),
-            serializer_class=serializer_class,
-            source_branch=VAT,
-            branch_id=vat_branch_id,
-            branch_code="BR01",
-            serializer_context=serializer_context,
-        )
-
-    if source_filter in {"ALL", NON_VAT}:
-        non_vat_rows = serialize_queryset(
-            non_vat_queryset.using("non_vat"),
-            serializer_class=serializer_class,
-            source_branch=NON_VAT,
-            branch_id=non_vat_branch_id,
-            branch_code="BR02",
-            serializer_context=serializer_context,
-        )
-
-    return merge_rows(
-        vat_rows,
-        non_vat_rows,
-        ordering_key=ordering_key,
-        reverse=reverse,
-        page=page,
-        page_size=page_size,
-    )
+    # This legacy helper accepts two querysets. Resolve their physical tenant
+    # schemas; do not assume branch codes or that every tax class has one branch.
+    from apps.branch_data.combined_views import source_alias
+    physical = list(Branch.objects.using("default").filter(
+        is_active=True, tax_mode__in=(VAT, NON_VAT)).order_by("pk"))
+    selected = [b for b in physical if source_filter in {"ALL", b.tax_mode, b.branch_code.upper()}]
+    result_rows = []
+    for branch in selected:
+        if branch.tax_mode == VAT:
+            qs = vat_queryset
+        else:
+            qs = non_vat_queryset
+        qs = qs.using(source_alias(branch))
+        if any(field.name == "branch" for field in qs.model._meta.get_fields()):
+            qs = qs.filter(branch_id=branch.pk)
+        result_rows.extend(serialize_queryset(
+            qs, serializer_class=serializer_class,
+            source_branch=branch.branch_code.upper(), branch_id=branch.pk,
+            branch_code=branch.branch_code.upper(), serializer_context=serializer_context,
+        ))
+    return merge_rows(result_rows, [], ordering_key=ordering_key,
+                      reverse=reverse, page=page, page_size=page_size)

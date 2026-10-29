@@ -75,7 +75,7 @@ class StockTransferItem(models.Model):
     transfer = models.ForeignKey(
         StockTransfer, on_delete=models.CASCADE, related_name="items"
     )
-    product = models.ForeignKey("inventory.Product", on_delete=models.PROTECT)
+    product = models.ForeignKey("inventory.Product", null=True, blank=True, on_delete=models.PROTECT)
     variant = models.ForeignKey(
         "inventory.ProductVariant",
         null=True,
@@ -83,6 +83,8 @@ class StockTransferItem(models.Model):
         on_delete=models.PROTECT,
         related_name="transfer_items",
     )
+    source_product_id = models.PositiveBigIntegerField(null=True, blank=True)
+    source_variant_id = models.PositiveBigIntegerField(null=True, blank=True)
     requested_quantity = models.PositiveIntegerField()
     dispatched_quantity = models.PositiveIntegerField(default=0)
     received_quantity = models.PositiveIntegerField(default=0)

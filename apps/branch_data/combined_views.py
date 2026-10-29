@@ -6,11 +6,47 @@ from rest_framework.exceptions import ValidationError
 
 from apps.branches.models import Branch
 from .combined import add_source_metadata
+from .schema_routing import register_branch_connection
+from django.conf import settings
+from django.db import connections
 
-PHYSICAL_SOURCES = (
-    ("VAT", "vat", "BR01"),
-    ("NON_VAT", "non_vat", "BR02"),
-)
+def _schema_reads_enabled():
+    # Opt-in until all write workflows have been audited.
+    return bool(getattr(settings, "GHAZA_SCHEMA_COMBINED_READS", False))
+
+
+def source_alias(branch):
+    from .supplier_scope import supplier_tenant_scope_active
+    if supplier_tenant_scope_active():
+        return register_branch_connection(branch.pk, branch.tax_mode)
+    if not _schema_reads_enabled():
+        return "vat" if branch.tax_mode == "VAT" else "non_vat"
+    alias = register_branch_connection(branch.pk, branch.tax_mode)
+    expected_schema = f"branch_{branch.pk:08d}"
+    with connections[alias].cursor() as cursor:
+        cursor.execute("SELECT current_schema()")
+        actual = cursor.fetchone()[0]
+        cursor.execute("SELECT to_regclass('branches_branch'), to_regclass('sales_salesinvoice')")
+        required = cursor.fetchone()
+    if actual != expected_schema or not all(required):
+        raise ValidationError({"branch": f"Schema not ready for branch {branch.pk}"})
+    return alias
+
+
+def physical_sources():
+    """Return unique branch codes and their respective physical schema aliases."""
+    return [
+        (branch.branch_code.upper(), source_alias(branch), branch.branch_code.upper())
+        for branch in Branch.objects.using("default").filter(
+            is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+        ).order_by("pk")
+    ]
+
+
+def _is_virtual(branch):
+    if branch is None:
+        return False
+    return not branch.tax_mode and (branch.branch_type == "MASTER" or branch.branch_code.upper() == "CONSOLIDATED")
 
 
 def requested_branch(request):
@@ -25,18 +61,17 @@ def requested_branch(request):
 
 
 def physical_branches():
-    rows = {
+    return {
         b.branch_code.upper(): b
         for b in Branch.objects.using("default").filter(
-            branch_code__in=["BR01", "BR02"], is_active=True
+            is_active=True, tax_mode__in=["VAT", "NON_VAT"]
         )
     }
-    return rows
 
 
 def is_combined_request(request):
     branch = requested_branch(request)
-    return bool(branch and str(branch.branch_code).upper() == "BR03")
+    return _is_virtual(branch)
 
 
 def _safe_int(value, default):
@@ -113,19 +148,13 @@ class CombinedPhysicalBranchListMixin:
         source_filter = str(
             self.request.query_params.get("source_branch") or "ALL"
         ).upper().replace("-", "_")
-        source_filter = {
-            "BR01": "VAT",
-            "BR02": "NON_VAT",
-            "BRANCH_1": "VAT",
-            "BRANCH_2": "NON_VAT",
-        }.get(source_filter, source_filter)
-        if source_filter not in {"ALL", "VAT", "NON_VAT"}:
-            raise ValidationError({"source_branch": "Use ALL, BR01, or BR02."})
+        if source_filter not in {"ALL", "VAT", "NON_VAT"} and source_filter not in physical_branches():
+            raise ValidationError({"source_branch": "Use ALL, VAT, NON_VAT, or a physical branch code."})
 
         branches = physical_branches()
         result = []
-        for source, alias, code in PHYSICAL_SOURCES:
-            if source_filter not in {"ALL", source}:
+        for source, alias, code in physical_sources():
+            if source_filter not in {"ALL", source, code, branches[code].tax_mode}:
                 continue
             branch = branches.get(code)
             if not branch:
@@ -148,14 +177,14 @@ class CombinedPhysicalBranchListMixin:
             return super().list(request, *args, **kwargs)
 
         source_filter = str(request.query_params.get("source_branch") or "ALL").upper().replace("-", "_")
-        source_filter = {"BR01": "VAT", "BR02": "NON_VAT", "BRANCH_1": "VAT", "BRANCH_2": "NON_VAT"}.get(source_filter, source_filter)
-        if source_filter not in {"ALL", "VAT", "NON_VAT"}:
-            raise ValidationError({"source_branch": "Use ALL, BR01, or BR02."})
+        
+        if source_filter not in {"ALL", "VAT", "NON_VAT"} and source_filter not in physical_branches():
+            raise ValidationError({"source_branch": "Use ALL, VAT, NON_VAT, or a physical branch code."})
 
         branches = physical_branches()
         rows = []
-        for source, alias, code in PHYSICAL_SOURCES:
-            if source_filter not in {"ALL", source}:
+        for source, alias, code in physical_sources():
+            if source_filter not in {"ALL", source, code, branches[code].tax_mode}:
                 continue
             branch = branches.get(code)
             if not branch:
@@ -196,9 +225,9 @@ class CombinedPhysicalBranchListMixin:
         if ":" in raw_pk:
             source, record_id = raw_pk.split(":", 1)
             source = source.upper().replace("-", "_")
-        if source not in {"VAT", "NON_VAT"}:
+        if source not in physical_branches():
             raise ValidationError({
-                "source_branch": "BR03 detail/action reads require resource_key (VAT:id / NON_VAT:id) or source_branch."
+                "source_branch": "Combined details require resource_key (BRANCH_CODE:id) or source_branch."
             })
         return source, record_id
 
@@ -206,9 +235,11 @@ class CombinedPhysicalBranchListMixin:
         if not is_combined_request(self.request):
             return super().get_object()
         source, record_id = self._combined_object_source()
-        alias = "vat" if source == "VAT" else "non_vat"
-        code = "BR01" if source == "VAT" else "BR02"
+        code = source
         branch = physical_branches().get(code)
+        if branch is None:
+            raise ValidationError({"source_branch": "Unknown or inactive branch."})
+        alias = source_alias(branch)
         qs = self._base_combined_queryset(alias, branch.id)
         obj = qs.filter(pk=record_id).first()
         if obj is None:
@@ -223,9 +254,11 @@ class CombinedPhysicalBranchListMixin:
 
         source, _record_id = self._combined_object_source()
         obj = self.get_object()
-        alias = "vat" if source == "VAT" else "non_vat"
-        code = "BR01" if source == "VAT" else "BR02"
+        code = source
         branch = physical_branches().get(code)
+        if branch is None:
+            raise ValidationError({"source_branch": "Unknown or inactive branch."})
+        alias = source_alias(branch)
         data = self.get_serializer(obj).data
         return Response(add_source_metadata(data, source_branch=source, branch_id=branch.id, branch_code=code))
 
@@ -246,7 +279,7 @@ class DefaultCombinedBranchRequestMixin:
             qs = Branch.objects.using("default").filter(is_active=True)
             text = str(raw).strip()
             branch = qs.filter(pk=int(text)).first() if text.isdigit() else qs.filter(branch_code__iexact=text).first()
-            if branch and str(branch.branch_code).upper() == "BR03":
+            if _is_virtual(branch):
                 try:
                     data = request._request.GET.copy()
                     data.pop("branch", None)

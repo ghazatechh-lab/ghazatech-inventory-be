@@ -4,13 +4,8 @@ from rest_framework.exceptions import ValidationError
 
 from apps.branches.models import Branch
 
-PHYSICAL_CODES = ("BR01", "BR02")
-SOURCE_TO_CODE = {
-    "BR01": "BR01",
-    "BR02": "BR02",
-    "VAT": "BR01",
-    "NON_VAT": "BR02",
-}
+# Physical branch identity is determined by tax classification, not code.
+# BR01/BR02 constants are intentionally not used for routing.
 
 
 def _branch_qs():
@@ -46,26 +41,25 @@ def active_interface_branch(request):
 
 
 def is_physical(branch):
-    return bool(branch and str(branch.branch_code or "").upper() in PHYSICAL_CODES)
+    return bool(branch and branch.is_active and branch.tax_mode in {"VAT", "NON_VAT"})
 
 
 def is_combined(branch):
-    return bool(branch and str(branch.branch_code or "").upper() == "BR03")
+    return bool(branch and branch.is_active and not branch.tax_mode and branch.branch_type == "MASTER")
 
 
 def physical_branches():
-    rows = _branch_qs().filter(branch_code__in=PHYSICAL_CODES).order_by("branch_code")
-    return list(rows)
+    return list(_branch_qs().filter(tax_mode__in=("VAT", "NON_VAT")).order_by("pk"))
 
 
 def _source_branch(request):
-    raw = str((getattr(request, "query_params", {}) or {}).get("source_branch") or "ALL").upper().replace("-", "_")
-    if raw == "ALL":
+    raw = str((getattr(request, "query_params", {}) or {}).get("source_branch") or "ALL").strip()
+    if raw.upper() == "ALL":
         return None
-    code = SOURCE_TO_CODE.get(raw)
-    if not code:
-        raise ValidationError({"source_branch": "Use ALL, BR01, or BR02."})
-    return _branch_qs().filter(branch_code=code).first()
+    branch = branch_from_value(raw)
+    if not is_physical(branch):
+        raise ValidationError({"source_branch": "Select an active physical branch code or ID."})
+    return branch
 
 
 def scope_queryset(request, queryset, lookup="branch_id"):
@@ -74,17 +68,14 @@ def scope_queryset(request, queryset, lookup="branch_id"):
     if not active:
         return queryset
 
-    code = str(active.branch_code or "").upper()
-    if code in PHYSICAL_CODES:
+    if is_physical(active):
         return queryset.filter(**{lookup: active.pk})
 
-    if code == "BR03":
+    if is_combined(active):
         selected = _source_branch(request)
         if selected:
             return queryset.filter(**{lookup: selected.pk})
-        ids = list(
-            _branch_qs().filter(branch_code__in=PHYSICAL_CODES).values_list("pk", flat=True)
-        )
+        ids = [branch.pk for branch in physical_branches()]
         return queryset.filter(**{f"{lookup}__in": ids})
 
     return queryset.none()
@@ -103,19 +94,19 @@ def require_direct_write_branch(request, supplied=None, *, existing=None):
         return active
 
     if not is_combined(active):
-        raise ValidationError({"branch": "Only Branch 1 or Branch 2 can own this record."})
+        raise ValidationError({"branch": "Only an active physical branch can own this record."})
 
     # On BR03, direct-owner writes must be explicit even for updates.
     target = branch_from_value(supplied)
     if not is_physical(target):
-        raise ValidationError({"branch": "Branch 3 cannot own records. Select Branch 1 or Branch 2."})
+        raise ValidationError({"branch": "The consolidated branch cannot own records. Select a physical branch."})
     return target
 
 
 def require_related_branch(request, related_branch):
     """Validate employee/vehicle inherited ownership against the active interface."""
     if not is_physical(related_branch):
-        raise ValidationError({"branch": "The related employee/vehicle must belong to Branch 1 or Branch 2."})
+        raise ValidationError({"branch": "The related employee/vehicle must belong to an active physical branch."})
 
     active = active_interface_branch(request)
     if not active:
@@ -125,7 +116,7 @@ def require_related_branch(request, related_branch):
         raise ValidationError({"branch": f"This record belongs to {related_branch.branch_code}, not the current branch."})
 
     if not (is_physical(active) or is_combined(active)):
-        raise ValidationError({"branch": "Only Branch 1 or Branch 2 may own this record."})
+        raise ValidationError({"branch": "Only a physical branch may own this record."})
     return related_branch
 
 

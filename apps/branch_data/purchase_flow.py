@@ -43,72 +43,33 @@ def _request_value(request, key):
 
 
 def requested_purchase_target(request):
-    """Return the canonical BR01/BR02 target for a purchase operation.
+    """Resolve a physical target by branch code or ID (never by tax category).
 
-    Physical BR01/BR02 screens are locked to their active branch. BR03 is
-    virtual and must explicitly provide a physical branch in ``branch`` or
-    ``target_branch``.  ``target_branch`` accepts BR01/BR02 and VAT/NON_VAT.
+    A VAT classification may cover multiple branches, so VAT/NON_VAT alone
+    cannot identify the destination for a write.
     """
     active = request_active_branch(request)
-
     if is_physical_branch(active):
         return _canonical_branch(active)
-
-    raw = _request_value(request, "branch") or _request_value(request, "target_branch")
-    text = str(raw or "").strip().upper().replace("-", "_")
-    aliases = {
-        "VAT": "BR01",
-        "NON_VAT": "BR02",
-        "NONVAT": "BR02",
-        "BR01": "BR01",
-        "BR02": "BR02",
-    }
-    code = aliases.get(text)
-
-    if not code and text.isdigit():
-        candidate = _canonical_branch(text)
-        code = str(getattr(candidate, "branch_code", "") or "").upper()
-
-    if code not in PHYSICAL_BRANCH_CODES:
-        return None
-
-    return Branch.objects.using("default").filter(
-        branch_code__iexact=code,
-        is_active=True,
-    ).first()
-
+    return branch_from_source_value(
+        _request_value(request, "target_branch") or _request_value(request, "branch")
+    )
 
 
 def branch_from_source_value(value):
-    text = str(value or "").strip().upper().replace("-", "_")
+    text = str(value or "").strip()
     if ":" in text:
         text = text.split(":", 1)[0]
-    code = {
-        "VAT": "BR01",
-        "BR01": "BR01",
-        "BRANCH_1": "BR01",
-        "NON_VAT": "BR02",
-        "NONVAT": "BR02",
-        "BR02": "BR02",
-        "BRANCH_2": "BR02",
-    }.get(text)
-    if not code:
-        return None
-    return Branch.objects.using("default").filter(
-        branch_code__iexact=code, is_active=True
-    ).first()
+    branch = _canonical_branch(text)
+    return branch if is_physical_branch(branch) else None
+
 
 def require_purchase_target(request):
     branch = requested_purchase_target(request)
     if branch is None:
-        raise serializers.ValidationError(
-            {
-                "branch": (
-                    "Select Branch 1 or Branch 2. Branch 3 is a combined "
-                    "interface and cannot own purchase data."
-                )
-            }
-        )
+        raise serializers.ValidationError({
+            "branch": "Select a specific active physical branch by ID or branch code."
+        })
     return branch
 
 
@@ -119,7 +80,7 @@ class PurchasePhysicalBranchSerializerMixin:
         branch = _canonical_branch(value)
         if not is_physical_branch(branch):
             raise serializers.ValidationError(
-                "Select Branch 1 or Branch 2. Branch 3 cannot own purchase data."
+                "Select an active physical branch; the consolidated branch cannot own purchase data."
             )
 
         # Return the branch row from the same physical database that will own

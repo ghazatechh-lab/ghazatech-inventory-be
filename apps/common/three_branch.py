@@ -43,7 +43,7 @@ def normalize_branch_code(branch) -> str:
 def branch_sales_mode(branch) -> str:
     """Return VAT, NON_VAT or BOTH for an operational branch."""
     code = normalize_branch_code(branch)
-    return BRANCH_SALES_MODES.get(code, BOTH)
+    return (getattr(branch, "tax_mode", None) or BRANCH_SALES_MODES.get(code, BOTH))
 
 
 def allowed_sale_modes(branch) -> list[str]:

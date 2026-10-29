@@ -2,18 +2,18 @@ from rest_framework import serializers
 
 from apps.branches.models import Branch
 
-PHYSICAL_BRANCH_CODES = {"BR01", "BR02"}
+PHYSICAL_BRANCH_CODES = {"BR01", "BR02"}  # legacy canonical codes
 COMBINED_BRANCH_CODE = "BR03"
 
 
 def is_physical_branch(branch):
-    return bool(branch and str(getattr(branch, "branch_code", "")).upper() in PHYSICAL_BRANCH_CODES)
+    return bool(branch and str(getattr(branch, "branch_code", "")).upper() != COMBINED_BRANCH_CODE and getattr(branch, "tax_mode", None) in {"VAT", "NON_VAT"} and getattr(branch, "is_active", False))
 
 
 def require_physical_branch(branch, *, field="branch", message=None):
     if not is_physical_branch(branch):
         raise serializers.ValidationError({
-            field: message or "Select Branch 1 or Branch 2. Branch 3 is a combined interface and cannot own physical inventory."
+            field: message or "Select an active VAT or Non-VAT physical branch. The consolidated branch cannot own inventory."
         })
     return branch
 
@@ -63,7 +63,7 @@ def request_active_branch(request):
             return None
 
     code = normalized.upper()
-    if code in {"BR01", "BR02", "BR03"}:
+    if code:
         try:
             return manager.get(branch_code=code)
         except Branch.DoesNotExist:

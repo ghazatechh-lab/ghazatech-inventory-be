@@ -1,3 +1,4 @@
+from uuid import uuid4
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
@@ -21,6 +22,7 @@ class BranchManagerOptionSerializer(serializers.ModelSerializer):
 
 
 class BranchSerializer(serializers.ModelSerializer):
+    branch_code = serializers.CharField(required=False, allow_blank=True, max_length=30)
     manager = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.filter(is_active=True),
         required=False,
@@ -32,6 +34,31 @@ class BranchSerializer(serializers.ModelSerializer):
         model = Branch
         fields = "__all__"
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        code = str(attrs.get("branch_code", getattr(self.instance, "branch_code", ""))).strip().upper()
+        mode = attrs.get("tax_mode", getattr(self.instance, "tax_mode", ""))
+        if self.instance and not self.instance.tax_mode:
+            raise serializers.ValidationError("The consolidated virtual branch cannot be edited as a physical branch.")
+        if mode not in (Branch.TAX_VAT, Branch.TAX_NON_VAT):
+            raise serializers.ValidationError({"tax_mode": "Select VAT or Non-VAT."})
+        if self.instance and mode != self.instance.tax_mode:
+            from apps.branch_data.models import BranchDatabaseProfile
+            if BranchDatabaseProfile.objects.using("default").filter(branch_id=self.instance.pk).exists():
+                raise serializers.ValidationError({"tax_mode": "Cannot change a provisioned branch's tax type."})
+        if not self.instance and code == "CONSOLIDATED":
+            raise serializers.ValidationError({"branch_code": "Reserved for the consolidated view."})
+        if code:
+            attrs["branch_code"] = code
+        return attrs
+
+    def create(self, validated_data):
+        # Opaque human-independent identifier; no fixed BR01/BR02 numbering.
+        validated_data.setdefault("branch_code", "LOC-" + uuid4().hex[:12].upper())
+        # Provisioning sets active=True only after schema creation and reference sync.
+        validated_data["is_active"] = False
+        return super().create(validated_data)
 
     def to_internal_value(self, data):
         mutable_data = data.copy()

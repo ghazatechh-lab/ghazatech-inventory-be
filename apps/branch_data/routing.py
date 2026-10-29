@@ -59,29 +59,51 @@ def normalize_source(value):
     return aliases.get(value, value)
 
 
+def _physical_from_source(source):
+    from apps.branches.models import Branch
+    from django.db.models import Q
+    source = normalize_source(source)
+    qs = Branch.objects.using("default").filter(is_active=True, tax_mode__in=(VAT, NON_VAT))
+    if source.isdigit():
+        return qs.filter(pk=int(source)).first()
+    branch = qs.filter(branch_code__iexact=source).first()
+    if branch:
+        return branch
+    if source in (VAT, NON_VAT):
+        matches = list(qs.filter(tax_mode=source)[:2])
+        # A tax classification does not select a unique branch when multiple
+        # locations use the same tax treatment.
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
 def source_for_active_branch(active_branch):
     code = normalize_branch_code(active_branch)
-    return BRANCH_TO_SOURCE.get(code)
+    from apps.branches.models import Branch
+    branch = (Branch.objects.using("default").filter(pk=int(code)).first()
+              if code.isdigit() else Branch.objects.using("default").filter(branch_code__iexact=code).first())
+    if branch and branch.is_active:
+        if branch.tax_mode in {VAT, NON_VAT}:
+            return branch.branch_code.upper()
+        if branch.branch_type == "MASTER":
+            return COMBINED
+    return None
 
 
 def database_for_source(source_branch):
-    source = normalize_source(source_branch)
-    try:
-        return SOURCE_TO_ALIAS[source]
-    except KeyError as exc:
-        raise ValidationError(
-            {"target_branch": "Target branch must be VAT or NON_VAT."}
-        ) from exc
+    from apps.branch_data.services import database_alias_for_branch
+    branch = _physical_from_source(source_branch)
+    if branch is None:
+        raise ValidationError({"target_branch": "Select a unique active physical branch."})
+    return database_alias_for_branch(branch.pk)
 
 
 def real_branch_code_for_source(source_branch):
-    source = normalize_source(source_branch)
-    try:
-        return SOURCE_TO_BRANCH_CODE[source]
-    except KeyError as exc:
-        raise ValidationError(
-            {"target_branch": "Target branch must be VAT or NON_VAT."}
-        ) from exc
+    branch = _physical_from_source(source_branch)
+    if branch is None:
+        raise ValidationError({"target_branch": "Select a unique active physical branch."})
+    return branch.branch_code.upper()
 
 
 def get_request_target(request):
@@ -110,20 +132,20 @@ def resolve_operation_context(
     active_code = normalize_branch_code(active_branch)
     active_source = source_for_active_branch(active_code)
 
-    if active_source in {VAT, NON_VAT}:
+    if active_source and active_source != COMBINED:
         source = active_source
     elif active_source == COMBINED:
         source = normalize_source(target_branch) or get_request_target(request)
-        if source not in {VAT, NON_VAT}:
+        if _physical_from_source(source) is None:
             if write:
                 raise ValidationError({
                     "target_branch": (
-                        "Select VAT Branch or Non-VAT Branch before creating "
-                        "a transaction from the Combined Branch."
+                        "Select a specific physical branch before creating "
+                        "a transaction from GhazaTech Consolidated."
                     )
                 })
             raise ValidationError({
-                "source_branch": "Select VAT, NON_VAT, or ALL for this operation."
+                "source_branch": "Select a specific physical branch for this operation."
             })
     else:
         raise ValidationError({"branch": "Unsupported active branch."})
@@ -146,8 +168,8 @@ def resolve_operation_context(
 
 def make_resource_key(source_branch, record_id):
     source = normalize_source(source_branch)
-    if source not in {VAT, NON_VAT}:
-        raise ValueError("source_branch must be VAT or NON_VAT")
+    if _physical_from_source(source) is None:
+        raise ValueError("source_branch must identify an active physical branch")
     return f"{source}:{record_id}"
 
 
@@ -157,7 +179,7 @@ def parse_resource_key(value):
         raise ValidationError({"id": "Expected composite id like VAT:15."})
     source, record_id = raw.split(":", 1)
     source = normalize_source(source)
-    if source not in {VAT, NON_VAT}:
+    if _physical_from_source(source) is None:
         raise ValidationError({"id": "Unknown source branch."})
     try:
         record_id = int(record_id)

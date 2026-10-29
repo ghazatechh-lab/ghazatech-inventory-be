@@ -88,8 +88,20 @@ class SupplierViewSet(
         "supplier_name",
     ]
 
+    def dispatch(self, request, *args, **kwargs):
+        # Scope only Supplier endpoints: do not enable tenant writes for other
+        # modules whose transactional behavior has not yet been audited.
+        from apps.branch_data.supplier_scope import supplier_tenant_scope
+        with supplier_tenant_scope():
+            return super().dispatch(request, *args, **kwargs)
+
     def get_queryset(self):
         queryset = super().get_queryset()
+        from apps.branch_data.combined_views import requested_branch
+        from apps.branch_data.services import database_alias_for_branch
+        branch = requested_branch(self.request)
+        if branch is not None and branch.tax_mode in {"VAT", "NON_VAT"}:
+            queryset = queryset.using(database_alias_for_branch(branch.pk))
         branch_id = self.request.query_params.get("branch")
 
         if branch_id not in (None, "", "all"):
@@ -137,7 +149,7 @@ class SupplierViewSet(
         )
 
         for uploaded_file in files:
-            SupplierDocument.objects.create(
+            SupplierDocument.objects.using(supplier._state.db).create(
                 supplier=supplier,
                 file=uploaded_file,
                 original_name=uploaded_file.name,

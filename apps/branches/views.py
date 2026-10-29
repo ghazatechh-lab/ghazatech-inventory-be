@@ -1,5 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.conf import settings
+from rest_framework.exceptions import APIException
 from django.db.models.deletion import CASCADE, PROTECT, ProtectedError
 from apps.common.three_branch import branch_sales_mode, allowed_sale_modes
 
@@ -65,6 +67,26 @@ class BranchViewSet(ModelViewSet):
             return queryset.none()
 
         return queryset.filter(id=branch_id)
+
+    def perform_create(self, serializer):
+        # Provision synchronously: never expose an active branch with no schema.
+        branch = serializer.save(is_active=False)
+        try:
+            from apps.branch_data.provisioning import provision_physical_branch
+            provision_physical_branch(branch.pk)
+        except Exception as exc:
+            Branch.objects.using("default").filter(pk=branch.pk).update(is_active=False)
+            raise APIException(
+                f"Branch {branch.pk} was saved inactive: schema provisioning failed. "
+                f"Fix provisioning before retrying. Details: {exc}"
+            ) from exc
+        from apps.branch_data.services import clear_branch_database_cache
+        clear_branch_database_cache()
+
+    def perform_update(self, serializer):
+        serializer.save()
+        from apps.branch_data.services import clear_branch_database_cache
+        clear_branch_database_cache()
 
     def _prepare_branch_for_permanent_delete(self, branch):
         """

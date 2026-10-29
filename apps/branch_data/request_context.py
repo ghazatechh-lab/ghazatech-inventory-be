@@ -32,9 +32,9 @@ class BranchDatabaseContextMiddleware(MiddlewareMixin):
             if raw:
                 try:
                     branch = (
-                        Branch.objects.get(branch_code=str(raw).upper())
-                        if str(raw).upper().startswith("BR")
-                        else Branch.objects.get(pk=raw)
+                        Branch.objects.using("default").get(pk=int(raw))
+                        if str(raw).isdigit()
+                        else Branch.objects.using("default").get(branch_code__iexact=str(raw))
                     )
                 except (Branch.DoesNotExist, ValueError):
                     branch = None

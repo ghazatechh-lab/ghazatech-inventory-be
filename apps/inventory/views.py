@@ -30,6 +30,8 @@ from .serializers import (
     BrandSerializer,
     CategorySerializer,
     ProductSerializer,
+    ProductVariantSerializer,
+    TenantProductSerializer,
     ProductStockSerializer,
     RackSerializer,
     StockAdjustmentSerializer,
@@ -48,7 +50,137 @@ from rest_framework import status
 from apps.branches.models import Branch
 
 
-class BrandViewSet(ModelViewSet):
+def _inventory_request_scope(request, *, require_physical=False):
+    """Resolve a selected physical branch to its schema, never to public.
+
+    Shared configuration remains on default. Query/body fallbacks support
+    existing clients that send branch IDs instead of X-Branch-ID.
+    """
+    from apps.branch_data.context import get_active_branch_id
+    from apps.branch_data.schema_routing import register_branch_connection
+
+    raw = (
+        request.query_params.get("branch")
+        or request.headers.get("X-Branch-ID")
+        or (
+            request.data.get("branch")
+            if request.method in {"POST", "PUT", "PATCH"}
+            and isinstance(request.data, dict)
+            else None
+        )
+        or get_active_branch_id()
+    )
+    if raw in (None, "", "all", "ALL"):
+        if require_physical:
+            raise ValidationError({"branch": "Select a physical branch first."})
+        return None, None
+    try:
+        branch = Branch.objects.using("default").get(pk=int(raw), is_active=True)
+    except (Branch.DoesNotExist, ValueError, TypeError):
+        raise ValidationError({"branch": "Invalid or inactive branch."})
+    if branch.tax_mode not in {"VAT", "NON_VAT"}:
+        if require_physical:
+            raise ValidationError(
+                {"branch": "Select a physical VAT or NON-VAT branch."}
+            )
+        return branch, None
+    alias = register_branch_connection(branch.pk, branch.tax_mode)
+    return branch, alias
+
+
+class TenantCatalogMixin:
+    """Keep catalog reference operations in the selected tenant schema."""
+
+    def list(self, request, *args, **kwargs):
+        branch, alias = _inventory_request_scope(request)
+        if branch is not None and alias is None:
+            from apps.branch_data.schema_routing import register_branch_connection
+
+            rows = []
+            for physical in Branch.objects.using("default").filter(
+                is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+            ):
+                tenant = register_branch_connection(physical.pk, physical.tax_mode)
+                for item in self.queryset.using(tenant).all().order_by("name"):
+                    record = self.get_serializer(item).data
+                    record["source_branch_id"] = physical.pk
+                    record["source_branch_name"] = physical.branch_name
+                    record["resource_key"] = f"{physical.pk}:{item.pk}"
+                    rows.append(record)
+            rows.sort(
+                key=lambda item: (item["name"].casefold(), item["source_branch_id"])
+            )
+            try:
+                page = max(1, int(request.query_params.get("page", 1)))
+                page_size = min(
+                    100, max(1, int(request.query_params.get("page_size", 12)))
+                )
+            except (TypeError, ValueError):
+                raise ValidationError({"page": "Invalid pagination parameters."})
+            total = len(rows)
+            return Response(
+                {
+                    "count": total,
+                    "next": None,
+                    "previous": None,
+                    "results": rows[(page - 1) * page_size : page * page_size],
+                }
+            )
+        return super().list(request, *args, **kwargs)
+
+    def get_queryset(self):
+        branch, alias = _inventory_request_scope(self.request)
+        if alias is None and self.action in {
+            "retrieve",
+            "update",
+            "partial_update",
+            "destroy",
+        }:
+            raw = self.request.query_params.get("source_branch_id")
+            if raw:
+                from apps.branch_data.schema_routing import register_branch_connection
+
+                try:
+                    physical = Branch.objects.using("default").get(
+                        pk=int(raw), is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+                    )
+                except (ValueError, TypeError, Branch.DoesNotExist):
+                    raise ValidationError(
+                        {"source_branch_id": "Invalid physical source branch."}
+                    )
+                alias = register_branch_connection(physical.pk, physical.tax_mode)
+        if alias is None:
+            # Consolidated catalog is handled separately; never show stale
+            # default.public rows as if they were tenant-owned references.
+            return self.queryset.none()
+        return self.queryset.using(alias).all()
+
+    def perform_create(self, serializer):
+        _, alias = _inventory_request_scope(self.request, require_physical=True)
+        obj = serializer.Meta.model(**serializer.validated_data)
+        obj.save(using=alias)
+        serializer.instance = obj
+
+    def perform_update(self, serializer):
+        obj = serializer.instance
+        alias = serializer.instance._state.db
+        if not alias or not alias.startswith("tenant_"):
+            raise ValidationError(
+                {"branch": "This record must be edited in its source tenant."}
+            )
+        for field, value in serializer.validated_data.items():
+            setattr(obj, field, value)
+        obj.save(using=alias)
+        serializer.instance = obj
+
+    def perform_destroy(self, instance):
+        alias = instance._state.db
+        if not alias or not alias.startswith("tenant_"):
+            raise ValidationError({"branch": "Source branch is required for deletion."})
+        instance.delete(using=alias)
+
+
+class BrandViewSet(TenantCatalogMixin, ModelViewSet):
     permission_classes = [ReferenceDataPermission]
     ordering_fields = ["name", "is_active", "created_at"]
     queryset = Brand.objects.all()
@@ -57,7 +189,7 @@ class BrandViewSet(ModelViewSet):
     filterset_fields = ["is_active"]
 
 
-class CategoryViewSet(ModelViewSet):
+class CategoryViewSet(TenantCatalogMixin, ModelViewSet):
     permission_classes = [ReferenceDataPermission]
     ordering_fields = ["name", "is_active", "created_at"]
     queryset = Category.objects.all()
@@ -68,63 +200,112 @@ class CategoryViewSet(ModelViewSet):
 
 class RackViewSet(ModelViewSet):
     permission_classes = [ReferenceDataPermission]
-    ordering_fields = [
-        "rack_code",
-        "rack_name",
-        "branch__branch_code",
-        "is_active",
-        "created_at",
-    ]
+    ordering_fields = ["rack_code", "rack_name", "is_active", "created_at"]
     serializer_class = RackSerializer
-    search_fields = [
-        "rack_code",
-        "rack_name",
-        "branch__branch_name",
-        "branch__branch_code",
-    ]
+    search_fields = ["rack_code", "rack_name"]
     filterset_fields = ["is_active"]
 
-    @staticmethod
-    def _mirror_to_physical_db(rack):
-        using = database_alias_for_branch(rack.branch_id)
-        if using == "default":
-            raise ValidationError({"branch": "Branch 3 cannot own racks."})
-        Rack.objects.using(using).update_or_create(
-            pk=rack.pk,
-            defaults={
-                "branch_id": rack.branch_id,
-                "rack_code": rack.rack_code,
-                "rack_name": rack.rack_name,
-                "is_active": rack.is_active,
-            },
+    def list(self, request, *args, **kwargs):
+        branch, alias = _inventory_request_scope(request)
+        if branch is not None and alias is None:
+            from apps.branch_data.schema_routing import register_branch_connection
+
+            rows = []
+            for physical in Branch.objects.using("default").filter(
+                is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+            ):
+                tenant = register_branch_connection(physical.pk, physical.tax_mode)
+                queryset = (
+                    Rack.objects.using(tenant)
+                    .filter(branch_id=physical.pk)
+                    .order_by("rack_code", "pk")
+                )
+                for rack in queryset:
+                    record = RackSerializer(rack, context={"request": request}).data
+                    record["source_branch_id"] = physical.pk
+                    record["source_branch_name"] = physical.branch_name
+                    record["resource_key"] = f"{physical.pk}:{rack.pk}"
+                    rows.append(record)
+            search = str(request.query_params.get("search") or "").strip().casefold()
+            if search:
+                rows = [
+                    row
+                    for row in rows
+                    if search in str(row.get("rack_code") or "").casefold()
+                    or search in str(row.get("rack_name") or "").casefold()
+                    or search in str(row.get("source_branch_name") or "").casefold()
+                ]
+            active = request.query_params.get("is_active")
+            if active is not None and str(active).lower() in ("true", "false"):
+                expected = str(active).lower() == "true"
+                rows = [row for row in rows if row.get("is_active") == expected]
+            rows.sort(
+                key=lambda row: (
+                    str(row.get("rack_code") or "").casefold(),
+                    row["source_branch_id"],
+                    row["id"],
+                )
+            )
+            try:
+                page = max(1, int(request.query_params.get("page", 1)))
+                size = min(100, max(1, int(request.query_params.get("page_size", 12))))
+            except (ValueError, TypeError):
+                raise ValidationError({"page": "Invalid pagination parameters."})
+            total = len(rows)
+            return Response(
+                {
+                    "count": total,
+                    "next": None,
+                    "previous": None,
+                    "results": rows[(page - 1) * size : page * size],
+                }
+            )
+        return super().list(request, *args, **kwargs)
+
+    def get_queryset(self):
+        branch, alias = _inventory_request_scope(self.request)
+        if alias is None:
+            return Rack.objects.none()
+        return (
+            Rack.objects.using(alias)
+            .filter(branch_id=branch.pk)
+            .select_related("branch")
         )
 
     def perform_create(self, serializer):
-        rack = serializer.save()
-        self._mirror_to_physical_db(rack)
+        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        requested = serializer.validated_data.get("branch")
+        if requested is not None and requested.pk != branch.pk:
+            raise ValidationError(
+                {"branch": "Rack must belong to the selected branch."}
+            )
+        rack = Rack(
+            branch_id=branch.pk,
+            rack_code=serializer.validated_data["rack_code"],
+            rack_name=serializer.validated_data.get("rack_name", ""),
+            is_active=serializer.validated_data.get("is_active", True),
+        )
+        rack.save(using=alias)
+        serializer.instance = rack
 
     def perform_update(self, serializer):
-        rack = serializer.save()
-        self._mirror_to_physical_db(rack)
+        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        if (
+            serializer.validated_data.get("branch")
+            and serializer.validated_data["branch"].pk != branch.pk
+        ):
+            raise ValidationError({"branch": "Cannot move a rack across schemas."})
+        rack = serializer.instance
+        for key in ("rack_code", "rack_name", "is_active"):
+            if key in serializer.validated_data:
+                setattr(rack, key, serializer.validated_data[key])
+        rack.save(using=alias)
 
-    def get_queryset(self):
-        queryset = Rack.objects.select_related("branch").all()
-        branch_id = self.request.query_params.get("branch")
-
-        if not branch_id:
-            return queryset
-
-        try:
-            branch = Branch.objects.get(pk=branch_id)
-        except (Branch.DoesNotExist, TypeError, ValueError):
-            return queryset.none()
-
-        # BR03 is a virtual combined branch and never owns racks.
-        # Its rack list is the union of the two physical branches.
-        if branch.branch_code == "BR03":
-            return queryset.filter(branch__branch_code__in=["BR01", "BR02"])
-
-        return queryset.filter(branch_id=branch.id)
+    def perform_destroy(self, instance):
+        alias = instance._state.db
+        if not alias or not alias.startswith("tenant_"):
+            raise ValidationError({"branch": "Source branch is required for deletion."})
+        instance.delete(using=alias)
 
 
 class RackAllocationViewSet(ReadOnlyModelViewSet):
@@ -144,7 +325,9 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
         sku = request.query_params.get("sku")
         stock_id = request.query_params.get("stock_id")
         if not (branch_code and sku and stock_id):
-            raise ValidationError({"detail": "branch_code, sku and stock_id are required."})
+            raise ValidationError(
+                {"detail": "branch_code, sku and stock_id are required."}
+            )
         if branch_code not in ("BR01", "BR02"):
             raise ValidationError({"branch_code": "Choose a physical branch."})
         branch = Branch.objects.using("default").filter(branch_code=branch_code).first()
@@ -152,21 +335,42 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
             raise ValidationError({"branch_code": "Branch not found."})
         alias = database_alias_for_branch(branch.id)
         if alias not in ("vat", "non_vat"):
-            raise ValidationError({"branch_code": "Unsupported physical branch database."})
+            raise ValidationError(
+                {"branch_code": "Unsupported physical branch database."}
+            )
         # Reject colliding numeric IDs by verifying SKU against physical stock product.
         with transaction.atomic(using=alias):
-            stock = (ProductStock.objects.using(alias).select_for_update()
-                     .select_related("product", "variant")
-                     .filter(pk=stock_id, branch_id=branch.id).first())
+            stock = (
+                ProductStock.objects.using(alias)
+                .select_for_update()
+                .select_related("product", "variant")
+                .filter(pk=stock_id, branch_id=branch.id)
+                .first()
+            )
             if stock is None or stock.product.sku.casefold() != str(sku).casefold():
-                raise ValidationError({"stock_id": "Physical stock does not match the requested SKU and branch."})
+                raise ValidationError(
+                    {
+                        "stock_id": "Physical stock does not match the requested SKU and branch."
+                    }
+                )
             if request.method == "PUT":
-                if not (request.user and request.user.is_authenticated and request.user.is_superuser):
+                if not (
+                    request.user
+                    and request.user.is_authenticated
+                    and request.user.is_superuser
+                ):
                     from rest_framework.exceptions import PermissionDenied
-                    raise PermissionDenied("Only administrators may modify rack allocations.")
+
+                    raise PermissionDenied(
+                        "Only administrators may modify rack allocations."
+                    )
                 items = request.data.get("allocations")
                 if not isinstance(items, list):
-                    raise ValidationError({"allocations": "Provide a list of rack_code and quantity pairs."})
+                    raise ValidationError(
+                        {
+                            "allocations": "Provide a list of rack_code and quantity pairs."
+                        }
+                    )
                 if len(items) > 200:
                     raise ValidationError({"allocations": "Too many rack assignments."})
                 allocations = []
@@ -176,32 +380,149 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
                         raise ValidationError({"allocations": "Invalid row."})
                     code = str(row.get("rack_code") or "").strip()
                     amount = row.get("quantity")
-                    if not code or isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
-                        raise ValidationError({"allocations": "Each row requires a rack_code and nonnegative integer quantity."})
-                    rack = Rack.objects.using(alias).filter(branch_id=branch.id, rack_code=code, is_active=True).first()
+                    if (
+                        not code
+                        or isinstance(amount, bool)
+                        or not isinstance(amount, int)
+                        or amount < 0
+                    ):
+                        raise ValidationError(
+                            {
+                                "allocations": "Each row requires a rack_code and nonnegative integer quantity."
+                            }
+                        )
+                    rack = (
+                        Rack.objects.using(alias)
+                        .filter(branch_id=branch.id, rack_code=code, is_active=True)
+                        .first()
+                    )
                     if rack is None or rack.pk in seen:
-                        raise ValidationError({"allocations": "Unknown or duplicate rack for this branch."})
+                        raise ValidationError(
+                            {
+                                "allocations": "Unknown or duplicate rack for this branch."
+                            }
+                        )
                     seen.add(rack.pk)
                     allocations.append((rack, amount))
                 total = sum(amount for _, amount in allocations)
                 if total > stock.current_stock:
-                    raise ValidationError({"allocations": "Rack allocation exceeds physical stock quantity."})
+                    raise ValidationError(
+                        {
+                            "allocations": "Rack allocation exceeds physical stock quantity."
+                        }
+                    )
                 # This operation changes locations only, not ProductStock or movement ledger.
-                RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk).delete()
-                RackStockAllocation.objects.using(alias).bulk_create([
-                    RackStockAllocation(stock_id=stock.pk, rack_id=rack.pk, quantity=amount)
-                    for rack, amount in allocations
-                ])
-            records = (RackStockAllocation.objects.using(alias)
-                       .filter(stock_id=stock.pk).select_related("rack").order_by("rack__rack_code"))
-            rows = [{"rack_code": item.rack.rack_code, "rack_name": item.rack.rack_name,
-                     "quantity": item.quantity} for item in records]
+                RackStockAllocation.objects.using(alias).filter(
+                    stock_id=stock.pk
+                ).delete()
+                RackStockAllocation.objects.using(alias).bulk_create(
+                    [
+                        RackStockAllocation(
+                            stock_id=stock.pk, rack_id=rack.pk, quantity=amount
+                        )
+                        for rack, amount in allocations
+                    ]
+                )
+            records = (
+                RackStockAllocation.objects.using(alias)
+                .filter(stock_id=stock.pk)
+                .select_related("rack")
+                .order_by("rack__rack_code")
+            )
+            rows = [
+                {
+                    "rack_code": item.rack.rack_code,
+                    "rack_name": item.rack.rack_name,
+                    "quantity": item.quantity,
+                }
+                for item in records
+            ]
             assigned = sum(row["quantity"] for row in rows)
-            return Response({"branch_code": branch_code, "sku": stock.product.sku,
-                             "stock_id": stock.pk, "physical_quantity": stock.current_stock,
-                             "allocated_quantity": assigned,
-                             "unallocated_quantity": stock.current_stock - assigned,
-                             "allocations": rows})
+            return Response(
+                {
+                    "branch_code": branch_code,
+                    "sku": stock.product.sku,
+                    "stock_id": stock.pk,
+                    "physical_quantity": stock.current_stock,
+                    "allocated_quantity": assigned,
+                    "unallocated_quantity": stock.current_stock - assigned,
+                    "allocations": rows,
+                }
+            )
+
+
+class ConsolidatedProductReadSerializer(TenantProductSerializer):
+    """Read tenant rows without using write-only branch field validation.
+
+    Keep TenantProductSerializer's tenant-aware representation methods, but
+    do not call its get_fields() override that requires a physical branch
+    in the incoming request (the request here selects Consolidated).
+    """
+
+    def get_fields(self):
+        return ProductSerializer.get_fields(self)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        alias = instance._state.db
+        source_id = self.context.get("source_branch_id") or instance.branch_id
+        variants = list(
+            ProductVariant.objects.using(alias)
+            .filter(product_id=instance.pk)
+            .order_by("pk")
+        )
+        data["variants"] = ProductVariantSerializer(
+            variants,
+            many=True,
+            context={
+                "request": self.context.get("request"),
+                "source_branch_id": source_id,
+            },
+        ).data
+        stocks = list(
+            ProductStock.objects.using(alias)
+            .filter(product_id=instance.pk, branch_id=source_id)
+            .order_by("pk")
+        )
+        # Older products may have opening stock but no base variant row.
+        # Display their real stock balance without manufacturing a price.
+        if not variants and not instance.has_variants and stocks:
+            data["variants"] = [
+                {
+                    "id": None,
+                    "attributes": {},
+                    "racks": [],
+                    "is_base": True,
+                    "is_active": True,
+                    "purchase_price": None,
+                    "retail_price": None,
+                    "wholesale_price": None,
+                    "minimum_selling_price": None,
+                    "current_stock": sum(s.current_stock for s in stocks),
+                    "reserved_stock": sum(s.reserved_stock for s in stocks),
+                    "available_stock": sum(
+                        max(0, s.current_stock - s.reserved_stock) for s in stocks
+                    ),
+                }
+            ]
+        data["stocks"] = [
+            {
+                "id": stock.pk,
+                "variant": stock.variant_id,
+                "variant_id": stock.variant_id,
+                "current_stock": stock.current_stock,
+                "reserved_stock": stock.reserved_stock,
+                "damaged_stock": stock.damaged_stock,
+                "available_stock": max(0, stock.current_stock - stock.reserved_stock),
+                "average_unit_cost": str(stock.average_unit_cost),
+                "last_purchase_cost": str(stock.last_purchase_cost),
+            }
+            for stock in stocks
+        ]
+        data["total_available_qty"] = sum(
+            max(0, s.current_stock - s.reserved_stock) for s in stocks
+        )
+        return data
 
 
 class ProductViewSet(ModelViewSet):
@@ -219,7 +540,7 @@ class ProductViewSet(ModelViewSet):
             "stocks",
         )
     )
-    serializer_class = ProductSerializer
+    serializer_class = TenantProductSerializer
     search_fields = [
         "product_name",
         "sku",
@@ -234,32 +555,179 @@ class ProductViewSet(ModelViewSet):
         "is_active",
     ]
 
+    def list(self, request, *args, **kwargs):
+        branch, alias = _inventory_request_scope(request)
+        if branch is not None and alias is None:
+            from apps.branch_data.schema_routing import register_branch_connection
+
+            rows = []
+            search = (request.query_params.get("search") or "").strip()
+            brand = request.query_params.get("brand")
+            category = request.query_params.get("category")
+            for physical in (
+                Branch.objects.using("default")
+                .filter(is_active=True, tax_mode__in=["VAT", "NON_VAT"])
+                .order_by("pk")
+            ):
+                tenant = register_branch_connection(physical.pk, physical.tax_mode)
+                qs = (
+                    Product.objects.using(tenant)
+                    .filter(branch_id=physical.pk, is_deleted=False)
+                    .select_related("brand", "category", "rack", "supplier", "branch")
+                    .prefetch_related("variants__racks", "stocks")
+                )
+                if search:
+                    qs = qs.filter(
+                        Q(product_name__icontains=search)
+                        | Q(sku__icontains=search)
+                        | Q(barcode__icontains=search)
+                    )
+                if brand:
+                    qs = qs.filter(brand_id=brand)
+                if category:
+                    qs = qs.filter(category_id=category)
+                for product in qs.order_by("pk"):
+                    record = ConsolidatedProductReadSerializer(
+                        product,
+                        context={"request": request, "source_branch_id": physical.pk},
+                    ).data
+                    record["source_branch_id"] = physical.pk
+                    record["source_branch_name"] = physical.branch_name
+                    record["branch_name"] = physical.branch_name
+                    record["branch_code"] = physical.branch_code
+                    record["resource_key"] = f"{physical.pk}:{product.pk}"
+                    rows.append(record)
+            rows.sort(
+                key=lambda item: (
+                    str(item.get("product_name") or "").casefold(),
+                    item["source_branch_id"],
+                    item["id"],
+                )
+            )
+            try:
+                page = max(1, int(request.query_params.get("page", 1)))
+                page_size = min(
+                    1000, max(1, int(request.query_params.get("page_size", 12)))
+                )
+            except (TypeError, ValueError):
+                raise ValidationError({"page": "Invalid pagination parameters."})
+            start = (page - 1) * page_size
+            return Response(
+                {
+                    "count": len(rows),
+                    "next": None,
+                    "previous": None,
+                    "results": rows[start : start + page_size],
+                }
+            )
+        return super().list(request, *args, **kwargs)
+
+    def retrieve(self, request, *args, **kwargs):
+        """Read a product from its physical tenant, including consolidated links.
+
+        The frontend should pass ?branch=<source branch id>. For old links
+        without that parameter, an ID is resolved only if it is unambiguous.
+        """
+        from rest_framework.exceptions import NotFound
+        from apps.branch_data.schema_routing import register_branch_connection
+
+        product_pk = kwargs.get(self.lookup_url_kwarg or self.lookup_field)
+        raw_source = request.query_params.get("branch")
+        if raw_source in (None, ""):
+            # Old bookmarks and stale frontend builds may omit source branch.
+            # When a physical branch is active, prefer its tenant.
+            active_branch, active_alias = _inventory_request_scope(request)
+            if active_alias is not None:
+                sources = [active_branch]
+            else:
+                sources = list(
+                    Branch.objects.using("default")
+                    .filter(is_active=True, tax_mode__in=("VAT", "NON_VAT"))
+                    .order_by("pk")
+                )
+        else:
+            try:
+                sources = [
+                    Branch.objects.using("default").get(
+                        pk=int(raw_source),
+                        is_active=True,
+                        tax_mode__in=("VAT", "NON_VAT"),
+                    )
+                ]
+            except (TypeError, ValueError, Branch.DoesNotExist):
+                raise ValidationError(
+                    {"branch": "Select a valid physical source branch."}
+                )
+
+        matches = []
+        for source in sources:
+            tenant = register_branch_connection(source.pk, source.tax_mode)
+            product = (
+                Product.objects.using(tenant)
+                .filter(pk=product_pk, branch_id=source.pk, is_deleted=False)
+                .select_related("brand", "category", "rack", "supplier", "branch")
+                .prefetch_related("variants__racks", "stocks")
+                .first()
+            )
+            if product is not None:
+                matches.append((source, product))
+                if len(matches) > 1:
+                    raise ValidationError(
+                        {
+                            "branch": "This product ID exists in multiple branches. "
+                            "Open it from Consolidated Products so its source branch is included."
+                        }
+                    )
+        if not matches:
+            raise NotFound("Product not found in the selected physical branch.")
+
+        source, product = matches[0]
+        self.check_object_permissions(request, product)
+        data = ConsolidatedProductReadSerializer(
+            product, context={"request": request, "source_branch_id": source.pk}
+        ).data
+        data["source_branch_id"] = source.pk
+        data["source_branch_name"] = source.branch_name
+        data["branch_name"] = source.branch_name
+        data["branch_code"] = source.branch_code
+        data["resource_key"] = f"{source.pk}:{product.pk}"
+        return Response(data)
+
     def get_queryset(self):
         queryset = super().get_queryset()
+        selected_branch, selected_alias = _inventory_request_scope(self.request)
+        if selected_alias:
+            queryset = queryset.using(selected_alias).filter(
+                branch_id=selected_branch.pk
+            )
+        else:
+            # A consolidated branch must not accidentally read legacy public
+            # product tables.  Its combined listing needs a separate endpoint.
+            return queryset.none()
         branch_id = self.request.query_params.get("branch")
         rack_id = self.request.query_params.get("rack")
 
         if branch_id:
             try:
-                requested_branch = Branch.objects.get(pk=branch_id)
+                requested_branch = Branch.objects.using("default").get(pk=branch_id)
             except (Branch.DoesNotExist, TypeError, ValueError):
                 return queryset.none()
 
-            if requested_branch.branch_code == "BR03":
-                # BR03 is virtual. Products created for either physical branch
-                # must remain visible from the combined branch.
-                queryset = queryset.filter(
-                    branch__branch_code__in=["BR01", "BR02"]
-                ).distinct()
-            else:
+            if requested_branch.tax_mode in {"VAT", "NON_VAT"}:
                 queryset = queryset.filter(branch_id=requested_branch.id).distinct()
+            else:
+                return (
+                    queryset.none()
+                )  # Combined view requires dedicated aggregation endpoint.
 
         if rack_id:
             queryset = queryset.filter(variants__racks_id=rack_id).distinct()
 
-        return queryset
+        return queryset.order_by("product_name", "pk")
 
     def perform_destroy(self, obj):
+        if not (obj._state.db or "").startswith("tenant_"):
+            raise ValidationError({"branch": "A physical source branch is required."})
         reason = (
             self.request.data.get("deletion_reason")
             or self.request.data.get("reason")
@@ -342,23 +810,35 @@ class StockViewSet(ReadOnlyModelViewSet):
                 "variant",
                 "branch",
             )
-            .prefetch_related("product__variants")
+            .prefetch_related("product__variants").filter(product__is_active=True, product__is_deleted=False)
             .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
         )
 
     def get_queryset(self):
-        """Return stock from the database that physically owns the branch."""
-        branch_id = self.request.query_params.get("branch") if self.request else None
-        if branch_id:
-            branch = Branch.objects.filter(pk=branch_id).first()
-            if branch and branch.branch_code != "BR03":
-                return self._base_queryset(database_alias_for_branch(branch.id))
-        return self._base_queryset()
+        branch, alias = _inventory_request_scope(self.request)
+        if alias:
+            return self._base_queryset(alias).filter(branch_id=branch.pk)
+        # Consolidated aggregation is done in list(), not with a queryset
+        # against default/public or the legacy VAT schemas.
+        return self._base_queryset("default").none()
 
     def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
+        branch, alias = _inventory_request_scope(request)
+        if alias:
+            queryset = self._base_queryset(alias).filter(branch_id=branch.pk)
+        else:
+            from apps.branch_data.schema_routing import register_branch_connection
 
-        branch_id = request.query_params.get("branch")
+            queryset = []
+            for physical in Branch.objects.using("default").filter(
+                is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+            ):
+                tenant = register_branch_connection(physical.pk, physical.tax_mode)
+                queryset.extend(
+                    list(self._base_queryset(tenant).filter(branch_id=physical.pk))
+                )
+
+        branch_id = str(branch.pk) if alias else None
         product_id = request.query_params.get("product")
         category_id = request.query_params.get("category")
         search = request.query_params.get(
@@ -369,41 +849,33 @@ class StockViewSet(ReadOnlyModelViewSet):
         max_price = request.query_params.get("max_price")
         ordering = request.query_params.get("ordering", "product_name")
 
-        requested_branch = Branch.objects.filter(pk=branch_id).first() if branch_id else None
-        if requested_branch and requested_branch.branch_code == "BR03":
-            physical_branches = list(
-                Branch.objects.filter(branch_code__in=["BR01", "BR02"], is_active=True)
-            )
-            combined_rows = []
-            for physical_branch in physical_branches:
-                using = database_alias_for_branch(physical_branch.id)
-                combined_rows.extend(
-                    list(
-                        self._base_queryset(using).filter(
-                            branch_id=physical_branch.id
-                        )
-                    )
-                )
-            queryset = combined_rows
-            branch_id = None
-
         if branch_id:
             queryset = queryset.filter(branch_id=branch_id)
         if isinstance(queryset, list):
             if product_id:
-                queryset = [row for row in queryset if str(row.product_id) == str(product_id)]
+                queryset = [
+                    row for row in queryset if str(row.product_id) == str(product_id)
+                ]
             if category_id:
-                queryset = [row for row in queryset if str(row.product.category_id) == str(category_id)]
+                queryset = [
+                    row
+                    for row in queryset
+                    if str(row.product.category_id) == str(category_id)
+                ]
             if search:
                 term = search.lower()
                 queryset = [
-                    row for row in queryset
-                    if term in " ".join([
-                        row.product.product_name or "",
-                        row.product.sku or "",
-                        row.branch.branch_name or "",
-                        row.branch.branch_code or "",
-                    ]).lower()
+                    row
+                    for row in queryset
+                    if term
+                    in " ".join(
+                        [
+                            row.product.product_name or "",
+                            row.product.sku or "",
+                            row.branch.branch_name or "",
+                            row.branch.branch_code or "",
+                        ]
+                    ).lower()
                 ]
         else:
             if product_id:
@@ -420,7 +892,7 @@ class StockViewSet(ReadOnlyModelViewSet):
 
         groups = {}
         for stock in queryset:
-            key = (stock.product_id, stock.variant_id)
+            key = (stock.branch_id, stock.product_id, stock.variant_id)
             if stock.variant_id:
                 retail_price = stock.variant.retail_price
             else:
@@ -555,21 +1027,9 @@ class StockViewSet(ReadOnlyModelViewSet):
             message="Stock overview fetched successfully.",
         )
 
-    @action(
-        detail=False,
-        methods=["get"],
-        url_path="low-stock",
-    )
+    @action(detail=False, methods=["get"], url_path="low-stock")
     def low_stock(self, request):
-        queryset = self.get_queryset()
-        items = [stock for stock in queryset if stock.available_stock < 10]
-
-        return ok(
-            ProductStockSerializer(
-                items,
-                many=True,
-            ).data
-        )
+        return low_stock_products(request)
 
     @action(
         detail=False,
@@ -595,52 +1055,40 @@ class StockViewSet(ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            product = Product.objects.get(
-                pk=product_id,
-                is_deleted=False,
+        branch, tenant = _inventory_request_scope(request, require_physical=True)
+        if str(branch.id) != str(branch_id):
+            raise ValidationError(
+                {"branch": "Branch selection does not match request."}
             )
-        except Product.DoesNotExist:
+        product = (
+            Product.objects.using(tenant)
+            .filter(pk=product_id, branch_id=branch.id, is_deleted=False)
+            .first()
+        )
+        if product is None:
             return Response(
-                {"product": ["Selected product was not found."]},
-                status=status.HTTP_404_NOT_FOUND,
+                {"product": ["Selected product was not found."]}, status=404
             )
-
         variant = None
-
         if product.has_variants:
             if not variant_id:
-                return Response(
-                    {"variant": ["Select an attribute for this product."]},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            try:
-                variant = ProductVariant.objects.get(
-                    pk=variant_id,
-                    product=product,
-                    is_active=True,
-                )
-            except ProductVariant.DoesNotExist:
-                return Response(
-                    {
-                        "variant": [
-                            "Selected attribute does not belong " "to this product."
-                        ]
-                    },
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-
-        stock = (
-            ProductStock.objects.select_related(
-                "product",
-                "variant",
-                "branch",
+                return Response({"variant": ["Select a variant."]}, status=400)
+            variant = (
+                ProductVariant.objects.using(tenant)
+                .filter(pk=variant_id, product_id=product.id, is_active=True)
+                .first()
             )
+            if variant is None:
+                return Response(
+                    {"variant": ["Variant does not belong to this product."]},
+                    status=404,
+                )
+        stock = (
+            ProductStock.objects.using(tenant)
             .filter(
-                branch_id=branch_id,
-                product=product,
-                variant=variant,
+                branch_id=branch.id,
+                product_id=product.id,
+                variant_id=(variant.id if variant else None),
             )
             .first()
         )
@@ -890,10 +1338,9 @@ class StockAdjustmentViewSet(ModelViewSet):
         # because variant is nullable. PostgreSQL represents that relation
         # with an OUTER JOIN and raises:
         # "FOR UPDATE cannot be applied to the nullable side of an outer join".
-        adjustment_db = (
-            getattr(getattr(serializer.instance, "_state", None), "db", None)
-            or database_alias_for_branch(serializer.instance.branch_id)
-        )
+        adjustment_db = getattr(
+            getattr(serializer.instance, "_state", None), "db", None
+        ) or database_alias_for_branch(serializer.instance.branch_id)
         with transaction.atomic(using=adjustment_db):
             adjustment = (
                 StockAdjustment.objects.using(adjustment_db)
@@ -1068,25 +1515,44 @@ class StockAdjustmentViewSet(ModelViewSet):
 
 @api_view(["GET"])
 def low_stock_products(request):
-    queryset = ProductStock.objects.select_related(
-        "product",
-        "variant",
-        "branch",
-        "product__brand",
-        "product__category",
-    ).filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+    from apps.branch_data.schema_routing import register_branch_connection
 
-    branch_id = request.query_params.get("branch")
-
-    if branch_id:
-        queryset = queryset.filter(branch_id=branch_id)
-
-    items = [stock for stock in queryset if stock.available_stock < 10]
-
-    return ok(
-        ProductStockSerializer(
-            items,
-            many=True,
-        ).data,
-        message=("Low stock products fetched " "successfully."),
+    branch, alias = _inventory_request_scope(request)
+    physical = (
+        [branch]
+        if alias
+        else list(
+            Branch.objects.using("default").filter(
+                is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+            )
+        )
     )
+    rows = []
+    for physical_branch in physical:
+        tenant = register_branch_connection(
+            physical_branch.id, physical_branch.tax_mode
+        )
+        stock_items = (
+            ProductStock.objects.using(tenant)
+            .select_related(
+                "product", "variant", "branch", "product__brand", "product__category"
+            )
+            .filter(branch_id=physical_branch.id).filter(product__is_active=True, product__is_deleted=False)
+            .filter(Q(product__has_variants=False) | Q(variant__isnull=False))
+        )
+        for item in stock_items:
+            if item.available_stock < 10:
+                record = ProductStockSerializer(item, context={"request": request}).data
+                record["source_branch_id"] = physical_branch.pk
+                record["source_branch_name"] = physical_branch.branch_name
+                record["resource_key"] = f"{physical_branch.pk}:{item.pk}"
+                rows.append(record)
+    return ok(rows, message="Low stock products fetched successfully.")
+
+
+# GHZ_TENANT_ADJUSTMENTS_PATCH_V1
+# Keep create/list on the same physical tenant database. Other adjustment
+# actions are deliberately left on existing code until their write paths are audited.
+from .tenant_adjustments import create_tenant_adjustment, list_tenant_adjustments
+StockAdjustmentViewSet.create = create_tenant_adjustment
+StockAdjustmentViewSet.list = list_tenant_adjustments

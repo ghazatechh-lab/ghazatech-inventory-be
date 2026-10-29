@@ -4,9 +4,9 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
-from apps.inventory.models import ProductStock
+from apps.inventory.models import Product, ProductVariant, ProductStock
 from apps.inventory.services import resolve_unit_cost_excluding_vat
-from apps.branch_data.services import database_alias_for_branch
+from apps.branch_data.schema_routing import register_branch_connection
 from apps.branch_data.physical import request_active_branch, require_physical_branch, is_physical_branch
 from apps.common.tax import calculate_inventory_tax, quantize_money, quantize_unit
 
@@ -23,14 +23,11 @@ def is_admin_user(user):
 
 
 class ItemSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(
-        source="product.product_name",
-        read_only=True,
-    )
-    sku = serializers.CharField(
-        source="product.sku",
-        read_only=True,
-    )
+    # Numeric source-tenant IDs; never resolve through default.public foreign keys.
+    product = serializers.IntegerField(min_value=1)
+    variant = serializers.IntegerField(min_value=1, allow_null=True, required=False)
+    product_name = serializers.SerializerMethodField()
+    sku = serializers.SerializerMethodField()
     variant_label = serializers.SerializerMethodField()
 
     class Meta:
@@ -68,11 +65,40 @@ class ItemSerializer(serializers.ModelSerializer):
             "value_difference",
         ]
 
-    def get_variant_label(self, obj):
-        if not obj.variant_id:
-            return ""
+    def _source(self, obj):
+        branch = getattr(obj.transfer, "from_branch", None)
+        if branch is None:
+            return None, None
+        alias = register_branch_connection(branch.pk, branch.tax_mode)
+        return alias, branch
 
-        return str(obj.variant)
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result["product"] = instance.source_product_id or instance.product_id
+        result["variant"] = instance.source_variant_id or instance.variant_id
+        return result
+
+    def get_product_name(self, obj):
+        alias, _ = self._source(obj)
+        if not alias:
+            return ""
+        return Product.objects.using(alias).filter(pk=obj.source_product_id or obj.product_id).values_list("product_name", flat=True).first() or ""
+
+    def get_sku(self, obj):
+        alias, _ = self._source(obj)
+        if not alias:
+            return ""
+        return Product.objects.using(alias).filter(pk=obj.source_product_id or obj.product_id).values_list("sku", flat=True).first() or ""
+
+    def get_variant_label(self, obj):
+        pk = obj.source_variant_id or obj.variant_id
+        if not pk:
+            return ""
+        alias, _ = self._source(obj)
+        if not alias:
+            return ""
+        variant = ProductVariant.objects.using(alias).filter(pk=pk).first()
+        return str(variant.attributes) if variant else ""
 
 
 class TransferSerializer(serializers.ModelSerializer):
@@ -204,7 +230,16 @@ class TransferSerializer(serializers.ModelSerializer):
         item_errors = []
         seen_products = set()
         for item in items:
-            product = item.get("product")
+            stock_db = register_branch_connection(from_branch.pk, from_branch.tax_mode)
+            product_id = item.get("product")
+            product = Product.objects.using(stock_db).filter(
+                pk=product_id, branch_id=from_branch.pk,
+                is_active=True, is_deleted=False,
+            ).first()
+            if product is None:
+                item_errors.append(f"Product ID {product_id} is not an active product in {from_branch.branch_name}.")
+                continue
+            item["_source_product"] = product
             quantity = int(item.get("requested_quantity") or 0)
             if not product or not from_branch:
                 continue
@@ -215,7 +250,16 @@ class TransferSerializer(serializers.ModelSerializer):
                 )
                 continue
 
-            variant = item.get("variant")
+            variant_id = item.get("variant")
+            variant = None
+            if variant_id:
+                variant = ProductVariant.objects.using(stock_db).filter(
+                    pk=variant_id, product_id=product.pk, is_active=True
+                ).first()
+                if variant is None:
+                    item_errors.append(f"{product.sku}: variant does not belong to the source product.")
+                    continue
+            item["_source_variant"] = variant
             duplicate_key = (
                 product.id,
                 variant.id if variant else None,
@@ -238,12 +282,12 @@ class TransferSerializer(serializers.ModelSerializer):
                 )
                 continue
 
-            stock_db = database_alias_for_branch(from_branch)
+            stock_variant_id = variant.pk if variant and not variant.is_base else None
             stock_rows = list(
                 ProductStock.objects.using(stock_db).filter(
                     product_id=product.id,
                     branch_id=from_branch.id,
-                    variant_id=(variant.id if variant else None),
+                    variant_id=stock_variant_id,
                 )
             )
             available = sum(int(row.available_stock or 0) for row in stock_rows)
@@ -298,8 +342,8 @@ class TransferSerializer(serializers.ModelSerializer):
         transfer_value = Decimal("0.00")
 
         for item_data in items:
-            product = item_data["product"]
-            variant = item_data.get("variant")
+            product = item_data["_source_product"]
+            variant = item_data.get("_source_variant")
             classification = (
                 str(
                     item_data.get(
@@ -311,12 +355,13 @@ class TransferSerializer(serializers.ModelSerializer):
             )
             quantity = int(item_data["requested_quantity"])
 
-            stock_db = database_alias_for_branch(transfer.from_branch)
+            stock_db = register_branch_connection(transfer.from_branch_id, transfer.from_branch.tax_mode)
+            stock_variant_id = variant.pk if variant and not variant.is_base else None
             stock_rows = list(
                 ProductStock.objects.using(stock_db).filter(
                     product_id=product.id,
                     branch_id=transfer.from_branch_id,
-                    variant_id=(variant.id if variant else None),
+                    variant_id=stock_variant_id,
                 )
             )
 
@@ -356,8 +401,12 @@ class TransferSerializer(serializers.ModelSerializer):
 
             StockTransferItem.objects.create(
                 transfer=transfer,
-                product=product,
-                variant=variant,
+                # Transfer ledger uses the shared DB, with stable source-tenant
+                # identity rather than an invalid cross-database FK.
+                product=None,
+                variant=None,
+                source_product_id=product.pk,
+                source_variant_id=(variant.pk if variant else None),
                 requested_quantity=quantity,
                 remarks=str(item_data.get("remarks", "") or "").strip(),
                 transfer_unit_cost=unit_cost,
@@ -400,9 +449,6 @@ class TransferSerializer(serializers.ModelSerializer):
                 "requested_by",
                 "approved_by",
             )
-            .prefetch_related(
-                "items__product",
-                "items__variant",
-            )
+.prefetch_related("items")
             .get(pk=transfer.pk)
         )
