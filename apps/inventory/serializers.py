@@ -409,7 +409,7 @@ class ProductSerializer(serializers.ModelSerializer):
             # Stock is physically stored in the branch databases. In an
             # unscoped request, aggregate both physical branches.
             target_branches = list(
-                Branch.objects.filter(branch_code__in=["BR01", "BR02"])
+                Branch.objects.filter(branch_code__in=["BR01", "BR02", "CONSOLIDATED"])
             )
         else:
             requested_branch = Branch.objects.filter(pk=branch_id).first()
@@ -418,7 +418,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
             if requested_branch.branch_code == "BR03":
                 target_branches = list(
-                    Branch.objects.filter(branch_code__in=["BR01", "BR02"])
+                    Branch.objects.filter(branch_code__in=["BR01", "BR02", "CONSOLIDATED"])
                 )
             else:
                 target_branches = [requested_branch]
@@ -1354,9 +1354,11 @@ class TenantProductSerializer(ProductSerializer):
             raise serializers.ValidationError(
                 {"branch": "Select a valid physical branch."}
             )
+        if branch.branch_code == "CONSOLIDATED" and branch.branch_type == "PHYSICAL":
+            return branch, "default"
         if branch.tax_mode not in {"VAT", "NON_VAT"}:
             raise serializers.ValidationError(
-                {"branch": "Choose Sharjah, Dubai or another physical branch."}
+                {"branch": "Choose a valid physical branch."}
             )
         from apps.branch_data.schema_routing import register_branch_connection
 

@@ -12,6 +12,7 @@ NON_VAT_ALIAS = "non_vat"
 BR01 = "BR01"
 BR02 = "BR02"
 BR03 = "BR03"
+CONSOLIDATED = "CONSOLIDATED"
 
 SOURCE_TO_ALIAS = {
     VAT: VAT_ALIAS,
@@ -27,6 +28,7 @@ BRANCH_TO_SOURCE = {
     BR01: VAT,
     BR02: NON_VAT,
     BR03: COMBINED,
+    CONSOLIDATED: CONSOLIDATED,
 }
 
 
@@ -48,22 +50,32 @@ def normalize_branch_code(value):
 
 
 def normalize_source(value):
-    value = str(value or "").strip().upper().replace("-", "_")
+    """Normalize aliases without changing actual physical branch codes."""
+    raw = str(value or "").strip().upper()
+
     aliases = {
         "VAT_BRANCH": VAT,
+        "VAT-BRANCH": VAT,
         "BR01": VAT,
         "NONVAT": NON_VAT,
+        "NON-VAT": NON_VAT,
         "NON_VAT_BRANCH": NON_VAT,
+        "NON-VAT-BRANCH": NON_VAT,
         "BR02": NON_VAT,
     }
-    return aliases.get(value, value)
+
+    return aliases.get(raw, raw)
+
 
 
 def _physical_from_source(source):
     from apps.branches.models import Branch
     from django.db.models import Q
     source = normalize_source(source)
-    qs = Branch.objects.using("default").filter(is_active=True, tax_mode__in=(VAT, NON_VAT))
+    qs = Branch.objects.using("default").filter(is_active=True)
+    if source == CONSOLIDATED:
+        return qs.filter(branch_code__iexact=CONSOLIDATED).first()
+    qs = qs.filter(tax_mode__in=(VAT, NON_VAT))
     if source.isdigit():
         return qs.filter(pk=int(source)).first()
     branch = qs.filter(branch_code__iexact=source).first()
@@ -84,6 +96,8 @@ def source_for_active_branch(active_branch):
     branch = (Branch.objects.using("default").filter(pk=int(code)).first()
               if code.isdigit() else Branch.objects.using("default").filter(branch_code__iexact=code).first())
     if branch and branch.is_active:
+        if branch.branch_code.upper() == CONSOLIDATED:
+            return CONSOLIDATED
         if branch.tax_mode in {VAT, NON_VAT}:
             return branch.branch_code.upper()
         if branch.branch_type == "MASTER":

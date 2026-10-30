@@ -103,6 +103,9 @@ def database_alias_for_branch(branch_or_id):
     # rollout. Outside that request scope, preserve legacy behavior unchanged.
     from .supplier_scope import supplier_tenant_scope_active
     if branch_id is not None and supplier_tenant_scope_active():
+        Branch = apps.get_model("branches", "Branch")
+        if Branch.objects.using("default").filter(pk=branch_id, branch_code__iexact="CONSOLIDATED", is_active=True).exists():
+            return MASTER_ALIAS
         from .schema_routing import register_branch_connection
         Branch = apps.get_model("branches", "Branch")
         branch = Branch.objects.using("default").filter(pk=branch_id, is_active=True).first()

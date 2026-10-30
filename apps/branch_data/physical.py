@@ -4,10 +4,18 @@ from apps.branches.models import Branch
 
 PHYSICAL_BRANCH_CODES = {"BR01", "BR02"}  # legacy canonical codes
 COMBINED_BRANCH_CODE = "BR03"
+CONSOLIDATED_BRANCH_CODE = "CONSOLIDATED"
 
 
 def is_physical_branch(branch):
-    return bool(branch and str(getattr(branch, "branch_code", "")).upper() != COMBINED_BRANCH_CODE and getattr(branch, "tax_mode", None) in {"VAT", "NON_VAT"} and getattr(branch, "is_active", False))
+    """Only active VAT/NON_VAT tenant branches own business data."""
+    return bool(
+        branch
+        and getattr(branch, "is_active", False)
+        and getattr(branch, "tax_mode", None) in {"VAT", "NON_VAT"}
+        and str(getattr(branch, "branch_code", "")).upper()
+            not in {"BR03", "CONSOLIDATED"}
+    )
 
 
 def require_physical_branch(branch, *, field="branch", message=None):

@@ -78,6 +78,12 @@ def _inventory_request_scope(request, *, require_physical=False):
         branch = Branch.objects.using("default").get(pk=int(raw), is_active=True)
     except (Branch.DoesNotExist, ValueError, TypeError):
         raise ValidationError({"branch": "Invalid or inactive branch."})
+    if branch.branch_code == "CONSOLIDATED":
+        if require_physical:
+            raise ValidationError({
+                "branch": "Select a VAT or NON-VAT physical branch."
+            })
+        return branch, None
     if branch.tax_mode not in {"VAT", "NON_VAT"}:
         if require_physical:
             raise ValidationError(
@@ -164,7 +170,7 @@ class TenantCatalogMixin:
     def perform_update(self, serializer):
         obj = serializer.instance
         alias = serializer.instance._state.db
-        if not alias or not alias.startswith("tenant_"):
+        if alias != "default" and (not alias or not alias.startswith("tenant_")):
             raise ValidationError(
                 {"branch": "This record must be edited in its source tenant."}
             )
@@ -175,7 +181,7 @@ class TenantCatalogMixin:
 
     def perform_destroy(self, instance):
         alias = instance._state.db
-        if not alias or not alias.startswith("tenant_"):
+        if alias != "default" and (not alias or not alias.startswith("tenant_")):
             raise ValidationError({"branch": "Source branch is required for deletion."})
         instance.delete(using=alias)
 
@@ -303,7 +309,7 @@ class RackViewSet(ModelViewSet):
 
     def perform_destroy(self, instance):
         alias = instance._state.db
-        if not alias or not alias.startswith("tenant_"):
+        if alias != "default" and (not alias or not alias.startswith("tenant_")):
             raise ValidationError({"branch": "Source branch is required for deletion."})
         instance.delete(using=alias)
 

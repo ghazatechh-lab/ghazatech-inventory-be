@@ -21,8 +21,10 @@ def _physical_branch(raw):
         branch = Branch.objects.using('default').get(pk=int(raw), is_active=True)
     except (ValueError, TypeError, Branch.DoesNotExist):
         raise ValidationError({'branch': ['Select an active physical branch.']})
+    if branch.branch_code == 'CONSOLIDATED' and branch.branch_type == 'PHYSICAL':
+        return branch, 'default'
     if branch.tax_mode not in ('VAT', 'NON_VAT'):
-        raise ValidationError({'branch': ['Select Sharjah or Dubai, not Consolidated, to adjust stock.']})
+        raise ValidationError({'branch': ['Select a valid physical branch.']})
     return branch, register_branch_connection(branch.pk, branch.tax_mode)
 
 

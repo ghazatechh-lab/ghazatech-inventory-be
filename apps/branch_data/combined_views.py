@@ -44,9 +44,19 @@ def physical_sources():
 
 
 def _is_virtual(branch):
-    if branch is None:
-        return False
-    return not branch.tax_mode and (branch.branch_type == "MASTER" or branch.branch_code.upper() == "CONSOLIDATED")
+    """The consolidated master aggregates physical tenant branches."""
+    return bool(
+        branch
+        and getattr(branch, "is_active", False)
+        and (
+            str(getattr(branch, "branch_code", "")).upper()
+                in {"BR03", "CONSOLIDATED"}
+            or (
+                getattr(branch, "branch_type", None) == "MASTER"
+                and not getattr(branch, "tax_mode", None)
+            )
+        )
+    )
 
 
 def requested_branch(request):
@@ -147,17 +157,19 @@ class CombinedPhysicalBranchListMixin:
 
         source_filter = str(
             self.request.query_params.get("source_branch") or "ALL"
-        ).upper().replace("-", "_")
+        ).upper()
         if source_filter not in {"ALL", "VAT", "NON_VAT"} and source_filter not in physical_branches():
             raise ValidationError({"source_branch": "Use ALL, VAT, NON_VAT, or a physical branch code."})
 
         branches = physical_branches()
         result = []
         for source, alias, code in physical_sources():
-            if source_filter not in {"ALL", source, code, branches[code].tax_mode}:
-                continue
             branch = branches.get(code)
-            if not branch:
+            if branch is None:
+                continue
+            if branch.tax_mode not in {"VAT", "NON_VAT"}:
+                continue
+            if source_filter not in {"ALL", source, code, branch.tax_mode}:
                 continue
             qs = self._base_combined_queryset(alias, branch.id)
             qs = self._apply_combined_filters(qs)
@@ -176,7 +188,7 @@ class CombinedPhysicalBranchListMixin:
             # and NON_VAT sources.
             return super().list(request, *args, **kwargs)
 
-        source_filter = str(request.query_params.get("source_branch") or "ALL").upper().replace("-", "_")
+        source_filter = str(request.query_params.get("source_branch") or "ALL").upper()
         
         if source_filter not in {"ALL", "VAT", "NON_VAT"} and source_filter not in physical_branches():
             raise ValidationError({"source_branch": "Use ALL, VAT, NON_VAT, or a physical branch code."})
@@ -184,10 +196,12 @@ class CombinedPhysicalBranchListMixin:
         branches = physical_branches()
         rows = []
         for source, alias, code in physical_sources():
-            if source_filter not in {"ALL", source, code, branches[code].tax_mode}:
-                continue
             branch = branches.get(code)
-            if not branch:
+            if branch is None:
+                continue
+            if branch.tax_mode not in {"VAT", "NON_VAT"}:
+                continue
+            if source_filter not in {"ALL", source, code, branch.tax_mode}:
                 continue
             qs = self._base_combined_queryset(alias, branch.id)
             qs = self._apply_combined_filters(qs)
@@ -219,16 +233,39 @@ class CombinedPhysicalBranchListMixin:
         })
 
     def _combined_object_source(self):
-        raw_pk = str(self.kwargs.get(self.lookup_url_kwarg or self.lookup_field, ""))
-        source = str(self.request.query_params.get("source_branch") or "").upper().replace("-", "_")
-        record_id = raw_pk
+        """Resolve a tenant record using its actual physical branch code."""
+        from apps.branch_data.routing import parse_resource_key
+
+        lookup = self.lookup_url_kwarg or self.lookup_field
+        raw_pk = str(self.kwargs.get(lookup, "")).strip()
+
         if ":" in raw_pk:
-            source, record_id = raw_pk.split(":", 1)
-            source = source.upper().replace("-", "_")
-        if source not in physical_branches():
+            source, record_id = parse_resource_key(raw_pk)
+        else:
+            source = str(
+                self.request.query_params.get("source_branch") or ""
+            ).strip().upper()
+            record_id = raw_pk
+
+        branches = physical_branches()
+
+        if source not in branches:
             raise ValidationError({
-                "source_branch": "Combined details require resource_key (BRANCH_CODE:id) or source_branch."
+                "source_branch": (
+                    "Select an active physical branch or provide "
+                    "a composite resource key (BRANCH_CODE:id)."
+                )
             })
+
+        try:
+            record_id = int(record_id)
+            if record_id <= 0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise ValidationError({
+                "id": "Invalid supplier record ID."
+            })
+
         return source, record_id
 
     def get_object(self):

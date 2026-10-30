@@ -8,7 +8,7 @@ from apps.branch_data.context import set_active_branch_id
 from apps.branch_data.permissions import user_can_source
 from apps.common.three_branch import ensure_branch_access
 
-PHYSICAL_BRANCH_CODES = {"BR01", "BR02"}
+PHYSICAL_BRANCH_CODES = {"BR01", "BR02", "CONSOLIDATED"}
 COMBINED_BRANCH_CODE = "BR03"
 
 
@@ -59,6 +59,8 @@ def branch_from_source_value(value):
         "BR02": "BR02",
         "BRANCH_2": "BR02",
     }.get(text)
+    if text == "CONSOLIDATED":
+        code = "CONSOLIDATED"
     if not code:
         return None
     return Branch.objects.using("default").filter(
@@ -69,6 +71,8 @@ def branch_from_source_value(value):
 
 def sale_mode_for_branch(branch):
     code = str(getattr(branch, "branch_code", "") or "").upper()
+    if code == "CONSOLIDATED":
+        return ""
     if code == "BR01":
         return "VAT"
     if code == "BR02":
@@ -142,7 +146,7 @@ class SalesPhysicalBranchGuardMixin:
                 data._mutable = True
             data["branch"] = branch.pk
             data["target_branch"] = branch.branch_code
-            if include_sale_mode:
+            if include_sale_mode and sale_mode_for_branch(branch):
                 data["sale_mode"] = sale_mode_for_branch(branch)
             if old_mutable is not None:
                 data._mutable = old_mutable

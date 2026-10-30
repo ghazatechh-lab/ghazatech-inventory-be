@@ -72,6 +72,8 @@ def _sources(request):
     active = active_interface_branch(request)
     if not active:
         return []
+    if str(active.branch_code or "").upper() == "CONSOLIDATED":
+        return [("default", active, "CONSOLIDATED")]
     code = str(active.branch_code or "").upper()
     rows = _physical_rows()
     if code in PHYSICAL:
