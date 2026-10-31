@@ -8,6 +8,7 @@ from django.db.models import F, Q
 
 
 class Brand(TimeStampedModel):
+    image = models.ImageField(upload_to="catalog/brands/", null=True, blank=True)
     name = models.CharField(max_length=100, unique=True)
     is_active = models.BooleanField(default=True)
 
@@ -16,6 +17,7 @@ class Brand(TimeStampedModel):
 
 
 class Category(TimeStampedModel):
+    image = models.ImageField(upload_to="catalog/categories/", null=True, blank=True)
     name = models.CharField(max_length=120, unique=True)
     is_active = models.BooleanField(default=True)
 
