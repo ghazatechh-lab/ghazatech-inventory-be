@@ -6,3 +6,4 @@ venv/
 media/
 staticfiles/
 .pytest_cache/
+celerybeat-schedule*
