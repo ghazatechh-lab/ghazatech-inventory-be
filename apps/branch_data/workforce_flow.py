@@ -45,7 +45,17 @@ def is_physical(branch):
 
 
 def is_combined(branch):
-    return bool(branch and branch.is_active and not branch.tax_mode and branch.branch_type == "MASTER")
+    # CONSOLIDATED is a virtual workspace even if historical metadata
+    # identifies its branch_type as PHYSICAL.
+    return bool(
+        branch
+        and branch.is_active
+        and not branch.tax_mode
+        and (
+            branch.branch_type == "MASTER"
+            or str(branch.branch_code).upper() in {"CONSOLIDATED", "BR03"}
+        )
+    )
 
 
 def physical_branches():

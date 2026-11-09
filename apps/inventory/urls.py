@@ -1,4 +1,5 @@
 from django.urls import path
+from .stock_aging_api import stock_aging_report
 from rest_framework.routers import DefaultRouter
 
 from .views import (
@@ -24,6 +25,7 @@ router.register("inventory/movements", StockMovementViewSet, basename="movement"
 router.register("inventory/adjustments", StockAdjustmentViewSet, basename="adjustment")
 
 urlpatterns = [
-    path("inventory/low-stock/", low_stock_products, name="inventory-low-stock")
+    path("inventory/low-stock/", low_stock_products, name="inventory-low-stock"),
+    path("inventory/stock-aging/", stock_aging_report, name="inventory-stock-aging")
 ]
 urlpatterns += router.urls
