@@ -64,58 +64,72 @@ def _resolve_sales_branch(branch_value):
 
 
 def _sales_product_options(branch_id, user=None):
-    """Return sellable product/variant options for one branch using single stock."""
+    """GHZ_POS_INVOICE_PRODUCTS_V2: Active branch products, including zero-stock items.
+
+    Zero available stock is displayed but cannot be sold: POS / invoice validation
+    must continue rejecting quantities greater than actual availability.
+    """
     branch = _resolve_sales_branch(branch_id)
-    if not branch:
+    if not branch or getattr(branch, "tax_mode", None) not in {"VAT", "NON_VAT"}:
         return []
 
-    using = database_alias_for_branch(branch.id)
-    stocks = (
-        ProductStock.objects.using(using).select_related("product", "variant", "branch")
-        .filter(branch_id=branch.id, product__is_active=True)
-        .order_by("product__product_name", "variant_id")
+    # Physical branch inventory resides in its tenant schema, not public tables.
+    from apps.branch_data.schema_routing import register_branch_connection
+    from apps.inventory.models import ProductVariant
+
+    using = register_branch_connection(branch.id, branch.tax_mode)
+    products = Product.objects.using(using).filter(
+        branch_id=branch.id, is_active=True,
+    ).order_by("product_name", "id")
+    if any(f.name == "is_deleted" for f in Product._meta.get_fields()):
+        products = products.filter(is_deleted=False)
+
+    variants = ProductVariant.objects.using(using).filter(
+        product_id__in=products.values_list("id", flat=True), is_active=True,
+    ).order_by("product_id", "id")
+    variants_by_product = {}
+    for variant in variants:
+        variants_by_product.setdefault(variant.product_id, []).append(variant)
+
+    stocks = ProductStock.objects.using(using).filter(
+        branch_id=branch.id,
+        product_id__in=products.values_list("id", flat=True),
     )
-
-    rows = []
+    stock_by_key = {}
     for stock in stocks:
-        product = stock.product
-        if getattr(product, "is_deleted", False):
-            continue
-
-        available = max(0, int(getattr(stock, "available_stock", 0) or 0))
-        if available <= 0:
-            continue
-
-        variant = stock.variant
-        price_variant = variant
-        if price_variant is None:
-            price_variant = product.variants.filter(
-                is_base=True, is_active=True
-            ).first()
-        if price_variant is None:
-            price_variant = (
-                product.variants.filter(is_active=True).order_by("id").first()
-            )
-
-        price = getattr(price_variant, "retail_price", None)
-        if price in (None, 0):
-            price = getattr(product, "selling_price", 0) or 0
-
-        vat_rate = (
-            getattr(product, "vat_rate", None)
-            or getattr(product, "vat_percentage", None)
-            or 0
+        key = (stock.product_id, stock.variant_id)
+        total, reserved = stock_by_key.get(key, (0, 0))
+        stock_by_key[key] = (
+            total + int(stock.current_stock or 0),
+            reserved + int(stock.reserved_stock or 0) + int(getattr(stock, "damaged_stock", 0) or 0),
         )
 
-        rows.append(
-            {
-                "option_key": f"{product.id}:{stock.variant_id or ''}",
-                "stock_id": stock.id,
+    rows = []
+    for product in products:
+        product_variants = variants_by_product.get(product.id, [])
+        # A product without variants has one sellable base choice.
+        selections = product_variants if product_variants else [None]
+        for variant in selections:
+            variant_id = variant.id if variant else None
+            current, unavailable = stock_by_key.get((product.id, variant_id), (0, 0))
+            # Some older products put their base stock in the null-variant row.
+            if variant and variant.is_base and (product.id, variant_id) not in stock_by_key:
+                current, unavailable = stock_by_key.get((product.id, None), (0, 0))
+            available = max(0, current - unavailable)
+            price_variant = variant or next((v for v in product_variants if v.is_base), None)
+            price = getattr(price_variant, "retail_price", None)
+            if price is None:
+                price = getattr(product, "selling_price", 0) or 0
+            vat_rate = getattr(product, "vat_rate", None)
+            if vat_rate is None:
+                vat_rate = getattr(product, "vat_percentage", 0) or 0
+            rows.append({
+                "option_key": f"{product.id}:{variant_id or ''}",
                 "branch_id": branch.id,
                 "branch_code": branch.branch_code,
                 "id": product.id,
                 "product_id": product.id,
-                "variant_id": stock.variant_id,
+                "variant_id": variant_id,
                 "product_name": product.product_name,
                 "name": product.product_name,
                 "sku": getattr(product, "sku", ""),
@@ -125,17 +139,15 @@ def _sales_product_options(branch_id, user=None):
                 "retail_price": price,
                 "unit_price": price,
                 "price": price,
-                "current_stock": int(stock.current_stock or 0),
-                "reserved_stock": int(stock.reserved_stock or 0),
+                "current_stock": current,
+                "reserved_stock": unavailable,
                 "available_stock": available,
-                "variant_name": str(variant) if variant else "",
+                "variant_name": str(variant) if variant and not variant.is_base else "",
                 "vat_percentage": vat_rate,
                 "vat_rate": vat_rate,
                 "tax_treatment": getattr(product, "tax_treatment", "VAT") or "VAT",
                 "vat_inclusive": bool(getattr(product, "vat_inclusive", False)),
-            }
-        )
-
+            })
     return rows
 
 
