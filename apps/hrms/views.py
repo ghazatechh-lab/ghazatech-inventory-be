@@ -2023,31 +2023,163 @@ class PayrollEntryViewSet(BaseViewSet):
 
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
-        """Only permit deletion of unfinalized payroll without recoveries."""
+        """Delete payroll with transactional reversal of identifiable HR recoveries.
+
+        Source branch is resolved by get_object() / WorkforceBranchScopeMixin,
+        including source_branch in the Consolidated workspace.
+        Never guess how an advance was allocated to a payroll: historical
+        partial-advance deductions lack per-entry allocation records.
+        """
+        import logging
+        from collections import defaultdict
+
         if not request.user.has_perm("hrms.delete_payrollentry"):
             return Response(
                 {"detail": "You do not have permission to delete payroll entries."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        entry = self.get_object()
-        entry = PayrollEntry.objects.select_for_update().get(pk=entry.pk)
-        if str(entry.status).upper() not in ("PENDING", "PROCESSING", "FAILED", "CANCELLED"):
+
+        entry_id = self.get_object().pk  # Enforce branch scope, including Consolidated.
+        entry = PayrollEntry.objects.select_for_update().get(pk=entry_id)
+        amount = lambda value: Decimal(str(value or 0)).quantize(MONEY)
+
+        # No allocation ledger exists for *partial* advance recoveries. Even
+        # entries linked by deducted_payroll_entry may be only the final portion.
+        # Never silently restore the wrong amount or delete an accounting trail.
+        if amount(entry.advance_deduction) != 0 or entry.deducted_salary_advances.exists():
             return Response(
-                {"detail": "Paid or finalized payroll cannot be deleted."},
+                {"detail": (
+                    "This payroll includes advance recovery that cannot be safely "
+                    "reversed from the current records. Restore/reconcile the "
+                    "advance allocation before deleting this payroll."
+                )},
                 status=status.HTTP_409_CONFLICT,
             )
-        if entry.paid_at or entry.loan_repayments.exists() or entry.deducted_salary_advances.exists():
+
+        repayments = list(
+            EmployeeLoanRepayment.objects.select_for_update()
+            .filter(payroll_entry=entry)
+            .order_by("pk")
+        )
+        actual_recovered = sum((amount(item.amount) for item in repayments), Decimal("0.00"))
+        planned_recovered = amount(entry.loan_deduction)
+        mismatch = planned_recovered != actual_recovered
+        # A legacy payroll may carry a loan deduction without a corresponding
+        # repayment ledger entry. In that case we cannot infer a loan balance
+        # adjustment. Only an explicitly acknowledged SUPERUSER override may
+        # delete the payroll without reversing that unrecorded portion.
+        override = request.query_params.get("unreconciled_override") == "CONFIRM_UNTRACKED_LOAN"
+        # Pending payroll has no settled loan recovery to undo. Its planned
+        # deduction is a preview, so zero repayment records is expected.
+        unsettled_preview = (
+            entry.status in {"PENDING", "PROCESSING", "FAILED", "CANCELLED"}
+            and actual_recovered == Decimal("0.00")
+        )
+        if mismatch and not unsettled_preview and not (override and request.user.is_superuser):
             return Response(
-                {"detail": "Payroll with payments, loans, or advance recoveries cannot be deleted."},
+                {
+                    "code": "UNRECONCILED_LOAN_RECOVERY",
+                    "detail": (
+                        "Payroll loan deduction differs from recorded loan repayments. "
+                        "The unrecorded portion cannot be safely reversed automatically. "
+                        "A super administrator may delete the payroll with an explicit "
+                        "acknowledgement; the unrecorded portion will NOT be added "
+                        "back to the employee's loan balance. Reconcile the loan separately."
+                    ),
+                    "payroll_loan_deduction": str(planned_recovered),
+                    "recorded_repayments": str(actual_recovered),
+                    "unreconciled_difference": str(planned_recovered - actual_recovered),
+                    "override_available": bool(request.user.is_superuser),
+                },
                 status=status.HTTP_409_CONFLICT,
             )
-        # Do not delete payroll entries containing deductions with financial implications.
-        if Decimal(entry.loan_deduction or 0) != 0 or Decimal(entry.advance_deduction or 0) != 0:
-            return Response(
-                {"detail": "Payroll with loan or advance deductions cannot be deleted."},
-                status=status.HTTP_409_CONFLICT,
+
+        repayment_totals = defaultdict(lambda: Decimal("0.00"))
+        for repayment in repayments:
+            repayment_totals[repayment.loan_id] += amount(repayment.amount)
+
+        if repayment_totals:
+            loans = {
+                loan.pk: loan for loan in EmployeeLoan.objects.select_for_update()
+                .filter(pk__in=list(repayment_totals))
+            }
+            if len(loans) != len(repayment_totals):
+                return Response(
+                    {"detail": "A related employee loan could not be found."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            for loan_id, restored in repayment_totals.items():
+                loan = loans[loan_id]
+                if loan.status == "CANCELLED":
+                    return Response(
+                        {"detail": "A related loan is cancelled and requires manual reconciliation."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                new_balance = amount(loan.remaining_balance) + restored
+                if new_balance > amount(loan.amount):
+                    return Response(
+                        {"detail": "Loan reversal would exceed the original loan amount."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+        # Remove explicit PROTECT relations before deleting the entry.
+        # The surrounding transaction rolls back all changes on failure.
+        for loan_id, restored in repayment_totals.items():
+            loan = loans[loan_id]
+            loan.remaining_balance = amount(loan.remaining_balance) + restored
+            loan.status = "ACTIVE" if loan.remaining_balance > 0 else "COMPLETED"
+            loan.save(update_fields=["remaining_balance", "status", "updated_at"])
+
+        if repayments:
+            EmployeeLoanRepayment.objects.filter(pk__in=[r.pk for r in repayments]).delete()
+
+        run = None
+        if entry.payroll_run_id:
+            run = PayrollRun.objects.select_for_update().get(pk=entry.payroll_run_id)
+
+        audit = {
+            "id": entry.pk,
+            "period": entry.period,
+            "employee_id": entry.employee_id,
+            "branch_id": entry.branch_id,
+            "status": entry.status,
+            "loan_reversed": str(actual_recovered),
+            "unreconciled_loan_difference": str(planned_recovered - actual_recovered),
+            "unreconciled_override": bool(mismatch and override and not unsettled_preview),
+            "actor_id": request.user.pk,
+        }
+        if mismatch and override and not unsettled_preview:
+            logging.getLogger("django.security").warning(
+                "SUPERUSER PAYROLL DELETE with unreconciled loan deduction: %s", audit
             )
         entry.delete()
+
+        if run is not None:
+            remaining = PayrollEntry.objects.filter(payroll_run=run)
+            if not remaining.exists():
+                run.delete()
+            else:
+                totals = remaining.aggregate(
+                    gross=Sum("gross_salary"),
+                    regular=Sum("deductions"),
+                    advance=Sum("advance_deduction"),
+                    loan=Sum("loan_deduction"),
+                    net=Sum("net_salary"),
+                )
+                run.total_gross = totals["gross"] or Decimal("0.00")
+                run.total_advance_deduction = totals["advance"] or Decimal("0.00")
+                run.total_deductions = totals["regular"] or Decimal("0.00")
+                run.total_net = totals["net"] or Decimal("0.00")
+                statuses = set(remaining.values_list("status", flat=True))
+                run.status = "COMPLETED" if statuses == {"PAID"} else "PROCESSING"
+                run.save(update_fields=[
+                    "total_gross", "total_advance_deduction", "total_deductions",
+                    "total_net", "status", "updated_at",
+                ])
+
+        logging.getLogger("apps.hrms.payroll").warning(
+            "Payroll deletion after HR recovery reversal: %s", audit
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @transaction.atomic
