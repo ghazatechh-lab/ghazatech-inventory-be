@@ -567,6 +567,8 @@ class ProductViewSet(ModelViewSet):
             search = (request.query_params.get("search") or "").strip()
             brand = request.query_params.get("brand")
             category = request.query_params.get("category")
+            brand_name = (request.query_params.get("brand_name") or "").strip()
+            category_name = (request.query_params.get("category_name") or "").strip()
 
             def scoped_filter(raw_value, field_name):
                 if not raw_value:
@@ -602,6 +604,10 @@ class ProductViewSet(ModelViewSet):
                         | Q(sku__icontains=search)
                         | Q(barcode__icontains=search)
                     )
+                if brand_name:
+                    qs = qs.filter(brand__name__iexact=brand_name)
+                if category_name:
+                    qs = qs.filter(category__name__iexact=category_name)
                 if brand_filter:
                     source_id, record_id = brand_filter
                     if source_id is not None and source_id != physical.pk:
@@ -732,6 +738,12 @@ class ProductViewSet(ModelViewSet):
             return queryset.none()
         branch_id = self.request.query_params.get("branch")
         rack_id = self.request.query_params.get("rack")
+        brand_name = (self.request.query_params.get("brand_name") or "").strip()
+        category_name = (self.request.query_params.get("category_name") or "").strip()
+        if brand_name:
+            queryset = queryset.filter(brand__name__iexact=brand_name)
+        if category_name:
+            queryset = queryset.filter(category__name__iexact=category_name)
 
         if branch_id:
             try:
