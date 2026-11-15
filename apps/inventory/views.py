@@ -114,7 +114,7 @@ class TenantCatalogMixin:
             try:
                 page = max(1, int(request.query_params.get("page", 1)))
                 page_size = min(
-                    100, max(1, int(request.query_params.get("page_size", 12)))
+                    1000, max(1, int(request.query_params.get("page_size", 12)))
                 )
             except (TypeError, ValueError):
                 raise ValidationError({"page": "Invalid pagination parameters."})
@@ -567,6 +567,23 @@ class ProductViewSet(ModelViewSet):
             search = (request.query_params.get("search") or "").strip()
             brand = request.query_params.get("brand")
             category = request.query_params.get("category")
+
+            def scoped_filter(raw_value, field_name):
+                if not raw_value:
+                    return None
+                parts = str(raw_value).split(":")
+                if len(parts) == 2:
+                    try:
+                        return (int(parts[0]), int(parts[1]))
+                    except (TypeError, ValueError):
+                        raise ValidationError({field_name: "Invalid branch-scoped filter."})
+                try:
+                    return (None, int(raw_value))
+                except (TypeError, ValueError):
+                    raise ValidationError({field_name: "Invalid filter value."})
+
+            brand_filter = scoped_filter(brand, "brand")
+            category_filter = scoped_filter(category, "category")
             for physical in (
                 Branch.objects.using("default")
                 .filter(is_active=True, tax_mode__in=["VAT", "NON_VAT"])
@@ -585,10 +602,16 @@ class ProductViewSet(ModelViewSet):
                         | Q(sku__icontains=search)
                         | Q(barcode__icontains=search)
                     )
-                if brand:
-                    qs = qs.filter(brand_id=brand)
-                if category:
-                    qs = qs.filter(category_id=category)
+                if brand_filter:
+                    source_id, record_id = brand_filter
+                    if source_id is not None and source_id != physical.pk:
+                        continue
+                    qs = qs.filter(brand_id=record_id)
+                if category_filter:
+                    source_id, record_id = category_filter
+                    if source_id is not None and source_id != physical.pk:
+                        continue
+                    qs = qs.filter(category_id=record_id)
                 for product in qs.order_by("pk"):
                     record = ConsolidatedProductReadSerializer(
                         product,
