@@ -27,6 +27,7 @@ from .models import (
     ProductStock,
     ProductVariant,
     Rack,
+    RackStockAllocation,
     StockAdjustment,
     StockMovement,
 )
@@ -223,6 +224,17 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             .filter(productvariant_id=obj.pk)
             .values_list("rack_id", flat=True)
         )
+        # Allocations are authoritative; old products may have a rack balance
+        # without a Product.rack or ProductVariant.racks link.
+        from .models import RackStockAllocation
+        stock_variant_id = obj.pk if not obj.is_base else None
+        allocation_ids = RackStockAllocation.objects.using(alias).filter(
+            stock__product_id=obj.product_id,
+            stock__branch_id=Product.objects.using(alias).filter(pk=obj.product_id).values_list("branch_id", flat=True).first(),
+            stock__variant_id=stock_variant_id,
+            quantity__gt=0,
+        ).values_list("rack_id", flat=True)
+        rack_ids = set(rack_ids) | set(allocation_ids)
         return [
             {
                 "id": rack.id,
@@ -1483,6 +1495,15 @@ class TenantProductSerializer(ProductSerializer):
         )
 
     def get_rack_code(self, obj):
+        allocated_codes = list(
+            RackStockAllocation.objects.using(obj._state.db)
+            .filter(stock__product_id=obj.pk, stock__branch_id=obj.branch_id, quantity__gt=0)
+            .order_by("rack__rack_code")
+            .values_list("rack__rack_code", flat=True)
+            .distinct()
+        )
+        if allocated_codes:
+            return ", ".join(allocated_codes)
         codes = list(
             Rack.objects.using(obj._state.db)
             .filter(product_variants__product_id=obj.pk)
@@ -1510,7 +1531,7 @@ class TenantProductSerializer(ProductSerializer):
         for row in supplied:
             row = dict(row)
             racks = row.pop("racks", [])
-            rack_quantities = row.pop("rack_quantities", {})
+            rack_quantities = row.pop("rack_quantities", None)
             qty = row.pop("initial_stock", None)
             variant_id = row.pop("id", None)
             row.pop("available_qty", None)
@@ -1540,6 +1561,48 @@ class TenantProductSerializer(ProductSerializer):
                 variant = ProductVariant.objects.using(alias).create(
                     product_id=obj.pk, **row
                 )
+            # Rack quantity edits are absolute location allocations, not receipts.
+            # Keep them in the product edit's tenant transaction.
+            stock_variant_id = variant.pk if obj.has_variants else None
+            stock, _ = ProductStock.objects.using(alias).get_or_create(
+                product_id=obj.pk, branch_id=obj.branch_id,
+                variant_id=stock_variant_id, warehouse="",
+                defaults={"current_stock": 0, "reorder_level": obj.reorder_level},
+            )
+            if not initial and rack_quantities is not None:
+                from .models import RackStockAllocation
+                if not isinstance(rack_quantities, dict):
+                    raise serializers.ValidationError({"rack_quantities": "Provide rack quantities as a mapping."})
+                try:
+                    incoming = {int(k): int(v) for k, v in rack_quantities.items()}
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({"rack_quantities": "Use whole-number rack quantities."})
+                selected = {r.pk for r in racks}
+                if set(incoming) != selected or any(q < 0 for q in incoming.values()):
+                    raise serializers.ValidationError({"rack_quantities": "Quantities must be supplied for each selected rack."})
+                valid_racks = set(Rack.objects.using(alias).filter(
+                    pk__in=selected, branch_id=obj.branch_id, is_active=True
+                ).values_list("pk", flat=True))
+                if valid_racks != selected:
+                    raise serializers.ValidationError({"racks": "Select only active racks from this physical branch."})
+                # Include all warehouse rows so allocations can never exceed the
+                # physical quantity, even when older data uses multiple warehouses.
+                all_stocks = list(ProductStock.objects.using(alias).select_for_update().filter(
+                    product_id=obj.pk, branch_id=obj.branch_id, variant_id=stock_variant_id
+                ).order_by("pk"))
+                physical = sum(int(row.current_stock) for row in all_stocks)
+                if sum(incoming.values()) > physical:
+                    raise serializers.ValidationError({"rack_quantities": f"Only {physical} physical units exist; rack quantities cannot create stock."})
+                # Single warehouse is the current product-form workflow. Do not
+                # silently redistribute balances across multiple warehouses.
+                if len(all_stocks) != 1:
+                    raise serializers.ValidationError({"rack_quantities": "Multiple warehouse stock rows need warehouse-specific allocation."})
+                stock = all_stocks[0]
+                RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk).delete()
+                RackStockAllocation.objects.using(alias).bulk_create([
+                    RackStockAllocation(stock_id=stock.pk, rack_id=rack_id, quantity=q)
+                    for rack_id, q in incoming.items() if q > 0
+                ])
             # Explicitly write the M2M through rows into the same tenant schema.
             # The relationship manager can otherwise route to a legacy alias
             # (vat/public or non_vat/public), causing FK failures on COMMIT.
@@ -1601,6 +1664,11 @@ class TenantProductSerializer(ProductSerializer):
                     raise serializers.ValidationError({'rack_quantities': 'Rack quantities must be whole numbers.'})
                 if len(rack_ids) == 1 and not allocation:
                     allocation = {next(iter(rack_ids)): int(qty)}
+                eligible_ids = set(Rack.objects.using(alias).filter(
+                    pk__in=rack_ids, branch_id=obj.branch_id, is_active=True
+                ).values_list("pk", flat=True))
+                if eligible_ids != rack_ids:
+                    raise serializers.ValidationError({'racks': 'Select active racks in this physical branch.'})
                 if any(value < 0 for value in allocation.values()) or set(allocation) != rack_ids or sum(allocation.values()) != int(qty):
                     raise serializers.ValidationError({'rack_quantities': 'Assign the entire initial quantity across the selected racks.'})
                 RackStockAllocation.objects.using(alias).bulk_create([

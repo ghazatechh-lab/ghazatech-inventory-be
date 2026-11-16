@@ -624,6 +624,41 @@ class ConsolidatedProductReadSerializer(TenantProductSerializer):
                     ),
                 }
             ]
+        # RackStockAllocation is the authoritative source of rack-wise balances.
+        # Product.rack and ProductVariant.racks are location links, not quantities.
+        # The edit form requires this mapping to hydrate the saved rack quantities.
+        stock_variant_ids = {stock.pk: stock.variant_id for stock in stocks}
+        allocation_rows = list(
+            RackStockAllocation.objects.using(alias)
+            .filter(stock_id__in=stock_variant_ids, rack__branch_id=source_id)
+            .select_related("rack")
+            .order_by("rack__rack_code", "pk")
+        )
+        allocation_map = {}
+        for allocation in allocation_rows:
+            key = str(stock_variant_ids[allocation.stock_id] or "base")
+            rack_values = allocation_map.setdefault(key, {})
+            rack_id = str(allocation.rack_id)
+            rack_values[rack_id] = rack_values.get(rack_id, 0) + int(allocation.quantity)
+        data["rack_allocations_by_variant"] = allocation_map
+        data["rack_allocations"] = [
+            {
+                "stock_id": allocation.stock_id,
+                "variant_id": stock_variant_ids[allocation.stock_id],
+                "rack_id": allocation.rack_id,
+                "rack_code": allocation.rack.rack_code,
+                "rack_name": allocation.rack.rack_name,
+                "quantity": int(allocation.quantity),
+            }
+            for allocation in allocation_rows
+        ]
+        # Include explicit stock/rack totals for the details page, without
+        # modifying physical inventory or producing movements.
+        data["allocated_quantity"] = sum(int(a.quantity) for a in allocation_rows)
+        data["physical_quantity"] = sum(int(stock.current_stock) for stock in stocks)
+        data["unallocated_quantity"] = data["physical_quantity"] - data["allocated_quantity"]
+        if allocation_rows:
+            data["rack_code"] = ", ".join(sorted({a.rack.rack_code for a in allocation_rows}))
         data["stocks"] = [
             {
                 "id": stock.pk,
