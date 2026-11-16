@@ -4,7 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
 
-from apps.inventory.models import Product, ProductVariant, ProductStock
+from apps.inventory.models import Product, ProductVariant, ProductStock, Rack, RackStockAllocation
 from apps.inventory.services import resolve_unit_cost_excluding_vat
 from apps.branch_data.schema_routing import register_branch_connection
 from apps.branch_data.physical import request_active_branch, require_physical_branch, is_physical_branch
@@ -26,6 +26,10 @@ class ItemSerializer(serializers.ModelSerializer):
     # Numeric source-tenant IDs; never resolve through default.public foreign keys.
     product = serializers.IntegerField(min_value=1)
     variant = serializers.IntegerField(min_value=1, allow_null=True, required=False)
+    source_rack_id = serializers.IntegerField(min_value=1, required=True)
+    destination_rack_id = serializers.IntegerField(read_only=True)
+    source_rack_code = serializers.SerializerMethodField()
+    destination_rack_code = serializers.SerializerMethodField()
     product_name = serializers.SerializerMethodField()
     sku = serializers.SerializerMethodField()
     variant_label = serializers.SerializerMethodField()
@@ -39,6 +43,10 @@ class ItemSerializer(serializers.ModelSerializer):
             "sku",
             "variant",
             "variant_label",
+            "source_rack_id",
+            "destination_rack_id",
+            "source_rack_code",
+            "destination_rack_code",
             "requested_quantity",
             "dispatched_quantity",
             "received_quantity",
@@ -77,6 +85,16 @@ class ItemSerializer(serializers.ModelSerializer):
         result["product"] = instance.source_product_id or instance.product_id
         result["variant"] = instance.source_variant_id or instance.variant_id
         return result
+
+    def get_source_rack_code(self, obj):
+        alias, _ = self._source(obj)
+        if not alias or not obj.source_rack_id: return ""
+        return Rack.objects.using(alias).filter(pk=obj.source_rack_id).values_list('rack_code', flat=True).first() or ""
+
+    def get_destination_rack_code(self, obj):
+        if not obj.destination_rack_id: return ""
+        alias = register_branch_connection(obj.transfer.to_branch_id, obj.transfer.to_branch.tax_mode)
+        return Rack.objects.using(alias).filter(pk=obj.destination_rack_id).values_list('rack_code', flat=True).first() or ""
 
     def get_product_name(self, obj):
         alias, _ = self._source(obj)
@@ -263,13 +281,14 @@ class TransferSerializer(serializers.ModelSerializer):
             duplicate_key = (
                 product.id,
                 variant.id if variant else None,
+                item.get("source_rack_id"),
             )
 
             if duplicate_key in seen_products:
                 item_errors.append(
                     (
                         f"{product.sku}: this product and "
-                        "attribute combination was added more than once."
+                        "rack combination was added more than once."
                     )
                 )
                 continue
@@ -282,6 +301,13 @@ class TransferSerializer(serializers.ModelSerializer):
                 )
                 continue
 
+            rack_id = item.get('source_rack_id')
+            rack = Rack.objects.using(stock_db).filter(
+                pk=rack_id, branch_id=from_branch.pk, is_active=True
+            ).first()
+            if rack is None:
+                item_errors.append(f'{product.sku}: select a valid source rack.')
+                continue
             stock_variant_id = variant.pk if variant and not variant.is_base else None
             stock_rows = list(
                 ProductStock.objects.using(stock_db).filter(
@@ -291,6 +317,14 @@ class TransferSerializer(serializers.ModelSerializer):
                 )
             )
             available = sum(int(row.available_stock or 0) for row in stock_rows)
+            rack_available = sum(
+                int(allocation.quantity or 0)
+                for allocation in RackStockAllocation.objects.using(stock_db).filter(
+                    rack_id=rack_id, stock_id__in=[s.pk for s in stock_rows]
+                )
+            )
+            if quantity > rack_available:
+                item_errors.append(f'{product.sku}: rack {rack.rack_code} has {rack_available} allocated units; requested {quantity}.')
             if available <= 0:
                 item_errors.append(
                     f"{product.sku}: no available stock in {from_branch.branch_code}."
@@ -407,6 +441,7 @@ class TransferSerializer(serializers.ModelSerializer):
                 variant=None,
                 source_product_id=product.pk,
                 source_variant_id=(variant.pk if variant else None),
+                source_rack_id=item_data["source_rack_id"],
                 requested_quantity=quantity,
                 remarks=str(item_data.get("remarks", "") or "").strip(),
                 transfer_unit_cost=unit_cost,

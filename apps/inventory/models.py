@@ -508,6 +508,7 @@ class StockAdjustment(TimeStampedModel, BranchAwareModel):
         ("REJECTED", "Rejected"),
     ]
 
+    rack_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
     adjustment_number = models.CharField(
         max_length=50,
         unique=True,

@@ -155,6 +155,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
     # Used only while creating or editing a product. The value initializes the
     # ProductStock row for the selected branch and is not stored separately on
     # ProductVariant.
+    rack_quantities = serializers.JSONField(write_only=True, required=False)
     initial_stock = serializers.IntegerField(
         write_only=True,
         required=False,
@@ -183,6 +184,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "rack_details",
             "display_name",
             "initial_stock",
+            "rack_quantities",
             "available_qty",
             "current_stock",
             "reserved_stock",
@@ -1168,6 +1170,7 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "adjustment_number",
+            "rack_id",
             "branch",
             "branch_name",
             "branch_code",
@@ -1204,6 +1207,7 @@ class StockAdjustmentSerializer(serializers.ModelSerializer):
             "updated_by",
         ]
         read_only_fields = [
+            "rack_id",
             "adjustment_number",
             "branch_name",
             "branch_code",
@@ -1506,6 +1510,7 @@ class TenantProductSerializer(ProductSerializer):
         for row in supplied:
             row = dict(row)
             racks = row.pop("racks", [])
+            rack_quantities = row.pop("rack_quantities", {})
             qty = row.pop("initial_stock", None)
             variant_id = row.pop("id", None)
             row.pop("available_qty", None)
@@ -1548,6 +1553,15 @@ class TenantProductSerializer(ProductSerializer):
             removed = linked - desired_rack_ids
             added = desired_rack_ids - linked
             if removed:
+                # Never orphan physical stock allocations by removing a rack
+                # from a variant that still holds units there.
+                from .models import RackStockAllocation
+                if RackStockAllocation.objects.using(alias).filter(
+                    stock__product_id=obj.pk, stock__branch_id=obj.branch_id,
+                    stock__variant_id=(variant.pk if obj.has_variants else None),
+                    rack_id__in=removed, quantity__gt=0,
+                ).exists():
+                    raise serializers.ValidationError({'racks': 'Cannot remove a rack that still contains stock. Reallocate the units before editing rack locations.'})
                 through.objects.using(alias).filter(
                     productvariant_id=variant.pk, rack_id__in=removed
                 ).delete()
@@ -1577,6 +1591,22 @@ class TenantProductSerializer(ProductSerializer):
                         }
                     )
                 self._create_opening_stock(obj, variant, stock, int(qty))
+                from .models import RackStockAllocation
+                rack_ids = {rack.pk for rack in racks}
+                if not isinstance(rack_quantities, dict):
+                    raise serializers.ValidationError({'rack_quantities': 'Provide rack quantities as a mapping.'})
+                try:
+                    allocation = {int(key): int(value) for key, value in rack_quantities.items()}
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({'rack_quantities': 'Rack quantities must be whole numbers.'})
+                if len(rack_ids) == 1 and not allocation:
+                    allocation = {next(iter(rack_ids)): int(qty)}
+                if any(value < 0 for value in allocation.values()) or set(allocation) != rack_ids or sum(allocation.values()) != int(qty):
+                    raise serializers.ValidationError({'rack_quantities': 'Assign the entire initial quantity across the selected racks.'})
+                RackStockAllocation.objects.using(alias).bulk_create([
+                    RackStockAllocation(stock_id=stock.pk, rack_id=rack_id, quantity=amount)
+                    for rack_id, amount in allocation.items() if amount
+                ])
         if not initial:
             omitted = (
                 ProductVariant.objects.using(alias)

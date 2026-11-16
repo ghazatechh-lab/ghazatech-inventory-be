@@ -85,6 +85,9 @@ class StockTransferItem(models.Model):
     )
     source_product_id = models.PositiveBigIntegerField(null=True, blank=True)
     source_variant_id = models.PositiveBigIntegerField(null=True, blank=True)
+    # Tenant rack IDs are numeric identities; never cross-database foreign keys.
+    source_rack_id = models.PositiveBigIntegerField(null=True, blank=True)
+    destination_rack_id = models.PositiveBigIntegerField(null=True, blank=True)
     requested_quantity = models.PositiveIntegerField()
     dispatched_quantity = models.PositiveIntegerField(default=0)
     received_quantity = models.PositiveIntegerField(default=0)

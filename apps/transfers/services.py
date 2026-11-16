@@ -13,7 +13,8 @@ from rest_framework import serializers
 
 from apps.branch_data.schema_routing import register_branch_connection
 from apps.inventory.models import (Brand, Category, Product, ProductVariant,
-                                   ProductStock, StockMovement)
+                                   ProductStock, StockMovement, Rack, RackStockAllocation)
+from apps.inventory.rack_ops import apply_rack_delta, rack_for_branch
 from .models import StockTransfer, StockTransferItem
 
 
@@ -46,7 +47,7 @@ def _stock_variant(variant):
 
 
 def _move(*, alias, branch_id, product, variant, quantity, movement_type,
-          warehouse, key, transfer_number, unit_cost, actor_id):
+          warehouse, key, transfer_number, unit_cost, actor_id, rack_id):
     """Lock and mutate one tenant stock row, with idempotent movement lookup.
 
     Called inside transaction.atomic(using=alias), under the default transfer
@@ -83,6 +84,7 @@ def _move(*, alias, branch_id, product, variant, quantity, movement_type,
         stock.last_tax_treatment = "NON_VAT"
         stock.last_vat_percentage = 0
         stock.valuation_updated_at = timezone.now()
+    apply_rack_delta(alias, stock, rack_id, quantity, new_total=after)
     stock.current_stock = after
     stock.last_stock_update = timezone.now()
     stock.save(using=alias)
@@ -192,7 +194,11 @@ def dispatch(t, u):
                 rows = list(ProductStock.objects.using(alias).filter(
                     branch_id=t.from_branch_id, product_id=source.pk,
                     variant_id=_stock_variant(variant)))
-                eligible = [s for s in rows if s.available_stock >= qty]
+                rack_for_branch(alias, t.from_branch_id, item.source_rack_id)
+                eligible = [s for s in rows if s.available_stock >= qty and
+                    RackStockAllocation.objects.using(alias).filter(
+                        stock_id=s.pk, rack_id=item.source_rack_id, quantity__gte=qty
+                    ).exists()]
                 if not eligible and not StockMovement.objects.using(alias).filter(
                     reference_type="Transfer", reference_id=_key(t,item,"out"),
                     movement_type="TRANSFER_OUT").exists():
@@ -204,7 +210,8 @@ def dispatch(t, u):
                     product=source, variant=variant, quantity=-qty,
                     movement_type="TRANSFER_OUT", warehouse=warehouse,
                     key=_key(t,item,"out"), transfer_number=t.transfer_number,
-                    unit_cost=item.transfer_unit_cost, actor_id=u.pk)
+                    unit_cost=item.transfer_unit_cost, actor_id=u.pk,
+                    rack_id=item.source_rack_id)
         for item in items:
             item.dispatched_quantity = int(item.dispatched_quantity or item.requested_quantity)
             item.save(using="default", update_fields=["dispatched_quantity"])
@@ -237,11 +244,15 @@ def receive(t, u):
                 source, variant = _ensure_source(t, item, src_alias)
                 dest = _destination_product(source, t.to_branch, dst_alias)
                 dest_variant = _destination_variant(variant, dest, dst_alias)
+                if not item.destination_rack_id:
+                    raise serializers.ValidationError({'rack': f'Select destination rack for {source.sku}.'})
+                rack_for_branch(dst_alias, t.to_branch_id, item.destination_rack_id)
                 _move(alias=dst_alias, branch_id=t.to_branch_id, product=dest,
                       variant=dest_variant, quantity=qty, movement_type="TRANSFER_IN",
                       warehouse="", key=_key(t,item,"in"),
                       transfer_number=t.transfer_number,
-                      unit_cost=item.transfer_unit_cost, actor_id=u.pk)
+                      unit_cost=item.transfer_unit_cost, actor_id=u.pk,
+                      rack_id=item.destination_rack_id)
         total = Decimal("0")
         for item in items:
             qty = int(item.dispatched_quantity or 0)

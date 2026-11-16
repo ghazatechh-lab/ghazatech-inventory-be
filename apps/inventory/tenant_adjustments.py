@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from apps.branches.models import Branch
 from apps.branch_data.schema_routing import register_branch_connection
 from .models import Product, ProductVariant, ProductStock, StockAdjustment, StockMovement
+from .rack_ops import apply_rack_delta, rack_for_branch
 
 
 def _physical_branch(raw):
@@ -21,8 +22,6 @@ def _physical_branch(raw):
         branch = Branch.objects.using('default').get(pk=int(raw), is_active=True)
     except (ValueError, TypeError, Branch.DoesNotExist):
         raise ValidationError({'branch': ['Select an active physical branch.']})
-    if branch.branch_code == 'CONSOLIDATED' and branch.branch_type == 'PHYSICAL':
-        return branch, 'default'
     if branch.tax_mode not in ('VAT', 'NON_VAT'):
         raise ValidationError({'branch': ['Select a valid physical branch.']})
     return branch, register_branch_connection(branch.pk, branch.tax_mode)
@@ -35,6 +34,7 @@ def _serialize_adjustment(obj, branch, *, product_name='', sku='', variant_label
         'branch_code': branch.branch_code, 'source_branch_id': branch.pk,
         'source_branch_name': branch.branch_name,
         'product': obj.product_id, 'product_name': product_name, 'sku': sku,
+        'rack_id': obj.rack_id,
         'variant': obj.variant_id, 'variant_label': variant_label,
         'adjustment_type': obj.adjustment_type, 'quantity': obj.quantity,
         'signed_quantity': (obj.quantity if obj.adjustment_type == 'ADD' else -obj.quantity),
@@ -80,6 +80,10 @@ def create_tenant_adjustment(self, request, *args, **kwargs):
     if len(reason) > 120:
         raise ValidationError({'reason': ['Reason cannot exceed 120 characters.']})
     remarks = str(payload.get('remarks') or '').strip()
+    try:
+        rack_id = int(payload.get('rack_id'))
+    except (TypeError, ValueError):
+        raise ValidationError({'rack_id': ['Select a rack for the stock adjustment.']})
 
     # No lookups use an implicit router, nor do we accept a stock-row ID as a product ID.
     with transaction.atomic(using=alias):
@@ -104,6 +108,7 @@ def create_tenant_adjustment(self, request, *args, **kwargs):
                       'reorder_level': product.reorder_level,
                       'last_stock_update': timezone.now()},
         )
+        rack_for_branch(alias, branch.pk, rack_id)
         before = int(stock.current_stock)
         signed = qty if action == 'ADD' else -qty
         after = before + signed
@@ -112,11 +117,14 @@ def create_tenant_adjustment(self, request, *args, **kwargs):
         if after < 0 or after < int(stock.reserved_stock):
             raise ValidationError({'quantity': ['Insufficient unreserved stock.']})
 
+        apply_rack_delta(alias, stock, rack_id, signed, new_total=after)
+
         # No new purchase cost is supplied by the Adjustment form: retain existing valuation.
         cost = Decimal(str(stock.average_unit_cost or 0))
         cost_excl = Decimal(str(stock.average_unit_cost_excluding_vat or 0))
         adjustment = StockAdjustment.objects.using(alias).create(
             adjustment_number='SA-' + uuid.uuid4().hex[:25].upper(),
+            rack_id=rack_id,
             branch_id=branch.pk, product_id=product.pk, variant_id=variant_id,
             adjustment_type=action, quantity=qty, reason=reason, remarks=remarks,
             current_quantity=before, actual_quantity_counted=after,

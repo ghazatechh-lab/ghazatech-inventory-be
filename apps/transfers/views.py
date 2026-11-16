@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.decorators import action
@@ -118,6 +118,95 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
 
         return queryset
 
+    @action(detail=False, methods=["get"], url_path="available-source-racks")
+    def available_source_racks(self, request):
+        """List only source-branch racks holding the selected product/variant.
+
+        Query: from_branch=<branch ID>&product=<tenant product ID>&variant=<optional ID>.
+        IDs are scoped to the source tenant, never the combined/default DB.
+        ``max_transferable_quantity`` reflects the dispatch rule that a single
+        warehouse stock row must fulfill the item.
+        """
+        from apps.branch_data.schema_routing import register_branch_connection
+        from apps.inventory.models import (
+            Product, ProductVariant, ProductStock, RackStockAllocation,
+        )
+
+        try:
+            branch_id = int(request.query_params.get("from_branch"))
+            product_id = int(request.query_params.get("product"))
+            raw_variant = request.query_params.get("variant")
+            variant_id = int(raw_variant) if raw_variant not in (None, "", "null") else None
+            if branch_id < 1 or product_id < 1 or (variant_id is not None and variant_id < 1):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise serializers.ValidationError({
+                "detail": "Valid from_branch and product IDs are required; variant is optional."
+            })
+
+        branch = Branch.objects.using("default").filter(
+            pk=branch_id, is_active=True, tax_mode__in=["VAT", "NON_VAT"]
+        ).first()
+        if not branch:
+            raise serializers.ValidationError({"from_branch": "Select an active physical source branch."})
+
+        active_branch = request_active_branch(request)
+        if active_branch and is_physical_branch(active_branch) and active_branch.pk != branch.pk:
+            raise PermissionDenied("Switch to the source branch to view its available racks.")
+
+        alias = register_branch_connection(branch.pk, branch.tax_mode)
+        product = Product.objects.using(alias).filter(
+            pk=product_id, branch_id=branch.pk, is_active=True, is_deleted=False
+        ).first()
+        if product is None:
+            raise serializers.ValidationError({"product": "Product is not available in the source branch."})
+
+        stock_variant_id = None
+        if variant_id is not None:
+            variant = ProductVariant.objects.using(alias).filter(
+                pk=variant_id, product_id=product.pk, is_active=True
+            ).first()
+            if variant is None:
+                raise serializers.ValidationError({"variant": "Variant does not belong to the selected product."})
+            if not variant.is_base:
+                stock_variant_id = variant.pk
+
+        stocks = list(ProductStock.objects.using(alias).filter(
+            branch_id=branch.pk, product_id=product.pk, variant_id=stock_variant_id
+        ))
+        if not stocks:
+            return ok([], message="No stock available in source racks.")
+
+        stock_by_id = {row.pk: row for row in stocks}
+        allocations = RackStockAllocation.objects.using(alias).filter(
+            stock_id__in=stock_by_id, quantity__gt=0,
+            rack__branch_id=branch.pk, rack__is_active=True,
+        ).select_related("rack")
+        racks = {}
+        for allocation in allocations:
+            stock = stock_by_id[allocation.stock_id]
+            # Dispatch only supports one stock/warehouse row per transfer item.
+            transferable = min(int(allocation.quantity), max(0, int(stock.available_stock)))
+            if transferable <= 0:
+                continue
+            rack = allocation.rack
+            entry = racks.setdefault(rack.pk, {
+                "id": rack.pk,
+                "rack_id": rack.pk,
+                "rack_code": rack.rack_code,
+                "rack_name": rack.rack_name,
+                "allocated_quantity": 0,
+                "available_quantity": 0,
+                "max_transferable_quantity": 0,
+            })
+            entry["allocated_quantity"] += int(allocation.quantity)
+            entry["available_quantity"] += transferable
+            entry["max_transferable_quantity"] = max(
+                entry["max_transferable_quantity"], transferable
+            )
+
+        return ok(sorted(racks.values(), key=lambda r: (r["rack_code"], r["id"])))
+
     def destroy(self, request, *args, **kwargs):
         if not is_admin_user(request.user):
             raise PermissionDenied("Only an Admin can delete stock transfers.")
@@ -173,7 +262,27 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
     @action(detail=True, methods=["post"], url_path="dispatch")
     def dispatch_transfer(self, request, pk=None):
         transfer = self.get_object()
-        self._require_physical_action_branch(transfer, action_name="dispatch")
+        source_branch = self._require_physical_action_branch(transfer, action_name="dispatch")
+        from apps.inventory.rack_ops import rack_for_branch
+        from apps.branch_data.schema_routing import register_branch_connection
+        from .models import StockTransferItem
+        assignments = request.data.get('racks', {})
+        if not isinstance(assignments, dict):
+            raise serializers.ValidationError({'racks': 'Provide a rack selection for every item.'})
+        alias = register_branch_connection(source_branch.pk, source_branch.tax_mode)
+        items = list(StockTransferItem.objects.using('default').filter(transfer_id=transfer.pk))
+        for item in items:
+            choice = assignments.get(str(item.pk), item.source_rack_id)
+            try:
+                rack_id = int(choice)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({'racks': f'Select a source rack for item {item.pk}.'})
+            rack_for_branch(alias, source_branch.pk, rack_id)
+            if transfer.status == 'IN_TRANSIT' and item.source_rack_id != rack_id:
+                raise serializers.ValidationError({'racks': 'Cannot change a source rack after dispatch.'})
+            item.source_rack_id = rack_id
+        with transaction.atomic(using='default'):
+            StockTransferItem.objects.using('default').bulk_update(items, ['source_rack_id'])
         transfer = dispatch_transfer_service(transfer, request.user)
         return ok(
             TransferSerializer(transfer, context={"request": request}).data,
@@ -195,6 +304,25 @@ class StockTransferViewSet(DefaultCombinedBranchRequestMixin, ModelViewSet):
         if not is_admin_user(request.user):
             if not active_branch or not is_physical_branch(active_branch) or active_branch.pk != destination_branch.pk:
                 raise PermissionDenied("Switch to the destination branch to receive this transfer.")
+        from apps.inventory.rack_ops import rack_for_branch
+        from apps.branch_data.schema_routing import register_branch_connection
+        from .models import StockTransferItem
+        assignments = request.data.get('racks')
+        if not isinstance(assignments, dict):
+            raise serializers.ValidationError({'racks': 'Choose a destination rack for each transfer item.'})
+        alias = register_branch_connection(destination_branch.pk, destination_branch.tax_mode)
+        items = list(StockTransferItem.objects.using('default').filter(transfer_id=transfer.pk))
+        for item in items:
+            try:
+                rack_id = int(assignments.get(str(item.pk)))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({'racks': f'Select a destination rack for item {item.pk}.'})
+            rack_for_branch(alias, destination_branch.pk, rack_id)
+            if item.destination_rack_id and item.destination_rack_id != rack_id:
+                raise serializers.ValidationError({'racks': 'Destination rack cannot change after receiving has started.'})
+            item.destination_rack_id = rack_id
+        with transaction.atomic(using='default'):
+            StockTransferItem.objects.using('default').bulk_update(items, ['destination_rack_id'])
         transfer = receive(transfer, request.user)
         return ok(
             TransferSerializer(transfer, context={"request": request}).data,
