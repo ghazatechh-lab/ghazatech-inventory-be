@@ -823,10 +823,86 @@ class ProductViewSet(ModelViewSet):
         url_path="export",
     )
     def export_products(self, request):
+        # Consolidated is virtual and has no product rows of its own.
+        # Export must visit the *physical* tenant schemas, not default.public.
+        selected, alias = _inventory_request_scope(request)
+        if selected is not None and alias is None:
+            from apps.branch_data.schema_routing import register_branch_connection
+
+            search = (request.query_params.get("search") or "").strip()
+            brand_name = (request.query_params.get("brand_name") or "").strip()
+            category_name = (request.query_params.get("category_name") or "").strip()
+            brand_raw = request.query_params.get("brand")
+            category_raw = request.query_params.get("category")
+
+            def parse_source_filter(value, name):
+                if not value:
+                    return None
+                pieces = str(value).split(":")
+                if len(pieces) == 2:
+                    try:
+                        return int(pieces[0]), int(pieces[1])
+                    except (TypeError, ValueError):
+                        raise ValidationError({name: "Invalid branch-scoped filter."})
+                try:
+                    return None, int(value)
+                except (TypeError, ValueError):
+                    raise ValidationError({name: "Invalid filter value."})
+
+            # Name-based filters represent a catalog label shared across tenants.
+            # Do not additionally compare unrelated tenant-local numeric IDs.
+            brand_filter = None if brand_name else parse_source_filter(brand_raw, "brand")
+            category_filter = None if category_name else parse_source_filter(category_raw, "category")
+            products = []
+            branches = (
+                Branch.objects.using("default")
+                .filter(is_active=True, tax_mode__in=["VAT", "NON_VAT"])
+                .order_by("pk")
+            )
+            for physical in branches:
+                using = register_branch_connection(physical.pk, physical.tax_mode)
+                queryset = (
+                    Product.objects.using(using)
+                    .filter(branch_id=physical.pk, is_deleted=False)
+                    .select_related("brand", "category", "rack")
+                    .prefetch_related("variants")
+                )
+                if search:
+                    queryset = queryset.filter(
+                        Q(product_name__icontains=search)
+                        | Q(sku__icontains=search)
+                        | Q(barcode__icontains=search)
+                    )
+                if brand_name:
+                    queryset = queryset.filter(brand__name__iexact=brand_name)
+                if category_name:
+                    queryset = queryset.filter(category__name__iexact=category_name)
+                if brand_filter:
+                    source, record_id = brand_filter
+                    if source is not None and source != physical.pk:
+                        continue
+                    queryset = queryset.filter(brand_id=record_id)
+                if category_filter:
+                    source, record_id = category_filter
+                    if source is not None and source != physical.pk:
+                        continue
+                    queryset = queryset.filter(category_id=record_id)
+                products.extend(queryset.order_by("product_name", "pk"))
+            products.sort(key=lambda obj: (
+                str(obj.product_name).casefold(), obj.branch_id, obj.pk
+            ))
+            return product_export_response(products)
+
         queryset = self.filter_queryset(self.get_queryset()).order_by(
-            "product_name",
-            "id",
+            "product_name", "id"
         )
+        # Match the catalog-name filters used by the Product list.
+        brand_name = (request.query_params.get("brand_name") or "").strip()
+        category_name = (request.query_params.get("category_name") or "").strip()
+        if brand_name:
+            queryset = queryset.filter(brand__name__iexact=brand_name)
+        if category_name:
+            queryset = queryset.filter(category__name__iexact=category_name)
         return product_export_response(queryset)
 
 

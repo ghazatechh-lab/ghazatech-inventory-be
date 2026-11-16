@@ -244,6 +244,10 @@ def parse_product_workbook(uploaded_file) -> list[dict[str, Any]]:
         attribute_name = _normalise_text(value("attribute"))
         attribute_value = _normalise_text(value("value"))
         initial_quantity = _as_integer(value("initial quantity"), default=0)
+        if initial_quantity < 0:
+            raise serializers.ValidationError(
+                {f"row_{row_number}": ["Initial quantity cannot be negative."]}
+            )
         purchase_price = _as_decimal_or_none(value("purchase price"))
         retail_price = _as_decimal_or_none(value("retail price")) or 0
         wholesale_price = _as_decimal_or_none(value("wholesale price")) or 0
@@ -399,9 +403,9 @@ def build_product_export_workbook(queryset) -> BytesIO:
         "condition",
         "warranty period",
         "reorder level",
-        "attribute ",
-        "value ",
-        "Initial quantity",
+        "attribute",
+        "value",
+        "initial quantity",
         "purchase price",
         "retail price",
         "wholesale price",
@@ -427,12 +431,34 @@ def build_product_export_workbook(queryset) -> BytesIO:
                 first_row = variant_index == 0 and attribute_index == 0
                 branch_id = product.branch_id
                 stock_variant = variant if product.has_variants else None
-                using = database_alias_for_branch(branch_id) if branch_id else "default"
-                stock = ProductStock.objects.using(using).filter(
-                    product_id=product.id,
-                    branch_id=branch_id,
-                    variant_id=(stock_variant.id if stock_variant else None),
-                ).first()
+                # Product catalogs and stock are stored in the source tenant
+                # schema. The legacy branch alias can point to a public schema
+                # and silently export zero for perfectly valid stock records.
+                using = product._state.db or "default"
+                if branch_id:
+                    from apps.branch_data.schema_routing import register_branch_connection
+                    from apps.branches.models import Branch
+                    physical_branch = Branch.objects.using("default").filter(pk=branch_id).first()
+                    if physical_branch and physical_branch.tax_mode in {"VAT", "NON_VAT"}:
+                        using = register_branch_connection(branch_id, physical_branch.tax_mode)
+                stock_query = ProductStock.objects.using(using).filter(
+                    product_id=product.id, branch_id=branch_id,
+                )
+                if product.has_variants and variant:
+                    stock_query = stock_query.filter(variant_id=variant.id)
+                elif not product.has_variants:
+                    # A non-variant product may use a NULL stock.variant even
+                    # though it has a base ProductVariant for its pricing.
+                    stock_query = stock_query.filter(variant_id__isnull=True)
+                current_qty = sum(int(qty or 0) for qty in stock_query.values_list("current_stock", flat=True))
+                if not product.has_variants and current_qty == 0:
+                    # Compatibility fallback for legacy base-variant stock rows.
+                    current_qty = sum(
+                        int(qty or 0) for qty in
+                        ProductStock.objects.using(using).filter(
+                            product_id=product.id, branch_id=branch_id
+                        ).values_list("current_stock", flat=True)
+                    )
                 supplier_id = physical_product_supplier_id(product, branch_id)
                 supplier_name = ""
                 if supplier_id and branch_id:
@@ -472,7 +498,7 @@ def build_product_export_workbook(queryset) -> BytesIO:
                         product.reorder_level if first_row else "",
                         attribute_name,
                         attribute_value,
-                        int(stock.current_stock or 0) if stock else 0,
+                        current_qty if attribute_index == 0 else None,
                         variant.purchase_price if variant else "",
                         variant.retail_price if variant else 0,
                         variant.wholesale_price if variant else 0,
