@@ -178,7 +178,7 @@ REST_FRAMEWORK = {
         "apps.common.pagination." "StandardResultsSetPagination"
     ),
     "PAGE_SIZE": 12,
-    "EXCEPTION_HANDLER": ("apps.common.exceptions." "custom_exception_handler"),
+    "EXCEPTION_HANDLER": "apps.common.exception.custom_exception_handler",
 }
 
 
