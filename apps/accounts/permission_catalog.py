@@ -1,16 +1,5 @@
 PERMISSION_GROUPS = [
     {
-        "module": "dashboard",
-        "label": "Dashboard",
-        "resources": [
-            {
-                "resource": "dashboard",
-                "label": "Dashboard",
-                "actions": ["view"],
-            },
-        ],
-    },
-    {
         "module": "branches",
         "label": "Branch Access",
         "resources": [
@@ -590,6 +579,16 @@ PERMISSION_GROUPS = [
                 "label": "Document Expiry",
                 "actions": ["view", "export"],
             },
+        ],
+    },
+    {
+        "module": "fleet",
+        "label": "Fleet Management",
+        "resources": [
+            {"resource": "dashboard", "label": "Fleet Dashboard", "actions": ["view"]},
+            {"resource": "vehicles", "label": "Vehicles", "actions": ["view", "create", "edit", "delete"]},
+            {"resource": "trips", "label": "Trips", "actions": ["view", "create", "edit", "delete"]},
+            {"resource": "vehicle_documents", "label": "Vehicle Documents", "actions": ["view", "create", "edit", "delete"]},
         ],
     },
     {

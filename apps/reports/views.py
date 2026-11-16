@@ -6,7 +6,7 @@ from django.db.models import DecimalField, ExpressionWrapper, F, Sum
 from django.db.models.functions import Coalesce, TruncMonth
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError, PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 
 from apps.branches.models import Branch
@@ -103,12 +103,31 @@ def _source_meta(branch, code, object_id=None):
     return data
 
 
+def _can_report(user, *codes):
+    """Permissions belong to the user; role permissions do not grant access."""
+    return bool(getattr(user, "is_superuser", False) or any(
+        user.has_operation_permission(code) for code in codes
+    ))
+
+
+def _require_report(user, code):
+    if not _can_report(user, code):
+        raise PermissionDenied("You do not have permission to view this report.")
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def reports_dashboard(request):
     from apps.inventory.models import ProductStock
     from apps.purchases.models import PurchaseOrder, SupplierBill
     from apps.sales.models import SalesInvoice
+
+    can_sales = _can_report(request.user, "reports.sales.view", "sales.invoices.view")
+    can_purchase = _can_report(request.user, "reports.purchase.view", "purchase.purchase_orders.view")
+    can_inventory = _can_report(request.user, "reports.inventory.view", "inventory.stock.view")
+    can_finance = _can_report(request.user, "reports.finance.view", "accounting.receivables.view", "accounting.payables.view")
+    if not (can_sales or can_purchase or can_inventory or can_finance or _can_report(request.user, "reports.dashboard.view")):
+        raise PermissionDenied("Dashboard access is not permitted.")
 
     today = timezone.localdate()
     month_start = today.replace(day=1)
@@ -122,26 +141,26 @@ def reports_dashboard(request):
     sales_by_month, purchases_by_month, by_branch = {}, {}, []
 
     for alias, branch, code in _sources(request):
-        invoices = SalesInvoice.objects.using(alias).filter(branch_id=branch.pk).exclude(payment_status="VOID")
-        pos = PurchaseOrder.objects.using(alias).filter(branch_id=branch.pk).exclude(status="CANCELLED")
-        bills = SupplierBill.objects.using(alias).filter(branch_id=branch.pk).exclude(status="CANCELLED")
-        stocks = ProductStock.objects.using(alias).filter(branch_id=branch.pk)
+        invoices = SalesInvoice.objects.using(alias).filter(branch_id=branch.pk).exclude(payment_status="VOID") if can_sales or can_finance else None
+        pos = PurchaseOrder.objects.using(alias).filter(branch_id=branch.pk).exclude(status="CANCELLED") if can_purchase else None
+        bills = SupplierBill.objects.using(alias).filter(branch_id=branch.pk).exclude(status="CANCELLED") if can_finance else None
+        stocks = ProductStock.objects.using(alias).filter(branch_id=branch.pk) if can_inventory else None
 
         branch_values = {
-            "sales_month": invoices.filter(invoice_date__gte=month_start).aggregate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO,
-            "purchases_month": pos.filter(order_date__gte=month_start).aggregate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO,
-            "receivables": invoices.filter(balance_due__gt=0).aggregate(total=Coalesce(Sum("balance_due"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO,
-            "payables": bills.filter(balance_due__gt=0).aggregate(total=Coalesce(Sum("balance_due"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO,
-            "inventory_value": stocks.aggregate(total=Coalesce(Sum(valuation_expression), ZERO, output_field=DecimalField(max_digits=20, decimal_places=2)))["total"] or ZERO,
+            "sales_month": (invoices.filter(invoice_date__gte=month_start).aggregate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO) if can_sales else ZERO,
+            "purchases_month": (pos.filter(order_date__gte=month_start).aggregate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO) if can_purchase else ZERO,
+            "receivables": (invoices.filter(balance_due__gt=0).aggregate(total=Coalesce(Sum("balance_due"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO) if can_finance else ZERO,
+            "payables": (bills.filter(balance_due__gt=0).aggregate(total=Coalesce(Sum("balance_due"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2)))["total"] or ZERO) if can_finance else ZERO,
+            "inventory_value": (stocks.aggregate(total=Coalesce(Sum(valuation_expression), ZERO, output_field=DecimalField(max_digits=20, decimal_places=2)))["total"] or ZERO) if can_inventory else ZERO,
         }
         for key, value in branch_values.items():
             totals[key] += value
         by_branch.append({**_source_meta(branch, code), **branch_values})
 
-        for row in invoices.filter(invoice_date__gte=first_month).annotate(month=TruncMonth("invoice_date")).values("month").annotate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2))):
+        for row in (invoices.filter(invoice_date__gte=first_month) if can_sales else SalesInvoice.objects.none()).annotate(month=TruncMonth("invoice_date")).values("month").annotate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2))):
             month = row["month"].date() if hasattr(row["month"], "date") else row["month"]
             sales_by_month[month] = sales_by_month.get(month, ZERO) + (row["total"] or ZERO)
-        for row in pos.filter(order_date__gte=first_month).annotate(month=TruncMonth("order_date")).values("month").annotate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2))):
+        for row in (pos.filter(order_date__gte=first_month) if can_purchase else PurchaseOrder.objects.none()).annotate(month=TruncMonth("order_date")).values("month").annotate(total=Coalesce(Sum("total_amount"), ZERO, output_field=DecimalField(max_digits=18, decimal_places=2))):
             month = row["month"].date() if hasattr(row["month"], "date") else row["month"]
             purchases_by_month[month] = purchases_by_month.get(month, ZERO) + (row["total"] or ZERO)
 
@@ -150,12 +169,21 @@ def reports_dashboard(request):
         month = _shift_month(first_month, offset)
         trend.append({"month": f"{month_abbr[month.month]} {str(month.year)[-2:]}", "sales": sales_by_month.get(month, ZERO), "purchases": purchases_by_month.get(month, ZERO)})
 
+    visible_keys = set()
+    if can_sales: visible_keys.add("sales_month")
+    if can_purchase: visible_keys.add("purchases_month")
+    if can_finance: visible_keys.update(("receivables", "payables"))
+    if can_inventory: visible_keys.add("inventory_value")
+    totals = {key: value for key, value in totals.items() if key in visible_keys}
+    by_branch = [{key: value for key, value in row.items() if key not in {"sales_month", "purchases_month", "receivables", "payables", "inventory_value"} or key in visible_keys} for row in by_branch]
+    trend = [{key: value for key, value in row.items() if key == "month" or (key == "sales" and can_sales) or (key == "purchases" and can_purchase)} for row in trend]
     return ok({"kpi": totals, "trend": trend, "by_branch": by_branch}, message="Reports dashboard fetched successfully")
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def purchase_report(request):
+    _require_report(request.user, "reports.purchase.view")
     from apps.purchases.models import PurchaseOrder, SupplierBill
 
     date_from, date_to = _date_param(request, "date_from"), _date_param(request, "date_to")
@@ -180,6 +208,7 @@ def purchase_report(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def inventory_report(request):
+    _require_report(request.user, "reports.inventory.view")
     from apps.inventory.models import ProductStock
 
     rows, branch_totals = [], {}

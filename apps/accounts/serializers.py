@@ -12,7 +12,6 @@ from .permission_catalog import (
 )
 
 LEGACY_PERMISSION_ALIASES = {
-    "dashboard.view": "dashboard.dashboard.view",
     "finance.view": "accounting.*",
     "hrms.view": "hrms.*",
     "inventory.view": "inventory.*",
@@ -33,6 +32,7 @@ MODULE_WILDCARD_PERMISSIONS = {
     "finance.*",
     "hrms.*",
     "reports.*",
+    "fleet.*",
     "settings.*",
 }
 
@@ -135,28 +135,9 @@ class RoleSerializer(serializers.ModelSerializer):
             "is_active",
             "user_count",
         ]
-        extra_kwargs = {"code": {"required": False}}
 
     def validate_code(self, value):
         return str(value).strip().upper().replace(" ", "_")
-
-    def validate(self, attrs):
-        # API clients can omit the code. On updates, keep the existing code.
-        if self.instance is None and not attrs.get("code"):
-            import re
-            from django.utils.text import slugify
-
-            base = re.sub(r"[^A-Z0-9]+", "_", slugify(
-                attrs.get("name", ""), allow_unicode=False
-            ).upper()).strip("_")[:44] or "ROLE"
-            code = base
-            suffix = 2
-            while Role.objects.filter(code=code).exists():
-                postfix = f"_{suffix}"
-                suffix += 1
-                code = base[: 50 - len(postfix)] + postfix
-            attrs["code"] = code
-        return attrs
 
 
 class EmployeeUserOptionSerializer(serializers.ModelSerializer):
@@ -183,7 +164,6 @@ class EmployeeUserOptionSerializer(serializers.ModelSerializer):
             "employee_code",
             "full_name",
             "email",
-            "phone",
             "branch",
             "branch_name",
             "user_id",
@@ -383,9 +363,9 @@ class UserSerializer(serializers.ModelSerializer):
             if not attrs.get("full_name"):
                 attrs["full_name"] = employee.full_name
 
-        # Admin permissions remain unrestricted; optional employee linking
-        # is permitted for HR profile association only.
+        # ADMIN is still unrestricted, but permission storage is kept clean.
         if role and role.code == "ADMIN":
+            attrs["employee"] = None
             attrs["permissions"] = []
 
         return attrs
