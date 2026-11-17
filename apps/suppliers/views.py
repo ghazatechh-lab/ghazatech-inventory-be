@@ -96,18 +96,26 @@ class SupplierViewSet(
             return super().dispatch(request, *args, **kwargs)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
         from apps.branch_data.combined_views import requested_branch
-        from apps.branch_data.services import database_alias_for_branch
+        from apps.branch_data.schema_routing import register_branch_connection
+        from apps.common.three_branch import ensure_branch_access
+
+        # When creating a PO from CONSOLIDATED, the frontend retains
+        # X-Branch-ID=CONSOLIDATED for the UI session but requests the supplier
+        # options for the selected physical branch via ?branch=<id>.
+        # BranchAccessQuerysetMixin checks the header *first*, so using
+        # super().get_queryset() here would filter for CONSOLIDATED and then
+        # add another physical-branch condition: an impossible conjunction.
+        # Resolve and authorize the explicit physical supplier source first.
         branch = requested_branch(self.request)
         if branch is not None and branch.tax_mode in {"VAT", "NON_VAT"}:
-            queryset = queryset.using(database_alias_for_branch(branch.pk))
-        branch_id = self.request.query_params.get("branch")
+            ensure_branch_access(self.request.user, branch)
+            alias = register_branch_connection(branch.pk, branch.tax_mode)
+            return self.queryset.all().using(alias).filter(branch_id=branch.pk)
 
-        if branch_id not in (None, "", "all"):
-            queryset = queryset.filter(branch_id=branch_id)
-
-        return queryset
+        # Consolidated list views are handled by CombinedPhysicalBranchListMixin;
+        # retain the ordinary access-controlled queryset for other requests.
+        return super().get_queryset()
 
     def _validate_documents(
         self,
