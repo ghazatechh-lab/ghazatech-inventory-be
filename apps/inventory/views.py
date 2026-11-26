@@ -7,10 +7,9 @@ from django.utils import timezone
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
-from rest_framework.viewsets import (
-    ModelViewSet,
-    ReadOnlyModelViewSet,
+from rest_framework.viewsets import (    ReadOnlyModelViewSet,
 )
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 
 from apps.common.response import ok
 
@@ -92,6 +91,48 @@ def _inventory_request_scope(request, *, require_physical=False):
 class TenantCatalogMixin:
     """Keep catalog reference operations in the selected tenant schema."""
 
+    def _record_catalog_actor(self, obj, action):
+        """Record the actual DRF-authenticated editor after a successful tenant save."""
+        import logging
+        from apps.audit_logs.models import AuditLog
+        actor = getattr(self.request, "user", None)
+        if not getattr(actor, "is_authenticated", False) or not getattr(actor, "pk", None):
+            logging.getLogger(__name__).warning(
+                "Catalog audit: authenticated actor unavailable for %s %s", action, obj.pk
+            )
+            return
+        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        if obj._state.db != alias:
+            raise ValidationError({"branch": "Catalog audit branch does not match the saved tenant."})
+        path = "/api/categories/" if isinstance(obj, Category) else "/api/brands/"
+        try:
+            AuditLog.objects.using("default").create(
+                user_id=actor.pk,
+                branch_id=branch.pk,
+                module="api_record_actor",
+                action=action,
+                description=f"{action.title()} {path} by user {actor.pk}",
+                object_type="api:" + path,
+                object_id=f"{branch.pk}:{obj.pk}",
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Catalog audit write FAILED: %s branch=%s id=%s actor=%s",
+                path, branch.pk, obj.pk, actor.pk,
+            )
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        """Include actor labels on catalog responses even if middleware misses them."""
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if request.method == "GET" and 200 <= response.status_code < 300:
+            try:
+                from apps.audit_logs.middleware import AuditMiddleware
+                AuditMiddleware(lambda unused: response)._annotate(request, response)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Catalog actor response annotation failed")
+        return response
+
     def list(self, request, *args, **kwargs):
         branch, alias = _inventory_request_scope(request)
         if branch is not None and alias is None:
@@ -161,6 +202,7 @@ class TenantCatalogMixin:
         obj = serializer.Meta.model(**serializer.validated_data)
         obj.save(using=alias)
         serializer.instance = obj
+        self._record_catalog_actor(obj, "CREATED")
 
     def perform_update(self, serializer):
         obj = serializer.instance
@@ -173,6 +215,7 @@ class TenantCatalogMixin:
             setattr(obj, field, value)
         obj.save(using=alias)
         serializer.instance = obj
+        self._record_catalog_actor(obj, "UPDATED")
 
     def perform_destroy(self, instance):
         alias = instance._state.db
@@ -276,7 +319,31 @@ class RackViewSet(ModelViewSet):
         )
 
     def perform_create(self, serializer):
-        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        # _rack_post_branch_selection_fix: respect the rack form branch selection
+        selected_branch_id = self.request.data.get("branch")
+        if selected_branch_id is None or str(selected_branch_id).strip() == "":
+            branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        else:
+            try:
+                if isinstance(selected_branch_id, bool):
+                    raise ValueError()
+                selected_branch_pk = int(str(selected_branch_id))
+                if selected_branch_pk <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValidationError({"branch": "Select a valid physical branch."})
+            branch = Branch.objects.using("default").filter(
+                pk=selected_branch_pk, is_active=True, tax_mode__in=("VAT", "NON_VAT")
+            ).first()
+            if branch is None:
+                raise ValidationError({"branch": "Select an active physical VAT or NON-VAT branch."})
+            # Prevent cross-branch writes by non-admin users.
+            if not self.request.user.is_superuser:
+                scoped_branch, _ = _inventory_request_scope(self.request, require_physical=True)
+                if scoped_branch.pk != branch.pk:
+                    raise ValidationError({"branch": "Selected branch does not match your authorized branch."})
+            from apps.branch_data.schema_routing import register_branch_connection
+            alias = register_branch_connection(branch.pk, branch.tax_mode)
         requested = serializer.validated_data.get("branch")
         if requested is not None and requested.pk != branch.pk:
             raise ValidationError(
@@ -288,6 +355,11 @@ class RackViewSet(ModelViewSet):
             rack_name=serializer.validated_data.get("rack_name", ""),
             is_active=serializer.validated_data.get("is_active", True),
         )
+        # _rack_create_tenant_duplicate_check
+        if Rack.objects.using(alias).filter(
+            branch_id=branch.pk, rack_code=rack.rack_code
+        ).exists():
+            raise ValidationError({"rack_code": "This rack code already exists in the selected branch."})
         rack.save(using=alias)
         serializer.instance = rack
 
@@ -448,8 +520,6 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
             raise ValidationError(
                 {"detail": "branch_code, sku and stock_id are required."}
             )
-        if branch_code not in ("BR01", "BR02"):
-            raise ValidationError({"branch_code": "Choose a physical branch."})
         branch = Branch.objects.using("default").filter(branch_code=branch_code).first()
         if branch is None:
             raise ValidationError({"branch_code": "Branch not found."})
@@ -562,6 +632,8 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
                     "branch_code": branch_code,
                     "sku": stock.product.sku,
                     "stock_id": stock.pk,
+                    "warehouse": stock.warehouse,
+                    "variant_id": stock.variant_id,
                     "physical_quantity": stock.current_stock,
                     "allocated_quantity": assigned,
                     "unallocated_quantity": stock.current_stock - assigned,
@@ -664,6 +736,7 @@ class ConsolidatedProductReadSerializer(TenantProductSerializer):
                 "id": stock.pk,
                 "variant": stock.variant_id,
                 "variant_id": stock.variant_id,
+                "warehouse": stock.warehouse,
                 "current_stock": stock.current_stock,
                 "reserved_stock": stock.reserved_stock,
                 "damaged_stock": stock.damaged_stock,

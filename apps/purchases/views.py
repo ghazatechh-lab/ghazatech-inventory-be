@@ -12,7 +12,7 @@ from rest_framework import serializers, status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from .models import *
 from .serializers import *
 from .services import confirm_grn

@@ -133,5 +133,5 @@ def soft_delete_to_recovery(instance, user=None, reason="", request=None):
         update_fields.append("deleted_by")
     if hasattr(instance, "updated_at"):
         update_fields.append("updated_at")
-    instance.save(update_fields=update_fields)
+    instance.save(using=instance._state.db, update_fields=update_fields)
     return record

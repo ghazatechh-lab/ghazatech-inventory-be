@@ -13,7 +13,7 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from apps.common.three_branch import BranchAccessQuerysetMixin
 from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
 from apps.branch_data.finance_flow import FinanceBranchGuardMixin

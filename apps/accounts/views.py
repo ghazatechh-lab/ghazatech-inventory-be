@@ -1,3 +1,4 @@
+from apps.audit_logs.viewsets import AuditedModelViewSet
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from rest_framework import status, viewsets
@@ -92,7 +93,7 @@ class ResetPasswordView(ForgotPasswordView):
     pass
 
 
-class RoleViewSet(viewsets.ModelViewSet):
+class RoleViewSet(AuditedModelViewSet):
     serializer_class = RoleSerializer
     search_fields = ["name", "code", "description"]
     ordering_fields = ["name", "code", "is_active"]
@@ -116,7 +117,7 @@ class RoleViewSet(viewsets.ModelViewSet):
         return Response(PERMISSION_GROUPS)
 
 
-class UserViewSet(viewsets.ModelViewSet):
+class UserViewSet(AuditedModelViewSet):
     serializer_class = UserSerializer
     search_fields = [
         "email",

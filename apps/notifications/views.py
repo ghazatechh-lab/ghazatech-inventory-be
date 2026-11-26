@@ -1,4 +1,4 @@
-from rest_framework.viewsets import ModelViewSet
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from rest_framework.decorators import action
 from apps.common.response import ok
 from .models import Notification

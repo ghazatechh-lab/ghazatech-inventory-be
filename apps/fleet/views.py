@@ -2,8 +2,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from rest_framework import serializers
 from rest_framework.decorators import action
-from rest_framework.viewsets import ModelViewSet
-
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from apps.common.response import ok
 from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
 from apps.branch_data.workforce_flow import WorkforceBranchScopeMixin, require_related_branch

@@ -1,0 +1,38 @@
+"""Model viewset that persists actual DRF-authenticated record actors.
+
+This runs after successful model save handlers, including custom handlers; shared
+middleware then enriches list/detail responses across ordinary and legacy views.
+"""
+import logging
+from rest_framework.viewsets import ModelViewSet
+from .actor_tracking import annotate_response, record_event
+
+logger = logging.getLogger(__name__)
+
+
+class AuditedModelViewSet(ModelViewSet):
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if not (200 <= response.status_code < 300):
+            return response
+        action = getattr(self, 'action', '')
+        if action in ('create', 'update', 'partial_update') or (
+            request.method in ('POST', 'PUT', 'PATCH')
+            and self.kwargs.get('pk') is not None
+            and action in ('approve', 'approve_transfer', 'dispatch', 'dispatch_transfer',
+                           'receive', 'receive_transfer', 'cancel', 'cancel_transfer', 'confirm', 'submit',
+                           'post', 'complete', 'mark_paid', 'reject')
+        ):
+            kind = 'CREATED' if action == 'create' else 'UPDATED'
+            try:
+                # The detail PK is available in the route. For create actions,
+                # derive it from the actual returned record (not input data).
+                if record_event(request, response, action=kind, pk=self.kwargs.get('pk')):
+                    response._api_actor_recorded = True
+            except Exception:
+                logger.exception('API actor audit write failed: %s %s', request.method, request.path)
+        try:
+            annotate_response(request, response)
+        except Exception:
+            logger.exception('API actor response enrichment failed: %s', request.path)
+        return response

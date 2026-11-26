@@ -114,6 +114,7 @@ class CategorySerializer(serializers.ModelSerializer):
 
 
 class RackSerializer(serializers.ModelSerializer):
+    branch = serializers.PrimaryKeyRelatedField(read_only=True)
     branch_name = serializers.CharField(
         source="branch.branch_name",
         read_only=True,
@@ -124,6 +125,7 @@ class RackSerializer(serializers.ModelSerializer):
     )
 
     class Meta:
+        validators = []  # Validate rack_code in the selected tenant DB
         model = Rack
         fields = [
             "id",
@@ -157,6 +159,8 @@ class ProductVariantSerializer(serializers.ModelSerializer):
     # ProductStock row for the selected branch and is not stored separately on
     # ProductVariant.
     rack_quantities = serializers.JSONField(write_only=True, required=False)
+    # Target one physical warehouse stock row when editing rack allocations.
+    warehouse_stock_id = serializers.IntegerField(write_only=True, required=False, min_value=1)
     initial_stock = serializers.IntegerField(
         write_only=True,
         required=False,
@@ -186,6 +190,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "display_name",
             "initial_stock",
             "rack_quantities",
+            "warehouse_stock_id",
             "available_qty",
             "current_stock",
             "reserved_stock",
@@ -1523,6 +1528,49 @@ class TenantProductSerializer(ProductSerializer):
             for item in stocks
         )
 
+    def _sync_variant_rack_links(self, obj, variant, racks, alias):
+        # Explicitly write the M2M through rows into the same tenant schema.
+        # The relationship manager can otherwise route to a legacy alias
+        # (vat/public or non_vat/public), causing FK failures on COMMIT.
+        through = ProductVariant.racks.through
+        desired_rack_ids = {rack.pk for rack in racks}
+        # A variant can have allocations in several warehouses. Keep locations
+        # that still hold units in any of them, not only the selected stock row.
+        from .models import RackStockAllocation
+        assigned_elsewhere = set(RackStockAllocation.objects.using(alias).filter(
+            stock__product_id=obj.pk, stock__branch_id=obj.branch_id,
+            stock__variant_id=(variant.pk if obj.has_variants else None),
+            quantity__gt=0,
+        ).values_list("rack_id", flat=True))
+        desired_rack_ids |= assigned_elsewhere
+        linked = set(
+            through.objects.using(alias)
+            .filter(productvariant_id=variant.pk)
+            .values_list("rack_id", flat=True)
+        )
+        removed = linked - desired_rack_ids
+        added = desired_rack_ids - linked
+        if removed:
+            # Never orphan physical stock allocations by removing a rack
+            # from a variant that still holds units there.
+            from .models import RackStockAllocation
+            if RackStockAllocation.objects.using(alias).filter(
+                stock__product_id=obj.pk, stock__branch_id=obj.branch_id,
+                stock__variant_id=(variant.pk if obj.has_variants else None),
+                rack_id__in=removed, quantity__gt=0,
+            ).exists():
+                raise serializers.ValidationError({'racks': 'Cannot remove a rack that still contains stock. Reallocate the units before editing rack locations.'})
+            through.objects.using(alias).filter(
+                productvariant_id=variant.pk, rack_id__in=removed
+            ).delete()
+        if added:
+            through.objects.using(alias).bulk_create(
+                [
+                    through(productvariant_id=variant.pk, rack_id=rack_id)
+                    for rack_id in sorted(added)
+                ]
+            )
+
     def _save_variants(self, obj, supplied, *, initial=False):
         alias = obj._state.db
         desired_ids = []
@@ -1530,8 +1578,10 @@ class TenantProductSerializer(ProductSerializer):
             supplied = supplied[:1] if supplied else [{}]
         for row in supplied:
             row = dict(row)
+            racks_supplied = "racks" in row
             racks = row.pop("racks", [])
             rack_quantities = row.pop("rack_quantities", None)
+            warehouse_stock_id = row.pop("warehouse_stock_id", None)
             qty = row.pop("initial_stock", None)
             variant_id = row.pop("id", None)
             row.pop("available_qty", None)
@@ -1564,11 +1614,8 @@ class TenantProductSerializer(ProductSerializer):
             # Rack quantity edits are absolute location allocations, not receipts.
             # Keep them in the product edit's tenant transaction.
             stock_variant_id = variant.pk if obj.has_variants else None
-            stock, _ = ProductStock.objects.using(alias).get_or_create(
-                product_id=obj.pk, branch_id=obj.branch_id,
-                variant_id=stock_variant_id, warehouse="",
-                defaults={"current_stock": 0, "reorder_level": obj.reorder_level},
-            )
+            # Do not manufacture an empty default-warehouse row when editing an
+            # item that already has stock in named warehouses.
             if not initial and rack_quantities is not None:
                 from .models import RackStockAllocation
                 if not isinstance(rack_quantities, dict):
@@ -1585,65 +1632,44 @@ class TenantProductSerializer(ProductSerializer):
                 ).values_list("pk", flat=True))
                 if valid_racks != selected:
                     raise serializers.ValidationError({"racks": "Select only active racks from this physical branch."})
-                # Include all warehouse rows so allocations can never exceed the
-                # physical quantity, even when older data uses multiple warehouses.
+                # Each ProductStock row is authoritative for its own warehouse.
+                # Never pool quantities from different warehouses: the caller
+                # must identify the physical stock row when multiple exist.
                 all_stocks = list(ProductStock.objects.using(alias).select_for_update().filter(
                     product_id=obj.pk, branch_id=obj.branch_id, variant_id=stock_variant_id
                 ).order_by("pk"))
-                physical = sum(int(row.current_stock) for row in all_stocks)
+                if warehouse_stock_id is None:
+                    if len(all_stocks) != 1:
+                        raise serializers.ValidationError({"warehouse_stock_id": "Select the warehouse stock row for rack allocation."})
+                    stock = all_stocks[0]
+                else:
+                    stock = next((item for item in all_stocks if item.pk == warehouse_stock_id), None)
+                    if stock is None:
+                        raise serializers.ValidationError({"warehouse_stock_id": "Stock row does not belong to this product, variant and branch."})
+                physical = int(stock.current_stock)
                 if sum(incoming.values()) > physical:
-                    raise serializers.ValidationError({"rack_quantities": f"Only {physical} physical units exist; rack quantities cannot create stock."})
-                # Single warehouse is the current product-form workflow. Do not
-                # silently redistribute balances across multiple warehouses.
-                if len(all_stocks) != 1:
-                    raise serializers.ValidationError({"rack_quantities": "Multiple warehouse stock rows need warehouse-specific allocation."})
-                stock = all_stocks[0]
+                    raise serializers.ValidationError({"rack_quantities": f"Only {physical} physical units exist in this warehouse; rack quantities cannot create stock."})
                 RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk).delete()
                 RackStockAllocation.objects.using(alias).bulk_create([
                     RackStockAllocation(stock_id=stock.pk, rack_id=rack_id, quantity=q)
                     for rack_id, q in incoming.items() if q > 0
                 ])
-            # Explicitly write the M2M through rows into the same tenant schema.
-            # The relationship manager can otherwise route to a legacy alias
-            # (vat/public or non_vat/public), causing FK failures on COMMIT.
-            through = ProductVariant.racks.through
-            desired_rack_ids = {rack.pk for rack in racks}
-            linked = set(
-                through.objects.using(alias)
-                .filter(productvariant_id=variant.pk)
-                .values_list("rack_id", flat=True)
-            )
-            removed = linked - desired_rack_ids
-            added = desired_rack_ids - linked
-            if removed:
-                # Never orphan physical stock allocations by removing a rack
-                # from a variant that still holds units there.
-                from .models import RackStockAllocation
-                if RackStockAllocation.objects.using(alias).filter(
-                    stock__product_id=obj.pk, stock__branch_id=obj.branch_id,
-                    stock__variant_id=(variant.pk if obj.has_variants else None),
-                    rack_id__in=removed, quantity__gt=0,
-                ).exists():
-                    raise serializers.ValidationError({'racks': 'Cannot remove a rack that still contains stock. Reallocate the units before editing rack locations.'})
-                through.objects.using(alias).filter(
-                    productvariant_id=variant.pk, rack_id__in=removed
-                ).delete()
-            if added:
-                through.objects.using(alias).bulk_create(
-                    [
-                        through(productvariant_id=variant.pk, rack_id=rack_id)
-                        for rack_id in sorted(added)
-                    ]
-                )
+            # Preserve existing rack links when the request only updates
+            # prices/details. Do not mistake an omitted racks field for [].
+            # Allocation edits affect one warehouse row; links used by other
+            # warehouse rows must also be retained.
+            if initial or racks_supplied:
+                self._sync_variant_rack_links(obj, variant, racks, alias)
             desired_ids.append(variant.pk)
             stock_variant_id = variant.pk if obj.has_variants else None
-            stock, _ = ProductStock.objects.using(alias).get_or_create(
-                product_id=obj.pk,
-                branch_id=obj.branch_id,
-                variant_id=stock_variant_id,
-                warehouse="",
-                defaults={"current_stock": 0, "reorder_level": obj.reorder_level},
-            )
+            if initial:
+                stock, _ = ProductStock.objects.using(alias).get_or_create(
+                    product_id=obj.pk,
+                    branch_id=obj.branch_id,
+                    variant_id=stock_variant_id,
+                    warehouse="",
+                    defaults={"current_stock": 0, "reorder_level": obj.reorder_level},
+                )
             # Opening stock is a one-time receipt only on product creation.
             # Both the stock balance and its audit movement use the tenant alias.
             if qty not in (None, "", 0, "0"):
@@ -1675,18 +1701,10 @@ class TenantProductSerializer(ProductSerializer):
                     RackStockAllocation(stock_id=stock.pk, rack_id=rack_id, quantity=amount)
                     for rack_id, amount in allocation.items() if amount
                 ])
-        if not initial:
-            omitted = (
-                ProductVariant.objects.using(alias)
-                .filter(product_id=obj.pk)
-                .exclude(pk__in=desired_ids)
-            )
-            if omitted.exists():
-                raise serializers.ValidationError(
-                    {
-                        "variants": "Deleting existing variants requires a separate stock-safe workflow."
-                    }
-                )
+        # Product edits update the supplied variants; omission is NOT deletion.
+        # Historical/base/hidden variants can exist outside the editor payload.
+        # Preserve them (and their stock and allocations) unchanged. Variant
+        # removal must be implemented as a separate explicit stock-safe action.
 
     def _create_opening_stock(self, product, variant, stock, qty):
         """Record opening stock and its valuation atomically in one tenant DB."""

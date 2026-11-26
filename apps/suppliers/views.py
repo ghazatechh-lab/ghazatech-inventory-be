@@ -9,8 +9,7 @@ from rest_framework.parsers import (
     MultiPartParser,
 )
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
-
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from apps.common.three_branch import BranchAccessQuerysetMixin
 from apps.branch_data.combined_views import CombinedPhysicalBranchListMixin
 from apps.branch_data.purchase_flow import PurchaseBranchGuardMixin

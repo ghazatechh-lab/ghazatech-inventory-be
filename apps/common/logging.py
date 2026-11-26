@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from django.core.files.uploadedfile import UploadedFile
 from django.http import QueryDict
 from rest_framework.views import APIView
-from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
+from rest_framework.viewsets import ReadOnlyModelViewSet
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 
 logger = logging.getLogger("ghazatech.api")
 

@@ -5,7 +5,7 @@ from django.db.models.functions import Coalesce
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from apps.branch_data.combined_views import DefaultCombinedBranchRequestMixin
 from apps.branch_data.sales_flow import SalesPhysicalBranchGuardMixin
 from apps.branch_data.combined_views import requested_branch as requested_combined_branch

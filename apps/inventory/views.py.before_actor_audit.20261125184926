@@ -46,6 +46,7 @@ from .product_import_export import (
     import_products_from_workbook,
     product_export_response,
 )
+from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework import status
 from apps.branches.models import Branch
 
@@ -90,6 +91,48 @@ def _inventory_request_scope(request, *, require_physical=False):
 
 class TenantCatalogMixin:
     """Keep catalog reference operations in the selected tenant schema."""
+
+    def _record_catalog_actor(self, obj, action):
+        """Record the actual DRF-authenticated editor after a successful tenant save."""
+        import logging
+        from apps.audit_logs.models import AuditLog
+        actor = getattr(self.request, "user", None)
+        if not getattr(actor, "is_authenticated", False) or not getattr(actor, "pk", None):
+            logging.getLogger(__name__).warning(
+                "Catalog audit: authenticated actor unavailable for %s %s", action, obj.pk
+            )
+            return
+        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        if obj._state.db != alias:
+            raise ValidationError({"branch": "Catalog audit branch does not match the saved tenant."})
+        path = "/api/categories/" if isinstance(obj, Category) else "/api/brands/"
+        try:
+            AuditLog.objects.using("default").create(
+                user_id=actor.pk,
+                branch_id=branch.pk,
+                module="api_record_actor",
+                action=action,
+                description=f"{action.title()} {path} by user {actor.pk}",
+                object_type="api:" + path,
+                object_id=f"{branch.pk}:{obj.pk}",
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Catalog audit write FAILED: %s branch=%s id=%s actor=%s",
+                path, branch.pk, obj.pk, actor.pk,
+            )
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        """Include actor labels on catalog responses even if middleware misses them."""
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if request.method == "GET" and 200 <= response.status_code < 300:
+            try:
+                from apps.audit_logs.middleware import AuditMiddleware
+                AuditMiddleware(lambda unused: response)._annotate(request, response)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Catalog actor response annotation failed")
+        return response
 
     def list(self, request, *args, **kwargs):
         branch, alias = _inventory_request_scope(request)
@@ -160,6 +203,7 @@ class TenantCatalogMixin:
         obj = serializer.Meta.model(**serializer.validated_data)
         obj.save(using=alias)
         serializer.instance = obj
+        self._record_catalog_actor(obj, "CREATED")
 
     def perform_update(self, serializer):
         obj = serializer.instance
@@ -172,6 +216,7 @@ class TenantCatalogMixin:
             setattr(obj, field, value)
         obj.save(using=alias)
         serializer.instance = obj
+        self._record_catalog_actor(obj, "UPDATED")
 
     def perform_destroy(self, instance):
         alias = instance._state.db
@@ -181,6 +226,7 @@ class TenantCatalogMixin:
 
 
 class BrandViewSet(TenantCatalogMixin, ModelViewSet):
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [ReferenceDataPermission]
     ordering_fields = ["name", "is_active", "created_at"]
     queryset = Brand.objects.all()
@@ -190,6 +236,7 @@ class BrandViewSet(TenantCatalogMixin, ModelViewSet):
 
 
 class CategoryViewSet(TenantCatalogMixin, ModelViewSet):
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [ReferenceDataPermission]
     ordering_fields = ["name", "is_active", "created_at"]
     queryset = Category.objects.all()
@@ -273,7 +320,31 @@ class RackViewSet(ModelViewSet):
         )
 
     def perform_create(self, serializer):
-        branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        # _rack_post_branch_selection_fix: respect the rack form branch selection
+        selected_branch_id = self.request.data.get("branch")
+        if selected_branch_id is None or str(selected_branch_id).strip() == "":
+            branch, alias = _inventory_request_scope(self.request, require_physical=True)
+        else:
+            try:
+                if isinstance(selected_branch_id, bool):
+                    raise ValueError()
+                selected_branch_pk = int(str(selected_branch_id))
+                if selected_branch_pk <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValidationError({"branch": "Select a valid physical branch."})
+            branch = Branch.objects.using("default").filter(
+                pk=selected_branch_pk, is_active=True, tax_mode__in=("VAT", "NON_VAT")
+            ).first()
+            if branch is None:
+                raise ValidationError({"branch": "Select an active physical VAT or NON-VAT branch."})
+            # Prevent cross-branch writes by non-admin users.
+            if not self.request.user.is_superuser:
+                scoped_branch, _ = _inventory_request_scope(self.request, require_physical=True)
+                if scoped_branch.pk != branch.pk:
+                    raise ValidationError({"branch": "Selected branch does not match your authorized branch."})
+            from apps.branch_data.schema_routing import register_branch_connection
+            alias = register_branch_connection(branch.pk, branch.tax_mode)
         requested = serializer.validated_data.get("branch")
         if requested is not None and requested.pk != branch.pk:
             raise ValidationError(
@@ -285,6 +356,11 @@ class RackViewSet(ModelViewSet):
             rack_name=serializer.validated_data.get("rack_name", ""),
             is_active=serializer.validated_data.get("is_active", True),
         )
+        # _rack_create_tenant_duplicate_check
+        if Rack.objects.using(alias).filter(
+            branch_id=branch.pk, rack_code=rack.rack_code
+        ).exists():
+            raise ValidationError({"rack_code": "This rack code already exists in the selected branch."})
         rack.save(using=alias)
         serializer.instance = rack
 
@@ -316,6 +392,123 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
     def get_queryset(self):
         return RackStockAllocation.objects.none()
 
+    @action(detail=False, methods=['post'], url_path='assign-unallocated')
+    def assign_unallocated(self, request):
+        """Assign legacy unallocated stock to an explicitly selected rack.
+
+        This never changes physical stock, movements, or existing allocations.
+        Only superusers can reconcile legacy location balances.
+        """
+        from rest_framework.exceptions import PermissionDenied
+        from django.db.models import Sum
+        from apps.branch_data.schema_routing import register_branch_connection
+        from .rack_ops import rack_for_branch
+        if not request.user.is_superuser:
+            raise PermissionDenied('Only administrators can reconcile unallocated stock.')
+        try:
+            branch_id = int(request.data.get('branch'))
+            stock_id = int(request.data.get('stock_id'))
+            rack_id = int(request.data.get('rack_id'))
+            qty = int(request.data.get('quantity'))
+            if qty <= 0: raise ValueError()
+        except (TypeError, ValueError):
+            raise ValidationError({'quantity': 'Select branch, stock, rack and positive whole-number quantity.'})
+        branch = Branch.objects.using('default').filter(
+            pk=branch_id, tax_mode__in=['VAT', 'NON_VAT'], is_active=True
+        ).first()
+        if not branch:
+            raise ValidationError({'branch': 'Select an active physical branch.'})
+        alias = register_branch_connection(branch.pk, branch.tax_mode)
+        with transaction.atomic(using=alias):
+            stock = ProductStock.objects.using(alias).select_for_update().filter(
+                pk=stock_id, branch_id=branch.pk
+            ).first()
+            if not stock:
+                raise ValidationError({'stock_id': 'Stock not found in the selected branch.'})
+            rack_for_branch(alias, branch.pk, rack_id)
+            assigned = RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk).aggregate(
+                total=Sum('quantity')
+            )['total'] or 0
+            unallocated = int(stock.current_stock) - int(assigned)
+            if qty > unallocated:
+                raise ValidationError({'quantity': f'Only {unallocated} unallocated units remain.'})
+            allocation, _ = RackStockAllocation.objects.using(alias).get_or_create(
+                stock_id=stock.pk, rack_id=rack_id, defaults={'quantity': 0}
+            )
+            allocation.quantity += qty
+            allocation.save(using=alias, update_fields=['quantity', 'updated_at'])
+        return Response({'success': True, 'message': f'{qty} units allocated to the selected rack.',
+                         'data': {'stock_id': stock_id, 'unallocated_quantity': unallocated - qty}})
+
+    @action(detail=False, methods=['put'], url_path='set-rack-quantity')
+    def set_rack_quantity(self, request):
+        """Set the absolute quantity at one rack, without creating physical stock.
+
+        Body: {branch, stock_id, rack_id, quantity}. Repeating the same request
+        is idempotent. Transfers between racks require setting both locations;
+        the physical stock balance and stock movement ledger are never changed.
+        """
+        from rest_framework.exceptions import PermissionDenied
+        from apps.branch_data.schema_routing import register_branch_connection
+        from .rack_ops import rack_for_branch, validate_rack_quantity
+
+        if not request.user or not request.user.is_authenticated or not request.user.is_superuser:
+            raise PermissionDenied('Only administrators may change rack allocations.')
+        try:
+            branch_id = int(request.data.get('branch'))
+            stock_id = int(request.data.get('stock_id'))
+            rack_id = int(request.data.get('rack_id'))
+            raw_quantity = request.data.get('quantity')
+            if isinstance(raw_quantity, bool) or str(raw_quantity).strip() != str(int(raw_quantity)):
+                raise ValueError()
+            quantity = int(raw_quantity)
+            if quantity < 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValidationError({'detail': 'branch, stock_id, rack_id and a nonnegative whole-number quantity are required.'})
+
+        branch = Branch.objects.using('default').filter(
+            pk=branch_id, is_active=True, tax_mode__in=['VAT', 'NON_VAT']
+        ).first()
+        if branch is None:
+            raise ValidationError({'branch': 'Select an active physical branch.'})
+        alias = register_branch_connection(branch.pk, branch.tax_mode)
+
+        with transaction.atomic(using=alias):
+            stock = ProductStock.objects.using(alias).select_for_update().filter(
+                pk=stock_id, branch_id=branch.pk
+            ).first()
+            if stock is None:
+                raise ValidationError({'stock_id': 'Stock not found in selected branch.'})
+            rack = rack_for_branch(alias, branch.pk, rack_id)
+            allocations = list(RackStockAllocation.objects.using(alias).filter(stock_id=stock.pk))
+            other_total = sum(int(item.quantity) for item in allocations if item.rack_id != rack.pk)
+            validate_rack_quantity(quantity, other_total, stock.current_stock)
+            existing = next((item for item in allocations if item.rack_id == rack.pk), None)
+            if existing:
+                if quantity == 0:
+                    existing.delete(using=alias)
+                elif existing.quantity != quantity:
+                    existing.quantity = quantity
+                    existing.save(using=alias, update_fields=['quantity', 'updated_at'])
+            elif quantity:
+                RackStockAllocation.objects.using(alias).create(
+                    stock_id=stock.pk, rack_id=rack.pk, quantity=quantity
+                )
+            assigned = other_total + quantity
+            return Response({
+                'success': True,
+                'message': 'Rack quantity updated without changing physical stock.',
+                'data': {
+                    'branch_code': branch.branch_code, 'stock_id': stock.pk,
+                    'rack_id': rack.pk, 'rack_code': rack.rack_code,
+                    'rack_quantity': quantity,
+                    'physical_quantity': stock.current_stock,
+                    'allocated_quantity': assigned,
+                    'unallocated_quantity': int(stock.current_stock) - assigned,
+                },
+            })
+
     @action(detail=False, methods=["get", "put"], url_path="for-stock")
     def for_stock(self, request):
         from django.db.models import Sum
@@ -328,16 +521,13 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
             raise ValidationError(
                 {"detail": "branch_code, sku and stock_id are required."}
             )
-        if branch_code not in ("BR01", "BR02"):
-            raise ValidationError({"branch_code": "Choose a physical branch."})
         branch = Branch.objects.using("default").filter(branch_code=branch_code).first()
         if branch is None:
             raise ValidationError({"branch_code": "Branch not found."})
-        alias = database_alias_for_branch(branch.id)
-        if alias not in ("vat", "non_vat"):
-            raise ValidationError(
-                {"branch_code": "Unsupported physical branch database."}
-            )
+        if not branch.is_active or branch.tax_mode not in ("VAT", "NON_VAT"):
+            raise ValidationError({"branch_code": "Select an active physical branch."})
+        from apps.branch_data.schema_routing import register_branch_connection
+        alias = register_branch_connection(branch.pk, branch.tax_mode)
         # Reject colliding numeric IDs by verifying SKU against physical stock product.
         with transaction.atomic(using=alias):
             stock = (
@@ -443,6 +633,8 @@ class RackAllocationViewSet(ReadOnlyModelViewSet):
                     "branch_code": branch_code,
                     "sku": stock.product.sku,
                     "stock_id": stock.pk,
+                    "warehouse": stock.warehouse,
+                    "variant_id": stock.variant_id,
                     "physical_quantity": stock.current_stock,
                     "allocated_quantity": assigned,
                     "unallocated_quantity": stock.current_stock - assigned,
@@ -505,11 +697,47 @@ class ConsolidatedProductReadSerializer(TenantProductSerializer):
                     ),
                 }
             ]
+        # RackStockAllocation is the authoritative source of rack-wise balances.
+        # Product.rack and ProductVariant.racks are location links, not quantities.
+        # The edit form requires this mapping to hydrate the saved rack quantities.
+        stock_variant_ids = {stock.pk: stock.variant_id for stock in stocks}
+        allocation_rows = list(
+            RackStockAllocation.objects.using(alias)
+            .filter(stock_id__in=stock_variant_ids, rack__branch_id=source_id)
+            .select_related("rack")
+            .order_by("rack__rack_code", "pk")
+        )
+        allocation_map = {}
+        for allocation in allocation_rows:
+            key = str(stock_variant_ids[allocation.stock_id] or "base")
+            rack_values = allocation_map.setdefault(key, {})
+            rack_id = str(allocation.rack_id)
+            rack_values[rack_id] = rack_values.get(rack_id, 0) + int(allocation.quantity)
+        data["rack_allocations_by_variant"] = allocation_map
+        data["rack_allocations"] = [
+            {
+                "stock_id": allocation.stock_id,
+                "variant_id": stock_variant_ids[allocation.stock_id],
+                "rack_id": allocation.rack_id,
+                "rack_code": allocation.rack.rack_code,
+                "rack_name": allocation.rack.rack_name,
+                "quantity": int(allocation.quantity),
+            }
+            for allocation in allocation_rows
+        ]
+        # Include explicit stock/rack totals for the details page, without
+        # modifying physical inventory or producing movements.
+        data["allocated_quantity"] = sum(int(a.quantity) for a in allocation_rows)
+        data["physical_quantity"] = sum(int(stock.current_stock) for stock in stocks)
+        data["unallocated_quantity"] = data["physical_quantity"] - data["allocated_quantity"]
+        if allocation_rows:
+            data["rack_code"] = ", ".join(sorted({a.rack.rack_code for a in allocation_rows}))
         data["stocks"] = [
             {
                 "id": stock.pk,
                 "variant": stock.variant_id,
                 "variant_id": stock.variant_id,
+                "warehouse": stock.warehouse,
                 "current_stock": stock.current_stock,
                 "reserved_stock": stock.reserved_stock,
                 "damaged_stock": stock.damaged_stock,
@@ -1103,6 +1331,15 @@ class StockViewSet(ReadOnlyModelViewSet):
                 "message": ("Stock adjustment options loaded."),
                 "data": {
                     "stock_id": (stock.id if stock else None),
+                    "unallocated_quantity": max(0, current_stock - (
+                        sum(item.quantity for item in RackStockAllocation.objects.using(tenant).filter(stock_id=stock.pk))
+                        if stock else 0
+                    )),
+                    "racks": ([
+                        {"id": entry.rack_id, "rack_code": entry.rack.rack_code, "quantity": entry.quantity}
+                        for entry in RackStockAllocation.objects.using(tenant)
+                        .filter(stock_id=stock.id).select_related('rack').order_by('rack__rack_code')
+                    ] if stock else []),
                     "product": product.id,
                     "product_name": product.product_name,
                     "sku": product.sku,
@@ -1324,6 +1561,11 @@ class StockAdjustmentViewSet(ModelViewSet):
             vat_recoverable=False,
         )
 
+    def perform_destroy(self, instance):
+        if getattr(instance, 'rack_id', None):
+            raise ValidationError({'rack_id': 'Rack-aware stock adjustments cannot be deleted without posting a reversing movement. Create a corrective adjustment.'})
+        return super().perform_destroy(instance)
+
     @routed_atomic
     def perform_update(self, serializer):
         """
@@ -1331,6 +1573,8 @@ class StockAdjustmentViewSet(ModelViewSet):
         the edited adjustment inside one database transaction.
         """
         user = self.request.user
+        if getattr(serializer.instance, 'rack_id', None):
+            raise ValidationError({'rack_id': 'Rack-aware adjustments cannot be edited. Record a corrective adjustment for the same rack.'})
 
         # Lock only the StockAdjustment row.
         #
@@ -1548,3 +1792,11 @@ def low_stock_products(request):
                 record["resource_key"] = f"{physical_branch.pk}:{item.pk}"
                 rows.append(record)
     return ok(rows, message="Low stock products fetched successfully.")
+
+
+# GHZ_TENANT_ADJUSTMENTS_PATCH_V1
+# Keep create/list on the same physical tenant database. Other adjustment
+# actions are deliberately left on existing code until their write paths are audited.
+from .tenant_adjustments import create_tenant_adjustment, list_tenant_adjustments
+StockAdjustmentViewSet.create = create_tenant_adjustment
+StockAdjustmentViewSet.list = list_tenant_adjustments

@@ -7,9 +7,7 @@ from rest_framework.decorators import (
 from rest_framework.response import (
     Response,
 )
-from rest_framework.viewsets import (
-    ModelViewSet,
-)
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 
 from apps.branches.models import Branch
 from apps.inventory.models import (

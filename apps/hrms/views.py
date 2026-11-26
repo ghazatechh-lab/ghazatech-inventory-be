@@ -13,8 +13,7 @@ from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet
-
+from apps.audit_logs.viewsets import AuditedModelViewSet as ModelViewSet
 from apps.recovery.models import RecoveryRecord
 from apps.recovery.services import create_recovery_record
 
