@@ -35,6 +35,11 @@ PERMISSION_GROUPS = [
                 "actions": ["view", "create", "edit", "delete"],
             },
             {
+                "resource": "brands",
+                "label": "Brands",
+                "actions": ["view", "create", "edit", "delete"],
+            },
+            {
                 "resource": "racks",
                 "label": "Racks",
                 "actions": ["view", "create", "edit", "delete"],

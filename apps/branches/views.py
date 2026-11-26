@@ -6,6 +6,7 @@ from django.db.models.deletion import CASCADE, PROTECT, ProtectedError
 from apps.common.three_branch import branch_sales_mode, allowed_sale_modes
 
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -286,6 +287,7 @@ class BranchViewSet(ModelViewSet):
         detail=False,
         methods=["get"],
         url_path="selector-options",
+        permission_classes=[IsAuthenticated],
     )
     def selector_options(self, request):
         """

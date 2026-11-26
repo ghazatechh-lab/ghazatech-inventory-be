@@ -51,13 +51,22 @@ from apps.branches.models import Branch
 
 
 def _inventory_request_scope(request, *, require_physical=False):
-    """Resolve a selected physical branch to its schema, never to public.
+    """Resolve a physical tenant with server-side user/branch authorization.
 
-    Shared configuration remains on default. Query/body fallbacks support
-    existing clients that send branch IDs instead of X-Branch-ID.
+    Normal branch users are scoped to their assigned branch even when the
+    frontend has an old branch ID in localStorage. Switching privileges are
+    honored only when they are actually granted.
     """
     from apps.branch_data.context import get_active_branch_id
     from apps.branch_data.schema_routing import register_branch_connection
+    from apps.common.branch_access import (
+        can_switch_branches, can_view_all_branches, get_user_branch_id,
+    )
+    from rest_framework.exceptions import PermissionDenied
+
+    user = request.user
+    if not user or not user.is_authenticated:
+        raise PermissionDenied("Authentication is required.")
 
     raw = (
         request.query_params.get("branch")
@@ -65,11 +74,31 @@ def _inventory_request_scope(request, *, require_physical=False):
         or (
             request.data.get("branch")
             if request.method in {"POST", "PUT", "PATCH"}
-            and isinstance(request.data, dict)
+            and hasattr(request.data, "get")
             else None
         )
         or get_active_branch_id()
     )
+    assigned_id = get_user_branch_id(user)
+    unrestricted = can_view_all_branches(user)
+    switching = can_switch_branches(user)
+
+    # The logged-in user's assigned branch is authoritative when no switching
+    # permission exists. Explicit attempts to reach a different branch fail.
+    if not switching:
+        if not assigned_id:
+            raise PermissionDenied("No branch is assigned to your account.")
+        if raw not in (None, "", "all", "ALL"):
+            try:
+                selected = int(raw)
+            except (ValueError, TypeError):
+                raise ValidationError({"branch": "Invalid branch ID."})
+            if selected != int(assigned_id):
+                raise PermissionDenied("You can only access your assigned branch.")
+        raw = assigned_id
+    elif raw in (None, "", "all", "ALL") and not unrestricted:
+        raw = assigned_id
+
     if raw in (None, "", "all", "ALL"):
         if require_physical:
             raise ValidationError({"branch": "Select a physical branch first."})
@@ -78,11 +107,11 @@ def _inventory_request_scope(request, *, require_physical=False):
         branch = Branch.objects.using("default").get(pk=int(raw), is_active=True)
     except (Branch.DoesNotExist, ValueError, TypeError):
         raise ValidationError({"branch": "Invalid or inactive branch."})
+    if not switching and branch.pk != int(assigned_id):
+        raise PermissionDenied("You can only access your assigned branch.")
     if branch.tax_mode not in {"VAT", "NON_VAT"}:
         if require_physical:
-            raise ValidationError(
-                {"branch": "Select a physical VAT or NON-VAT branch."}
-            )
+            raise ValidationError({"branch": "Select a physical VAT or NON-VAT branch."})
         return branch, None
     alias = register_branch_connection(branch.pk, branch.tax_mode)
     return branch, alias
@@ -190,6 +219,13 @@ class TenantCatalogMixin:
                     raise ValidationError(
                         {"source_branch_id": "Invalid physical source branch."}
                     )
+                from apps.common.branch_access import (
+                    can_switch_branches, get_user_branch_id,
+                )
+                if (not can_switch_branches(self.request.user)
+                        and physical.pk != get_user_branch_id(self.request.user)):
+                    from rest_framework.exceptions import PermissionDenied
+                    raise PermissionDenied("You can only access your assigned branch.")
                 alias = register_branch_connection(physical.pk, physical.tax_mode)
         if alias is None:
             # Consolidated catalog is handled separately; never show stale
@@ -991,6 +1027,10 @@ class ProductViewSet(ModelViewSet):
             branch = Branch.objects.get(pk=branch_id)
         except Branch.DoesNotExist as exc:
             raise ValidationError({"branch": "Selected branch was not found."}) from exc
+
+        selected, _ = _inventory_request_scope(request, require_physical=True)
+        if branch.pk != selected.pk:
+            raise ValidationError({"branch": "Import branch differs from your selected branch."})
 
         products = import_products_from_workbook(
             request=request,
